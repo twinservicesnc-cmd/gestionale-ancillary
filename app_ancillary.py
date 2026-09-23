@@ -163,6 +163,19 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS damage_photos (
+                id TEXT PRIMARY KEY,
+                damage_id TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                mime_type TEXT,
+                file_data BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_damage_photos_damage_id ON damage_photos(damage_id)")
         damage_count = conn.execute("SELECT COUNT(*) FROM damage_charges").fetchone()[0]
         if damage_count == 0 and DAMAGE_SEED_PATH.exists():
             damages = json.loads(DAMAGE_SEED_PATH.read_text(encoding="utf-8"))
@@ -449,6 +462,38 @@ def save_damage(record):
             """,
             payload,
         )
+    return record_id
+
+
+def save_damage_photos(damage_id, uploaded_files):
+    rows = []
+    for uploaded in uploaded_files or []:
+        file_data = uploaded.getvalue()
+        if not file_data:
+            continue
+        rows.append((
+            str(uuid.uuid4()), damage_id, clean(uploaded.name) or "foto_danno.jpg",
+            clean(uploaded.type) or "image/jpeg", sqlite3.Binary(file_data),
+            datetime.now().isoformat(timespec="seconds"),
+        ))
+    if rows:
+        with db() as conn:
+            conn.executemany(
+                """
+                INSERT INTO damage_photos
+                (id, damage_id, file_name, mime_type, file_data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+    return len(rows)
+
+
+def damage_photos(damage_id):
+    with db() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM damage_photos WHERE damage_id = ? ORDER BY created_at", (damage_id,)
+        ).fetchall()]
 
 
 def load_damages():
@@ -462,7 +507,16 @@ def load_damages():
     frame["control_date"] = pd.to_datetime(frame["control_date"], errors="coerce")
     frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
     frame["damage_category"] = frame["description"].map(classify_damage)
-    frame["has_photo"] = frame["photo_url"].fillna("").str.strip().ne("")
+    with db() as conn:
+        photo_counts = pd.read_sql_query(
+            "SELECT damage_id AS id, COUNT(*) AS photo_count FROM damage_photos GROUP BY damage_id", conn
+        )
+    if photo_counts.empty:
+        frame["photo_count"] = 0
+    else:
+        frame = frame.merge(photo_counts, on="id", how="left")
+        frame["photo_count"] = frame["photo_count"].fillna(0).astype(int)
+    frame["has_photo"] = frame["photo_url"].fillna("").str.strip().ne("") | frame["photo_count"].gt(0)
     return frame
 
 
@@ -1238,21 +1292,102 @@ def damage_archive(frame):
         return
     display = frame[[
         "control_date", "ra", "vehicle_category", "charge_mode", "operator",
-        "damage_category", "description", "amount", "payment_status", "photo_url", "notes",
+        "damage_category", "description", "photo_count", "amount", "payment_status", "photo_url", "notes",
     ]].copy()
     display.columns = [
         "Data controllo", "RA", "Veicolo", "Modalità", "Operatore", "Tipo danno",
-        "Descrizione", "Importo", "Stato", "Foto", "Note",
+        "Descrizione", "Numero foto", "Importo", "Stato", "Collegamento foto", "Note",
     ]
     st.dataframe(
         display, use_container_width=True, hide_index=True,
         column_config={
             "Data controllo": st.column_config.DateColumn(format="DD/MM/YYYY"),
             "Importo": st.column_config.NumberColumn(format="€ %.2f"),
-            "Foto": st.column_config.LinkColumn(display_text="Apri foto"),
+            "Collegamento foto": st.column_config.LinkColumn(display_text="Apri foto"),
         },
     )
     st.download_button("Esporta archivio danni in Excel", to_excel(display), "archivio_addebito_danni.xlsx", use_container_width=True)
+
+    records_with_photos = frame[frame["photo_count"].gt(0)]
+    if not records_with_photos.empty:
+        st.subheader("Fotografie delle segnalazioni")
+        photo_record_id = st.selectbox(
+            "Seleziona RA",
+            records_with_photos["id"].tolist(),
+            format_func=lambda item_id: (
+                f"{records_with_photos.loc[records_with_photos['id'].eq(item_id), 'ra'].iloc[0]} — "
+                f"{int(records_with_photos.loc[records_with_photos['id'].eq(item_id), 'photo_count'].iloc[0])} foto"
+            ),
+        )
+        photos = damage_photos(photo_record_id)
+        columns = st.columns(min(3, len(photos)))
+        for index, photo in enumerate(photos):
+            with columns[index % len(columns)]:
+                st.image(photo["file_data"], caption=photo["file_name"], use_container_width=True)
+                st.download_button(
+                    "Scarica", photo["file_data"], photo["file_name"],
+                    mime=photo["mime_type"] or "image/jpeg", key=f"download_photo_{photo['id']}",
+                    use_container_width=True,
+                )
+
+
+def quick_damage_checkin():
+    st.header("Check-in rapido danni")
+    st.caption("Compila i dati essenziali e allega più fotografie direttamente da telefono o tablet.")
+
+    linked_operator = current_operator() if not user_is_admin() else ""
+    operator_options = [row["name"] for row in configured_operators()]
+    if linked_operator and linked_operator not in operator_options:
+        operator_options.append(linked_operator)
+
+    with st.form("quick_damage_checkin", clear_on_submit=True):
+        ra = st.text_input("RA *", placeholder="Esempio: TOR-12345")
+        c1, c2 = st.columns(2)
+        vehicle = c1.selectbox("Categoria veicolo *", ["", "CAR", "VAN"])
+        charge_mode = c2.selectbox(
+            "Modalità di addebito *",
+            ["IN PRESENZA", "KEY BOX", "CLIENTE NON ASPETTA (AFTER RENTAL)", "ALTRO"],
+        )
+        if linked_operator:
+            operator = st.selectbox(
+                "Operatore responsabile *", operator_options,
+                index=operator_options.index(linked_operator), disabled=True,
+            )
+            st.caption("Operatore compilato automaticamente dall’account personale.")
+        else:
+            operator = st.selectbox("Operatore responsabile *", [""] + operator_options)
+        description = st.text_area(
+            "Descrizione sintetica del danno *", placeholder="Indica posizione e tipo di danno", height=100,
+        )
+        photos = st.file_uploader(
+            "Fotografie del danno",
+            type=["jpg", "jpeg", "png", "webp", "heic"],
+            accept_multiple_files=True,
+            help="Puoi scattare o selezionare più fotografie dal telefono.",
+        )
+        notes = st.text_area("Note facoltative", height=70)
+        submitted = st.form_submit_button("Salva check-in", type="primary", use_container_width=True)
+
+    if submitted:
+        if not all([ra, vehicle, charge_mode, operator, description]):
+            st.error("Compila RA, categoria veicolo, modalità, operatore e descrizione.")
+            return
+        if len(photos or []) > 10:
+            st.error("Puoi allegare al massimo 10 fotografie per check-in.")
+            return
+        oversized = [photo.name for photo in photos or [] if len(photo.getvalue()) > 8 * 1024 * 1024]
+        if oversized:
+            st.error("Ogni fotografia deve essere inferiore a 8 MB: " + ", ".join(oversized))
+            return
+        damage_id = save_damage({
+            "control_date": date.today().isoformat(), "ra": ra,
+            "vehicle_category": vehicle, "charge_mode": charge_mode,
+            "operator": operator, "description": description, "photo_url": "",
+            "amount": None, "payment_status": "DA VERIFICARE", "notes": notes,
+        })
+        photo_total = save_damage_photos(damage_id, photos)
+        st.success(f"Check-in {normalize_ra(ra)} salvato con {photo_total} fotografie.")
+        st.rerun()
 
 
 def damage_form(frame):
@@ -1342,6 +1477,7 @@ def damage_form(frame):
         confirm = st.checkbox(f"Confermo l’eliminazione definitiva della segnalazione {current['ra']}")
         if st.button("Elimina segnalazione danno", disabled=not confirm, use_container_width=True):
             with db() as conn:
+                conn.execute("DELETE FROM damage_photos WHERE damage_id = ?", (current["id"],))
                 conn.execute("DELETE FROM damage_charges WHERE id = ?", (current["id"],))
             st.success("Segnalazione eliminata.")
             st.rerun()
@@ -1654,6 +1790,7 @@ navigation = {
         ("🔀 Analisi incrociata", "Analisi incrociata"),
     ],
     "ADDEBITO DANNI": [
+        ("📱 Check-in rapido danni", "Check-in rapido danni"),
         ("📊 Analisi addebito danni", "Analisi addebito danni"),
         ("🗂️ Archivio addebito danni", "Archivio addebito danni"),
         ("➕ Inserimento addebito danni", "Inserimento addebito danni"),
@@ -1722,6 +1859,8 @@ elif page == "Archivio addebito danni":
     damage_archive(all_damages)
 elif page == "Inserimento addebito danni":
     damage_form(all_damages)
+elif page == "Check-in rapido danni":
+    quick_damage_checkin()
 elif page == "Archivio ancillary":
     archive(filtered)
 elif page == "Archivio contratti RA":
