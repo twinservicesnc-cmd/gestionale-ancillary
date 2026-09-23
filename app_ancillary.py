@@ -15,6 +15,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ancillary.db"
 SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
+ANCILLARY_START_DATE = date(2026, 10, 1)
 
 st.set_page_config(page_title="Gestionale Ancillary", page_icon="🚗", layout="wide")
 
@@ -108,6 +109,46 @@ def init_db():
                 """,
                 contracts,
             )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_config (
+                name TEXT PRIMARY KEY,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        cleanup_done = conn.execute(
+            "SELECT value FROM app_meta WHERE key = 'ancillary_history_cleared_2026_10_01'"
+        ).fetchone()
+        if cleanup_done is None:
+            conn.execute("DELETE FROM rentals")
+            conn.execute(
+                "INSERT INTO app_meta (key, value) VALUES (?, ?)",
+                ("ancillary_history_cleared_2026_10_01", datetime.now().isoformat(timespec="seconds")),
+            )
+        operator_count = conn.execute("SELECT COUNT(*) FROM operator_config").fetchone()[0]
+        if operator_count == 0:
+            existing_operators = conn.execute(
+                """
+                SELECT DISTINCT TRIM(operator) AS name FROM rentals
+                WHERE TRIM(COALESCE(operator, '')) <> ''
+                UNION
+                SELECT DISTINCT TRIM(operator) AS name FROM contracts
+                WHERE TRIM(COALESCE(operator, '')) <> ''
+                """
+            ).fetchall()
+            conn.executemany(
+                "INSERT OR IGNORE INTO operator_config (name, active) VALUES (?, 1)",
+                [(upper(row[0]),) for row in existing_operators if upper(row[0])],
+            )
 
 
 def clean(value):
@@ -116,6 +157,15 @@ def clean(value):
 
 def upper(value):
     return clean(value).upper()
+
+
+def configured_operators(active_only=True):
+    query = "SELECT name, active FROM operator_config"
+    if active_only:
+        query += " WHERE active = 1"
+    query += " ORDER BY name"
+    with db() as conn:
+        return [dict(row) for row in conn.execute(query).fetchall()]
 
 
 def normalize_ra(value):
@@ -473,7 +523,16 @@ def record_form(frame):
     )
 
     d, e, f = st.columns(3)
-    operator = d.text_input("Operatore", value=(current or {}).get("operator", ""), key=f"{widget_prefix}_operator")
+    current_operator = upper((current or {}).get("operator", ""))
+    operator_options = [""] + [row["name"] for row in configured_operators()]
+    if current_operator and current_operator not in operator_options:
+        operator_options.append(current_operator)
+    operator = d.selectbox(
+        "Operatore",
+        operator_options,
+        index=operator_options.index(current_operator) if current_operator in operator_options else 0,
+        key=f"{widget_prefix}_operator",
+    )
     vehicle_options = ["", "CAR", "VAN"]
     current_vehicle = upper((current or {}).get("vehicle_type", ""))
     if current_vehicle not in vehicle_options:
@@ -539,6 +598,8 @@ def record_form(frame):
     if submitted:
         if not ra or not rental_type:
             st.error("Inserisci almeno RA e tipo noleggio.")
+        elif start_date < ANCILLARY_START_DATE:
+            st.error("Lo storico ancillary parte dal 01/10/2026. Inserisci una data uguale o successiva.")
         elif not ancillary_blocked and days <= 0:
             st.error("Inserisci i giorni di noleggio.")
         else:
@@ -725,10 +786,14 @@ def import_backup():
                 st.rerun()
             imported = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, dtype=object)
             added = 0
+            skipped_before_start = 0
             for _, row in imported.iterrows():
                 days = pd.to_numeric(row.get("GIORNI NOLEGGIO"), errors="coerce")
                 cost = pd.to_numeric(row.get("COSTO TOTALE ANCILLARY (iva esclusa)"), errors="coerce")
                 start = pd.to_datetime(row.get("DATA INIZIO NOLEGGIO"), errors="coerce")
+                if pd.notna(start) and start.date() < ANCILLARY_START_DATE:
+                    skipped_before_start += 1
+                    continue
                 vehicle = upper(row.get("TIPO DI VEICOLO"))
                 ancillary = upper(row.get("SCELTA ANCILLARY (CAR)")) or upper(row.get("SCELTA ANCILLARY (VAN)"))
                 save_record({
@@ -742,7 +807,74 @@ def import_backup():
                 })
                 added += 1
             st.success(f"Importati {added} record ancillary.")
+            if skipped_before_start:
+                st.info(f"Esclusi {skipped_before_start} record anteriori al 01/10/2026.")
             st.rerun()
+
+
+def operator_settings():
+    st.header("Configurazione operatori")
+    st.caption("Gli operatori attivi compaiono nella tendina del modulo di inserimento. Lo storico non viene modificato.")
+
+    with st.form("add_operator", clear_on_submit=True):
+        new_operator = st.text_input("Nuovo operatore")
+        add_operator = st.form_submit_button("Aggiungi operatore", type="primary", use_container_width=True)
+    if add_operator:
+        name = upper(new_operator)
+        if not name:
+            st.error("Inserisci il nome dell’operatore.")
+        else:
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO operator_config (name, active) VALUES (?, 1) "
+                    "ON CONFLICT(name) DO UPDATE SET active = 1",
+                    (name,),
+                )
+            st.success(f"Operatore {name} disponibile nel modulo.")
+            st.rerun()
+
+    rows = configured_operators(active_only=False)
+    if not rows:
+        st.info("Nessun operatore configurato.")
+        return
+
+    st.subheader("Operatori configurati")
+    st.dataframe(
+        pd.DataFrame(rows).rename(columns={"name": "Operatore", "active": "Attivo"}),
+        use_container_width=True,
+        hide_index=True,
+        column_config={"Attivo": st.column_config.CheckboxColumn()},
+    )
+    selected_name = st.selectbox("Operatore da gestire", [row["name"] for row in rows])
+    selected_row = next(row for row in rows if row["name"] == selected_name)
+    c1, c2 = st.columns(2)
+    renamed = c1.text_input("Nuovo nome", value=selected_name, key=f"rename_{selected_name}")
+    active = c2.checkbox("Attivo nella tendina", value=bool(selected_row["active"]), key=f"active_{selected_name}")
+    if st.button("Salva modifiche operatore", type="primary", use_container_width=True):
+        new_name = upper(renamed)
+        if not new_name:
+            st.error("Il nome non può essere vuoto.")
+        else:
+            try:
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE operator_config SET name = ?, active = ? WHERE name = ?",
+                        (new_name, int(active), selected_name),
+                    )
+                    if new_name != selected_name:
+                        conn.execute("UPDATE rentals SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
+                        conn.execute("UPDATE contracts SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
+                st.success("Operatore aggiornato.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.error("Esiste già un operatore con questo nome.")
+
+    confirm_delete = st.checkbox("Confermo la rimozione dalla configurazione")
+    if st.button("Elimina operatore", disabled=not confirm_delete, use_container_width=True):
+        with db() as conn:
+            conn.execute("DELETE FROM operator_config WHERE name = ?", (selected_name,))
+        st.success("Operatore rimosso dalla tendina. I dati storici restano invariati.")
+        st.rerun()
 
 
 def login():
@@ -778,7 +910,7 @@ page = st.sidebar.radio(
     [
         "Dashboard ancillary", "Analisi contratti RA", "Analisi incrociata",
         "Archivio ancillary", "Archivio contratti RA", "Inserimento / modifica",
-        "Importazione e backup",
+        "Configurazione operatori", "Importazione e backup",
     ],
 )
 
@@ -794,5 +926,7 @@ elif page == "Archivio contratti RA":
     contracts_archive(all_contracts)
 elif page == "Inserimento / modifica":
     record_form(all_data)
+elif page == "Configurazione operatori":
+    operator_settings()
 else:
     import_backup()
