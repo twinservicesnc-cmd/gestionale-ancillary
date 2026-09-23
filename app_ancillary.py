@@ -1437,16 +1437,39 @@ st.caption("Importazione automatica dei report, archivio contratti, statistiche,
 all_data = load_data()
 all_contracts = load_contracts()
 all_damages = load_damages()
-filtered = filters(all_data) if not all_data.empty else all_data
-page = st.sidebar.radio(
-    "Sezione",
-    [
-        "Dashboard ancillary", "Analisi contratti RA", "Analisi ancillary RA", "Analisi incrociata",
-        "Analisi addebito danni", "Archivio addebito danni", "Inserimento addebito danni",
-        "Archivio ancillary", "Archivio contratti RA", "Inserimento / modifica",
-        "Configurazione operatori", "Importazione e backup",
+
+navigation = {
+    "Ancillary": [
+        "Dashboard ancillary",
+        "Analisi ancillary RA",
+        "Archivio ancillary",
+        "Inserimento ancillary",
     ],
-)
+    "Contratti RA": [
+        "Analisi contratti RA",
+        "Archivio contratti RA",
+        "Analisi incrociata",
+    ],
+    "Addebito danni": [
+        "Analisi addebito danni",
+        "Archivio addebito danni",
+        "Inserimento addebito danni",
+    ],
+    "Amministrazione": [
+        "Configurazione operatori",
+        "Importazione e backup",
+    ],
+}
+
+st.sidebar.subheader("Navigazione")
+main_area = st.sidebar.selectbox("Area principale", list(navigation))
+page = st.sidebar.radio("Funzione", navigation[main_area])
+
+# I filtri generali ancillary sono mostrati solo nelle pagine che li usano.
+if page in {"Dashboard ancillary", "Archivio ancillary"} and not all_data.empty:
+    filtered = filters(all_data)
+else:
+    filtered = all_data
 
 if page == "Dashboard ancillary":
     dashboard(filtered)
@@ -1466,7 +1489,7 @@ elif page == "Archivio ancillary":
     archive(filtered)
 elif page == "Archivio contratti RA":
     contracts_archive(all_contracts)
-elif page == "Inserimento / modifica":
+elif page == "Inserimento ancillary":
     record_form(all_data)
 elif page == "Configurazione operatori":
     operator_settings()
