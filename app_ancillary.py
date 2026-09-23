@@ -11,6 +11,11 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -301,6 +306,24 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_event_files_event ON event_files(event_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_vehicles (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                vehicle_group TEXT,
+                plate TEXT,
+                brand TEXT,
+                model TEXT,
+                assigned_to TEXT,
+                ra TEXT,
+                pickup_date TEXT,
+                notes TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_vehicles_event ON event_vehicles(event_id)")
         cleanup_done = conn.execute(
             "SELECT value FROM app_meta WHERE key = 'ancillary_history_cleared_2026_10_01'"
         ).fetchone()
@@ -721,9 +744,11 @@ def load_special_events():
     with db() as conn:
         counts = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS participants FROM event_participants GROUP BY event_id", conn)
         files = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS files FROM event_files GROUP BY event_id", conn)
+        vehicles = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS assigned_vehicles FROM event_vehicles GROUP BY event_id", conn)
     frame = frame.merge(counts, on="id", how="left") if not counts.empty else frame.assign(participants=0)
     frame = frame.merge(files, on="id", how="left") if not files.empty else frame.assign(files=0)
-    frame[["participants", "files"]] = frame[["participants", "files"]].fillna(0).astype(int)
+    frame = frame.merge(vehicles, on="id", how="left") if not vehicles.empty else frame.assign(assigned_vehicles=0)
+    frame[["participants", "files", "assigned_vehicles"]] = frame[["participants", "files", "assigned_vehicles"]].fillna(0).astype(int)
     return frame
 
 
@@ -943,6 +968,45 @@ def table_to_excel(frame, sheet_name="Dati"):
             export[column] = export[column].dt.date
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    return output.getvalue()
+
+
+def event_vehicles_to_pdf(frame, event_title):
+    output = io.BytesIO()
+    document = SimpleDocTemplate(
+        output, pagesize=landscape(A4), rightMargin=8 * mm, leftMargin=8 * mm,
+        topMargin=8 * mm, bottomMargin=8 * mm,
+    )
+    styles = getSampleStyleSheet()
+    story = [Paragraph(f"Veicoli assegnati - {event_title}", styles["Title"]), Spacer(1, 4 * mm)]
+    export = frame.copy()
+    if "_id" in export.columns:
+        export = export.drop(columns=["_id"])
+    if "Stato" in export.columns:
+        export["Stato"] = export["Data ritiro"].fillna("").astype(str).str.strip().map(lambda value: "RITIRATA" if value else "DA RITIRARE")
+    export = export.fillna("").astype(str)
+    data = [list(export.columns)] + export.values.tolist()
+    widths = [23, 24, 23, 27, 30, 39, 25, 27, 39][:len(export.columns)]
+    table = Table(data, repeatRows=1, colWidths=[width * mm for width in widths])
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DCE6F1")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#172033")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F6F8FB")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+    ]
+    if "Stato" in export.columns:
+        status_column = list(export.columns).index("Stato")
+        for row_number, status in enumerate(export["Stato"], start=1):
+            style.append(("TEXTCOLOR", (status_column, row_number), (status_column, row_number), colors.green if status == "RITIRATA" else colors.red))
+            style.append(("FONTNAME", (status_column, row_number), (status_column, row_number), "Helvetica-Bold"))
+    table.setStyle(TableStyle(style))
+    story.append(table)
+    document.build(story)
     return output.getvalue()
 
 
@@ -2030,12 +2094,13 @@ def special_events_dashboard(frame):
         return
     today = pd.Timestamp(date.today())
     upcoming = frame[frame["start_date"].ge(today) & ~frame["status"].isin(["ANNULLATO", "CONCLUSO"])]
-    columns = st.columns(5)
+    columns = st.columns(6)
     columns[0].metric("Eventi totali", len(frame))
     columns[1].metric("In programma", len(upcoming))
     columns[2].metric("Partecipanti", int(frame["participants"].sum()))
     columns[3].metric("Ricavi", f"€ {frame['revenue'].sum():,.2f}")
     columns[4].metric("Margine", f"€ {frame['margin'].sum():,.2f}")
+    columns[5].metric("Veicoli assegnati", int(frame["assigned_vehicles"].sum()))
     by_status = frame.groupby("status", as_index=False).size().rename(columns={"size": "eventi"})
     by_type = frame.groupby("event_type", as_index=False).agg(eventi=("id", "count"), ricavi=("revenue", "sum"))
     c1, c2 = st.columns(2)
@@ -2084,7 +2149,7 @@ def special_event_form(frame):
         responsible_options.append(current_responsible)
     responsible = c9.selectbox("Responsabile", [""] + responsible_options, index=([""] + responsible_options).index(current_responsible) if current_responsible else 0, key=f"{prefix}_event_responsible")
     capacity = c10.number_input("Capienza prevista", min_value=0, step=1, value=int(current.get("capacity") or 0), key=f"{prefix}_event_capacity")
-    vehicles = st.text_input("Veicoli assegnati", value=current.get("vehicles", ""), placeholder="Esempio: Z1, CAR 12, furgone supporto", key=f"{prefix}_event_vehicles")
+    vehicles = st.text_input("Note generali veicoli", value=current.get("vehicles", ""), placeholder="L’elenco dettagliato si gestisce nella pagina Veicoli evento", key=f"{prefix}_event_vehicles")
     c11, c12 = st.columns(2)
     cost = c11.number_input("Costi previsti", min_value=0.0, step=50.0, value=float(current.get("cost") or 0), key=f"{prefix}_event_cost")
     revenue = c12.number_input("Incassi previsti", min_value=0.0, step=50.0, value=float(current.get("revenue") or 0), key=f"{prefix}_event_revenue")
@@ -2114,6 +2179,7 @@ def special_event_form(frame):
             with db() as conn:
                 conn.execute("DELETE FROM event_participants WHERE event_id = ?", (current["id"],))
                 conn.execute("DELETE FROM event_files WHERE event_id = ?", (current["id"],))
+                conn.execute("DELETE FROM event_vehicles WHERE event_id = ?", (current["id"],))
                 conn.execute("DELETE FROM special_events WHERE id = ?", (current["id"],))
             st.success("Evento eliminato.")
             st.rerun()
@@ -2217,6 +2283,131 @@ def event_files_page(frame):
             with db() as conn:
                 conn.execute("DELETE FROM event_files WHERE id = ?", (file["id"],))
             st.rerun()
+
+
+def event_vehicles_page(frame):
+    st.header("Veicoli assegnati all’evento")
+    st.caption(
+        "Inserisci o incolla l’elenco direttamente nella tabella. Le righe vengono ordinate per gruppo, "
+        "targa, marca e modello. Il pallino diventa verde quando è indicata la data di ritiro."
+    )
+    records, record_ids = event_options(frame)
+    if not record_ids:
+        st.info("Crea prima un evento.")
+        return
+    event_id = st.selectbox(
+        "Evento",
+        record_ids,
+        format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}",
+        key="event_vehicle_event",
+    )
+    with db() as conn:
+        stored = [
+            dict(row) for row in conn.execute(
+                """
+                SELECT * FROM event_vehicles
+                WHERE event_id = ?
+                ORDER BY UPPER(COALESCE(vehicle_group, '')), UPPER(COALESCE(plate, '')),
+                         UPPER(COALESCE(brand, '')), UPPER(COALESCE(model, ''))
+                """,
+                (event_id,),
+            ).fetchall()
+        ]
+    columns = ["_id", "Stato", "Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Note"]
+    rows = []
+    for item in stored:
+        pickup = clean(item.get("pickup_date"))
+        rows.append({
+            "_id": item["id"], "Stato": "🟢" if pickup else "🔴",
+            "Gruppo": item.get("vehicle_group", ""), "Targa": item.get("plate", ""),
+            "Marca": item.get("brand", ""), "Modello": item.get("model", ""),
+            "Assegnata a": item.get("assigned_to", ""), "RA": item.get("ra", ""),
+            "Data ritiro": pickup, "Note": item.get("notes", ""),
+        })
+    source = pd.DataFrame(rows, columns=columns)
+    if source.empty:
+        source = pd.DataFrame(columns=columns)
+    total = len(stored)
+    collected = sum(bool(clean(item.get("pickup_date"))) for item in stored)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Veicoli assegnati", total, delta=f"su 40 previsti" if total <= 40 else "oltre 40 previsti")
+    m2.metric("Ritirati", collected)
+    m3.metric("Da ritirare", max(total - collected, 0))
+    edited = st.data_editor(
+        source,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key=f"event_vehicle_editor_{event_id}",
+        column_config={
+            "_id": None,
+            "Stato": st.column_config.TextColumn("Ritiro", disabled=True, width="small", help="🟢 ritirata; 🔴 non ancora ritirata"),
+            "Gruppo": st.column_config.TextColumn("Gruppo", width="medium"),
+            "Targa": st.column_config.TextColumn("Targa", width="small"),
+            "Marca": st.column_config.TextColumn("Marca", width="medium"),
+            "Modello": st.column_config.TextColumn("Modello", width="medium"),
+            "Assegnata a": st.column_config.TextColumn("Assegnata a", width="medium"),
+            "RA": st.column_config.TextColumn("RA", width="small"),
+            "Data ritiro": st.column_config.TextColumn("Data ritiro", help="Esempio: 25/09/2026", width="small"),
+            "Note": st.column_config.TextColumn("Note", width="large"),
+        },
+        disabled=["Stato"],
+    )
+    st.caption("Puoi copiare più righe da Excel e incollarle nella prima cella. Usa il + in fondo per aggiungere una riga.")
+    export = edited.copy()
+    if "_id" in export.columns:
+        export = export.drop(columns=["_id"])
+    export["Stato"] = export.get("Data ritiro", pd.Series(dtype=str)).fillna("").astype(str).str.strip().map(
+        lambda value: "RITIRATA" if value else "DA RITIRARE"
+    )
+    export = export.sort_values(
+        ["Gruppo", "Targa", "Marca", "Modello"],
+        key=lambda column: column.fillna("").astype(str).str.upper(),
+    )
+    safe_event_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(records[event_id].title)).strip("_") or "evento"
+    d1, d2 = st.columns(2)
+    d1.download_button(
+        "Scarica elenco in Excel", table_to_excel(export, "Veicoli evento"),
+        f"veicoli_{safe_event_name}.xlsx", use_container_width=True,
+    )
+    d2.download_button(
+        "Scarica elenco in PDF", event_vehicles_to_pdf(export, str(records[event_id].title)),
+        f"veicoli_{safe_event_name}.pdf", mime="application/pdf", use_container_width=True,
+    )
+    if st.button("Salva elenco veicoli", type="primary", use_container_width=True):
+        saved_ids = []
+        now = datetime.now().isoformat(timespec="seconds")
+        with db() as conn:
+            for _, row in edited.fillna("").iterrows():
+                values = {name: clean(row.get(name, "")) for name in ["Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Note"]}
+                if not any(values.values()):
+                    continue
+                vehicle_id = clean(row.get("_id")) or str(uuid.uuid4())
+                saved_ids.append(vehicle_id)
+                conn.execute(
+                    """
+                    INSERT INTO event_vehicles
+                    (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        vehicle_group=excluded.vehicle_group,plate=excluded.plate,brand=excluded.brand,
+                        model=excluded.model,assigned_to=excluded.assigned_to,ra=excluded.ra,
+                        pickup_date=excluded.pickup_date,notes=excluded.notes,updated_at=excluded.updated_at
+                    """,
+                    (vehicle_id, event_id, values["Gruppo"], upper(values["Targa"]), values["Marca"],
+                     values["Modello"], values["Assegnata a"], upper(values["RA"]),
+                     values["Data ritiro"], values["Note"], now),
+                )
+            if saved_ids:
+                placeholders = ",".join("?" for _ in saved_ids)
+                conn.execute(
+                    f"DELETE FROM event_vehicles WHERE event_id = ? AND id NOT IN ({placeholders})",
+                    [event_id] + saved_ids,
+                )
+            else:
+                conn.execute("DELETE FROM event_vehicles WHERE event_id = ?", (event_id,))
+        st.success(f"Elenco salvato: {len(saved_ids)} veicoli.")
+        st.rerun()
 
 
 def import_backup():
@@ -2544,6 +2735,7 @@ navigation = {
         ("📊 Dashboard eventi", "Dashboard eventi speciali"),
         ("➕ Crea evento", "Crea evento speciale"),
         ("📅 Calendario eventi", "Calendario eventi speciali"),
+        ("🚗 Veicoli evento", "Veicoli eventi speciali"),
         ("👥 Partecipanti e personale", "Partecipanti eventi speciali"),
         ("📎 Documenti e fotografie", "Allegati eventi speciali"),
         ("🗂️ Archivio eventi", "Archivio eventi speciali"),
@@ -2630,6 +2822,8 @@ elif page == "Crea evento speciale":
     special_event_form(all_special_events)
 elif page == "Calendario eventi speciali":
     events_calendar(all_special_events)
+elif page == "Veicoli eventi speciali":
+    event_vehicles_page(all_special_events)
 elif page == "Partecipanti eventi speciali":
     event_participants_page(all_special_events)
 elif page == "Allegati eventi speciali":
