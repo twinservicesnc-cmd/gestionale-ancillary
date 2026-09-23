@@ -2313,6 +2313,85 @@ def event_vehicles_page(frame):
                 (event_id,),
             ).fetchall()
         ]
+    st.subheader("Inserimento o modifica veicolo")
+    vehicle_by_id = {item["id"]: item for item in stored}
+    selected_vehicle_id = st.selectbox(
+        "Veicolo da modificare",
+        [""] + list(vehicle_by_id),
+        format_func=lambda item_id: "➕ NUOVO VEICOLO" if not item_id else " | ".join(
+            value for value in [
+                upper(vehicle_by_id[item_id].get("plate")),
+                clean(vehicle_by_id[item_id].get("brand")),
+                clean(vehicle_by_id[item_id].get("model")),
+                clean(vehicle_by_id[item_id].get("assigned_to")),
+            ] if value
+        ),
+        key=f"event_vehicle_selector_{event_id}",
+    )
+    selected_vehicle = vehicle_by_id.get(selected_vehicle_id, {})
+    form_key = selected_vehicle_id or "new"
+    existing_pickup = clean(selected_vehicle.get("pickup_date"))
+    pickup_default = date.today()
+    if existing_pickup:
+        parsed_pickup = pd.to_datetime(existing_pickup, errors="coerce", dayfirst=True)
+        if pd.notna(parsed_pickup):
+            pickup_default = parsed_pickup.date()
+    with st.form(f"event_vehicle_form_{event_id}_{form_key}", clear_on_submit=not bool(selected_vehicle_id)):
+        c1, c2, c3, c4 = st.columns(4)
+        vehicle_group = c1.text_input("Gruppo", value=clean(selected_vehicle.get("vehicle_group")))
+        plate = c2.text_input("Targa *", value=upper(selected_vehicle.get("plate")))
+        brand = c3.text_input("Marca", value=clean(selected_vehicle.get("brand")))
+        model = c4.text_input("Modello", value=clean(selected_vehicle.get("model")))
+        c5, c6, c7 = st.columns(3)
+        assigned_to = c5.text_input("Assegnata a", value=clean(selected_vehicle.get("assigned_to")))
+        ra = c6.text_input("RA", value=upper(selected_vehicle.get("ra")))
+        picked_up = c7.checkbox("Veicolo ritirato", value=bool(existing_pickup))
+        c8, c9 = st.columns([1, 2])
+        pickup_date = c8.date_input("Data ritiro", value=pickup_default, disabled=not picked_up)
+        vehicle_notes = c9.text_input("Note", value=clean(selected_vehicle.get("notes")))
+        save_vehicle = st.form_submit_button(
+            "Aggiorna veicolo" if selected_vehicle_id else "Aggiungi veicolo alla tabella",
+            type="primary", use_container_width=True,
+        )
+    if save_vehicle:
+        if not clean(plate):
+            st.error("Inserisci almeno la targa del veicolo.")
+        else:
+            vehicle_id = selected_vehicle_id or str(uuid.uuid4())
+            with db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO event_vehicles
+                    (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        vehicle_group=excluded.vehicle_group,plate=excluded.plate,brand=excluded.brand,
+                        model=excluded.model,assigned_to=excluded.assigned_to,ra=excluded.ra,
+                        pickup_date=excluded.pickup_date,notes=excluded.notes,updated_at=excluded.updated_at
+                    """,
+                    (
+                        vehicle_id, event_id, clean(vehicle_group), upper(plate), clean(brand), clean(model),
+                        clean(assigned_to), upper(ra), pickup_date.isoformat() if picked_up else "",
+                        clean(vehicle_notes), datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
+            st.success("Veicolo aggiornato nella tabella." if selected_vehicle_id else "Veicolo aggiunto automaticamente alla tabella.")
+            st.rerun()
+    if selected_vehicle_id:
+        confirm_vehicle_delete = st.checkbox(
+            "Confermo l’eliminazione del veicolo selezionato",
+            key=f"confirm_vehicle_delete_{event_id}_{selected_vehicle_id}",
+        )
+        if st.button(
+            "Elimina veicolo selezionato", disabled=not confirm_vehicle_delete,
+            key=f"delete_vehicle_{event_id}_{selected_vehicle_id}", use_container_width=True,
+        ):
+            with db() as conn:
+                conn.execute("DELETE FROM event_vehicles WHERE id = ? AND event_id = ?", (selected_vehicle_id, event_id))
+            st.success("Veicolo eliminato.")
+            st.rerun()
+    st.divider()
+    st.subheader("Elenco veicoli dell’evento")
     columns = ["_id", "Stato", "Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Note"]
     rows = []
     for item in stored:
