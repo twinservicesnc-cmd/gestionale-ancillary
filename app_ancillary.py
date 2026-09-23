@@ -19,7 +19,9 @@ SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
 DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 ANCILLARY_START_DATE = date(2026, 10, 1)
-PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "AMMINISTRAZIONE"]
+PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "AMMINISTRAZIONE"]
+CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
+CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
 
 st.set_page_config(page_title="Gestionale Ancillary", page_icon="🚗", layout="wide")
 
@@ -207,6 +209,39 @@ def init_db():
                 permissions TEXT NOT NULL DEFAULT '[]',
                 active INTEGER NOT NULL DEFAULT 1,
                 is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cash_movements (
+                id TEXT PRIMARY KEY,
+                source_key TEXT UNIQUE,
+                movement_date TEXT NOT NULL,
+                ra TEXT,
+                movement_type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                payment_method TEXT NOT NULL DEFAULT 'CONTANTI',
+                operator TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cash_movements_date ON cash_movements(movement_date)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cash_closings (
+                id TEXT PRIMARY KEY,
+                closing_date TEXT NOT NULL UNIQUE,
+                expected_balance REAL NOT NULL,
+                counted_cash REAL NOT NULL,
+                checks_total REAL NOT NULL DEFAULT 0,
+                difference REAL NOT NULL,
+                denominations TEXT NOT NULL DEFAULT '{}',
+                operator TEXT,
+                notes TEXT,
                 created_at TEXT NOT NULL
             )
             """
@@ -520,6 +555,70 @@ def load_damages():
     return frame
 
 
+def cash_effect(movement_type, amount):
+    value = abs(float(amount or 0))
+    return value if upper(movement_type) in CASH_IN_TYPES else -value
+
+
+def save_cash_movement(record):
+    movement_id = record.get("id") or str(uuid.uuid4())
+    payload = {
+        "id": movement_id,
+        "source_key": clean(record.get("source_key")) or movement_id,
+        "movement_date": clean(record.get("movement_date")) or date.today().isoformat(),
+        "ra": normalize_ra(record.get("ra")) if clean(record.get("ra")) else "",
+        "movement_type": upper(record.get("movement_type")),
+        "amount": abs(float(record.get("amount") or 0)),
+        "payment_method": upper(record.get("payment_method")) or "CONTANTI",
+        "operator": upper(record.get("operator")),
+        "notes": clean(record.get("notes")),
+        "created_at": record.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+    }
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO cash_movements
+            (id, source_key, movement_date, ra, movement_type, amount, payment_method, operator, notes, created_at)
+            VALUES (:id, :source_key, :movement_date, :ra, :movement_type, :amount, :payment_method, :operator, :notes, :created_at)
+            ON CONFLICT(source_key) DO UPDATE SET
+                movement_date=:movement_date, ra=:ra, movement_type=:movement_type,
+                amount=:amount, payment_method=:payment_method, operator=:operator,
+                notes=:notes, created_at=:created_at
+            """,
+            payload,
+        )
+    return movement_id
+
+
+def load_cash_movements():
+    with db() as conn:
+        frame = pd.read_sql_query(
+            "SELECT * FROM cash_movements ORDER BY movement_date DESC, created_at DESC", conn
+        )
+    if frame.empty:
+        return frame
+    frame["movement_date"] = pd.to_datetime(frame["movement_date"], errors="coerce")
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce").fillna(0)
+    frame["effect"] = frame.apply(lambda row: cash_effect(row["movement_type"], row["amount"]), axis=1)
+    return frame
+
+
+def cash_balance(frame=None):
+    frame = load_cash_movements() if frame is None else frame
+    return 0.0 if frame.empty else float(frame["effect"].sum())
+
+
+def load_cash_closings():
+    with db() as conn:
+        frame = pd.read_sql_query("SELECT * FROM cash_closings ORDER BY closing_date DESC", conn)
+    if frame.empty:
+        return frame
+    frame["closing_date"] = pd.to_datetime(frame["closing_date"], errors="coerce")
+    for column in ["expected_balance", "counted_cash", "checks_total", "difference"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+    return frame
+
+
 def load_contracts():
     with db() as conn:
         frame = pd.read_sql_query("SELECT * FROM contracts ORDER BY contract_date DESC, ra DESC", conn)
@@ -718,6 +817,17 @@ def to_excel(frame):
     ]
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export[cols].to_excel(writer, index=False, sheet_name="Dati ancillary")
+    return output.getvalue()
+
+
+def table_to_excel(frame, sheet_name="Dati"):
+    output = io.BytesIO()
+    export = frame.copy()
+    for column in export.columns:
+        if pd.api.types.is_datetime64_any_dtype(export[column]):
+            export[column] = export[column].dt.date
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export.to_excel(writer, index=False, sheet_name=sheet_name[:31])
     return output.getvalue()
 
 
@@ -1306,7 +1416,10 @@ def damage_archive(frame):
             "Collegamento foto": st.column_config.LinkColumn(display_text="Apri foto"),
         },
     )
-    st.download_button("Esporta archivio danni in Excel", to_excel(display), "archivio_addebito_danni.xlsx", use_container_width=True)
+    st.download_button(
+        "Esporta archivio danni in Excel", table_to_excel(display, "Addebito danni"),
+        "archivio_addebito_danni.xlsx", use_container_width=True,
+    )
 
     records_with_photos = frame[frame["photo_count"].gt(0)]
     if not records_with_photos.empty:
@@ -1371,6 +1484,9 @@ def quick_damage_checkin():
     if submitted:
         if not all([ra, vehicle, charge_mode, operator, description]):
             st.error("Compila RA, categoria veicolo, modalità, operatore e descrizione.")
+            return
+        if not photos:
+            st.error("Allega almeno una fotografia del danno prima di salvare.")
             return
         if len(photos or []) > 10:
             st.error("Puoi allegare al massimo 10 fotografie per check-in.")
@@ -1446,6 +1562,13 @@ def damage_form(frame):
         c5.caption("Compilato automaticamente dall’utente collegato.")
     description = st.text_area("Descrizione sintetica del danno *", value=current.get("description", ""), key=f"{prefix}_damage_description")
     photo_url = st.text_input("Collegamento foto danno", value=current.get("photo_url", ""), key=f"{prefix}_damage_photo")
+    existing_photo_total = len(damage_photos(current["id"])) if current else 0
+    new_photos = st.file_uploader(
+        "Aggiungi fotografie",
+        type=["jpg", "jpeg", "png", "webp", "heic"], accept_multiple_files=True,
+        key=f"{prefix}_damage_new_photos",
+        help=f"Fotografie già archiviate: {existing_photo_total}. Le nuove immagini verranno aggiunte.",
+    )
     c6, c7 = st.columns(2)
     amount_value = current.get("amount")
     amount = c6.number_input(
@@ -1464,14 +1587,15 @@ def damage_form(frame):
         if not all([ra, vehicle, charge_mode, operator, description]):
             st.error("Compila RA, categoria veicolo, modalità, operatore e descrizione.")
         else:
-            save_damage({
+            saved_damage_id = save_damage({
                 "id": current.get("id"), "source_key": current.get("source_key"),
                 "submitted_at": current.get("submitted_at"), "control_date": control_date.isoformat(),
                 "ra": ra, "vehicle_category": vehicle, "charge_mode": charge_mode,
                 "operator": operator, "description": description, "photo_url": photo_url,
                 "amount": amount if amount > 0 else None, "payment_status": status, "notes": notes,
             })
-            st.success("Segnalazione danno salvata.")
+            added_photos = save_damage_photos(saved_damage_id, new_photos)
+            st.success(f"Segnalazione danno salvata. Nuove fotografie aggiunte: {added_photos}.")
             st.rerun()
     if current:
         confirm = st.checkbox(f"Confermo l’eliminazione definitiva della segnalazione {current['ra']}")
@@ -1481,6 +1605,299 @@ def damage_form(frame):
                 conn.execute("DELETE FROM damage_charges WHERE id = ?", (current["id"],))
             st.success("Segnalazione eliminata.")
             st.rerun()
+
+
+def cash_filters(frame):
+    if frame.empty:
+        return frame
+    st.sidebar.subheader("Filtri cassa")
+    years = sorted(frame["movement_date"].dropna().dt.year.unique().tolist(), reverse=True)
+    selected_years = st.sidebar.multiselect("Anno cassa", years, default=years[:1])
+    movement_types = sorted(frame["movement_type"].dropna().unique().tolist())
+    selected_types = st.sidebar.multiselect("Tipo movimento", movement_types)
+    methods = sorted(frame["payment_method"].dropna().unique().tolist())
+    selected_methods = st.sidebar.multiselect("Metodo", methods)
+    search = st.sidebar.text_input("Cerca RA o note")
+    result = frame.copy()
+    if selected_years:
+        result = result[result["movement_date"].dt.year.isin(selected_years)]
+    if selected_types:
+        result = result[result["movement_type"].isin(selected_types)]
+    if selected_methods:
+        result = result[result["payment_method"].isin(selected_methods)]
+    if search:
+        needle = upper(search)
+        mask = result[["ra", "notes", "operator"]].fillna("").apply(
+            lambda column: column.str.upper().str.contains(needle, regex=False)
+        ).any(axis=1)
+        result = result[mask]
+    return result
+
+
+def cash_dashboard(frame):
+    st.header("Dashboard cassa")
+    filtered = cash_filters(frame)
+    if frame.empty:
+        st.info("Nessun movimento di cassa presente.")
+        return
+    total_in = float(filtered.loc[filtered["effect"].gt(0), "effect"].sum()) if not filtered.empty else 0
+    total_out = abs(float(filtered.loc[filtered["effect"].lt(0), "effect"].sum())) if not filtered.empty else 0
+    current_balance = cash_balance(frame)
+    open_deposits = frame[frame["ra"].fillna("").ne("")].groupby("ra", as_index=False)["effect"].sum()
+    open_deposits = open_deposits[open_deposits["effect"].gt(0.009)]
+    columns = st.columns(4)
+    columns[0].metric("Saldo cassa attuale", f"€ {current_balance:,.2f}")
+    columns[1].metric("Entrate filtrate", f"€ {total_in:,.2f}")
+    columns[2].metric("Uscite filtrate", f"€ {total_out:,.2f}")
+    columns[3].metric("RA con deposito aperto", len(open_deposits))
+    if filtered.empty:
+        st.info("Nessun movimento corrisponde ai filtri selezionati.")
+        return
+    daily = filtered.dropna(subset=["movement_date"]).copy()
+    daily["giorno"] = daily["movement_date"].dt.date
+    daily = daily.groupby("giorno", as_index=False).agg(entrate=("effect", lambda x: x[x > 0].sum()), uscite=("effect", lambda x: abs(x[x < 0].sum())))
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(
+        px.bar(daily, x="giorno", y=["entrate", "uscite"], barmode="group", title="Entrate e uscite giornaliere"),
+        use_container_width=True,
+    )
+    by_type = filtered.groupby("movement_type", as_index=False)["amount"].sum()
+    c2.plotly_chart(px.bar(by_type, x="movement_type", y="amount", title="Movimenti per tipologia"), use_container_width=True)
+    if not open_deposits.empty:
+        st.subheader("Depositi ancora presenti per RA")
+        open_deposits = open_deposits.rename(columns={"ra": "RA", "effect": "Residuo"}).sort_values("Residuo", ascending=False)
+        st.dataframe(open_deposits, use_container_width=True, hide_index=True, column_config={"Residuo": st.column_config.NumberColumn(format="€ %.2f")})
+
+
+def cash_movement_form(frame):
+    st.header("Inserimento e modifica movimento cassa")
+    records = {row.id: row for row in frame.itertuples()} if not frame.empty else {}
+    selected = st.selectbox(
+        "Movimento da modificare (lascia vuoto per inserirne uno nuovo)",
+        [""] + list(records),
+        format_func=lambda item_id: "" if not item_id else (
+            f"{records[item_id].movement_date.date()} | {records[item_id].movement_type} | "
+            f"{records[item_id].ra or 'SENZA RA'} | € {records[item_id].amount:.2f}"
+        ),
+    )
+    current = frame[frame["id"].eq(selected)].iloc[0].to_dict() if selected else {}
+    prefix = current.get("id", "new_cash_movement")
+    c1, c2, c3 = st.columns(3)
+    movement_date = c1.date_input(
+        "Data movimento *",
+        value=current["movement_date"].date() if current and pd.notna(current.get("movement_date")) else date.today(),
+        key=f"{prefix}_cash_date",
+    )
+    all_types = CASH_IN_TYPES + CASH_OUT_TYPES
+    current_type = upper(current.get("movement_type", ""))
+    movement_type = c2.selectbox(
+        "Tipo movimento *", [""] + all_types,
+        index=([""] + all_types).index(current_type) if current_type in all_types else 0,
+        key=f"{prefix}_cash_type",
+    )
+    amount = c3.number_input(
+        "Importo *", min_value=0.0, step=10.0,
+        value=float(current.get("amount") or 0), key=f"{prefix}_cash_amount",
+    )
+    c4, c5, c6 = st.columns(3)
+    ra = c4.text_input("RA", value=current.get("ra", ""), key=f"{prefix}_cash_ra")
+    methods = ["CONTANTI", "ASSEGNO", "CARTA", "BONIFICO", "ALTRO"]
+    current_method = upper(current.get("payment_method", "")) or "CONTANTI"
+    method = c5.selectbox("Metodo *", methods, index=methods.index(current_method) if current_method in methods else 0, key=f"{prefix}_cash_method")
+    linked_operator = current_operator() if not user_is_admin() else ""
+    operator_options = [row["name"] for row in configured_operators()]
+    if linked_operator and linked_operator not in operator_options:
+        operator_options.append(linked_operator)
+    current_operator_value = linked_operator or upper(current.get("operator", ""))
+    if current_operator_value and current_operator_value not in operator_options:
+        operator_options.append(current_operator_value)
+    operator = c6.selectbox(
+        "Operatore *", [""] + operator_options,
+        index=([""] + operator_options).index(current_operator_value) if current_operator_value else 0,
+        disabled=bool(linked_operator), key=f"{prefix}_cash_operator",
+    )
+    notes = st.text_area("Note", value=current.get("notes", ""), key=f"{prefix}_cash_notes")
+    effect = cash_effect(movement_type, amount) if movement_type else 0
+    st.info(f"Effetto sul saldo: € {effect:,.2f}")
+    if st.button("Salva movimento", type="primary", use_container_width=True):
+        if not movement_type or amount <= 0 or not operator:
+            st.error("Compila tipo movimento, importo e operatore.")
+        elif movement_type in {"DEPOSITO", "INCASSO", "RIMBORSO"} and not ra:
+            st.error("Per depositi, incassi e rimborsi è obbligatorio indicare il RA.")
+        else:
+            save_cash_movement({
+                "id": current.get("id"), "source_key": current.get("source_key"),
+                "movement_date": movement_date.isoformat(), "ra": ra,
+                "movement_type": movement_type, "amount": amount, "payment_method": method,
+                "operator": operator, "notes": notes, "created_at": current.get("created_at"),
+            })
+            st.success("Movimento salvato.")
+            st.rerun()
+    if current:
+        confirm = st.checkbox("Confermo l’eliminazione definitiva del movimento")
+        if st.button("Elimina movimento", disabled=not confirm, use_container_width=True):
+            with db() as conn:
+                conn.execute("DELETE FROM cash_movements WHERE id = ?", (current["id"],))
+            st.success("Movimento eliminato.")
+            st.rerun()
+
+
+def cash_archive(frame):
+    st.header("Archivio movimenti cassa")
+    filtered = cash_filters(frame)
+    if filtered.empty:
+        st.info("Nessun movimento disponibile.")
+        return
+    display = filtered[["movement_date", "ra", "movement_type", "amount", "effect", "payment_method", "operator", "notes"]].copy()
+    display.columns = ["Data", "RA", "Tipo", "Importo", "Effetto saldo", "Metodo", "Operatore", "Note"]
+    st.dataframe(
+        display, use_container_width=True, hide_index=True,
+        column_config={
+            "Data": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Importo": st.column_config.NumberColumn(format="€ %.2f"),
+            "Effetto saldo": st.column_config.NumberColumn(format="€ %.2f"),
+        },
+    )
+    st.download_button(
+        "Esporta archivio cassa in Excel", table_to_excel(display, "Movimenti cassa"),
+        "archivio_cassa.xlsx", use_container_width=True,
+    )
+
+
+def cash_closing_page(frame):
+    st.header("Conteggio e chiusura cassa")
+    expected = cash_balance(frame)
+    st.metric("Saldo contabile atteso", f"€ {expected:,.2f}")
+    denominations = [200, 100, 50, 20, 10, 5, 2, 1, 0.50, 0.20, 0.10, 0.05]
+    counts = {}
+    st.subheader("Conteggio contanti")
+    columns = st.columns(4)
+    for index, denomination in enumerate(denominations):
+        label = f"€ {denomination:g}"
+        counts[str(denomination)] = columns[index % 4].number_input(label, min_value=0, step=1, key=f"cash_count_{denomination}")
+    counted_cash = sum(float(value) * int(counts[str(value)]) for value in denominations)
+    checks_total = st.number_input("Totale assegni presenti", min_value=0.0, step=10.0)
+    physical_total = counted_cash + checks_total
+    difference = physical_total - expected
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Contanti contati", f"€ {counted_cash:,.2f}")
+    c2.metric("Totale fisico", f"€ {physical_total:,.2f}")
+    c3.metric("Differenza", f"€ {difference:,.2f}")
+    operator = current_operator()
+    if not operator:
+        operator = st.selectbox("Operatore chiusura *", [""] + [row["name"] for row in configured_operators()])
+    else:
+        st.info(f"Operatore: {operator}")
+    notes = st.text_area("Note chiusura")
+    if st.button("Registra chiusura cassa", type="primary", use_container_width=True):
+        if not operator:
+            st.error("Seleziona l’operatore.")
+        else:
+            with db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO cash_closings
+                    (id, closing_date, expected_balance, counted_cash, checks_total, difference, denominations, operator, notes, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(closing_date) DO UPDATE SET
+                        expected_balance=excluded.expected_balance, counted_cash=excluded.counted_cash,
+                        checks_total=excluded.checks_total, difference=excluded.difference,
+                        denominations=excluded.denominations, operator=excluded.operator,
+                        notes=excluded.notes, created_at=excluded.created_at
+                    """,
+                    (
+                        str(uuid.uuid4()), date.today().isoformat(), expected, counted_cash, checks_total,
+                        difference, json.dumps(counts), operator, clean(notes), datetime.now().isoformat(timespec="seconds"),
+                    ),
+                )
+            st.success("Chiusura cassa registrata.")
+            st.rerun()
+    closings = load_cash_closings()
+    if not closings.empty:
+        st.subheader("Storico chiusure")
+        display = closings[["closing_date", "expected_balance", "counted_cash", "checks_total", "difference", "operator", "notes"]].copy()
+        display.columns = ["Data", "Saldo atteso", "Contanti", "Assegni", "Differenza", "Operatore", "Note"]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+def import_cash_workbook(file_bytes):
+    book = pd.ExcelFile(io.BytesIO(file_bytes))
+    added = 0
+    skipped = 0
+    opening_added = False
+    for sheet in book.sheet_names:
+        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, dtype=object)
+        header_row = None
+        for index in range(min(12, len(raw))):
+            values = [upper(value) for value in raw.iloc[index, :6].tolist()]
+            if "RA" in values and any("DATA APERTURA" in value for value in values):
+                header_row = index
+                break
+        if header_row is None:
+            continue
+        if not opening_added and header_row + 1 < len(raw):
+            opening_label = upper(raw.iloc[header_row + 1, 0])
+            opening_value = pd.to_numeric(raw.iloc[header_row + 1, 5], errors="coerce")
+            if "RIMANENZA" in opening_label and pd.notna(opening_value) and float(opening_value) != 0:
+                source_dates = pd.concat([
+                    pd.to_datetime(raw.iloc[header_row + 1:, 1], errors="coerce"),
+                    pd.to_datetime(raw.iloc[header_row + 1:, 3], errors="coerce"),
+                ]).dropna()
+                opening_date = source_dates.min().date() if not source_dates.empty else date.today()
+                save_cash_movement({
+                    "source_key": f"cash-opening|{sheet}|{header_row + 2}",
+                    "movement_date": opening_date.isoformat(), "movement_type": "RETTIFICA POSITIVA",
+                    "amount": abs(float(opening_value)), "payment_method": "CONTANTI",
+                    "operator": "IMPORTAZIONE", "notes": clean(raw.iloc[header_row + 1, 0]),
+                })
+                opening_added = True
+                added += 1
+        for row_index in range(header_row + 1, len(raw)):
+            row = raw.iloc[row_index]
+            ra_raw = clean(row.iloc[0] if len(row) > 0 else "")
+            if not ra_raw or "RIMANENZA" in upper(ra_raw) or "TOTALE CASSA" in upper(ra_raw):
+                continue
+            deposit = pd.to_numeric(row.iloc[2] if len(row) > 2 else None, errors="coerce")
+            refund = pd.to_numeric(row.iloc[4] if len(row) > 4 else None, errors="coerce")
+            open_date = pd.to_datetime(row.iloc[1] if len(row) > 1 else None, errors="coerce")
+            close_date = pd.to_datetime(row.iloc[3] if len(row) > 3 else None, errors="coerce")
+            is_remittance = "RIMESSA" in upper(ra_raw)
+            imported_row = False
+            if pd.notna(deposit) and float(deposit) != 0 and pd.notna(open_date):
+                save_cash_movement({
+                    "source_key": f"cash|{sheet}|{row_index + 1}|in",
+                    "movement_date": open_date.date().isoformat(), "ra": "" if is_remittance else ra_raw,
+                    "movement_type": "DEPOSITO", "amount": abs(float(deposit)),
+                    "payment_method": "CONTANTI", "operator": "IMPORTAZIONE",
+                    "notes": f"Storico Excel — {sheet}",
+                })
+                added += 1
+                imported_row = True
+            if pd.notna(refund) and float(refund) != 0 and pd.notna(close_date):
+                save_cash_movement({
+                    "source_key": f"cash|{sheet}|{row_index + 1}|out",
+                    "movement_date": close_date.date().isoformat(), "ra": "" if is_remittance else ra_raw,
+                    "movement_type": "RIMESSA" if is_remittance else "RIMBORSO",
+                    "amount": abs(float(refund)), "payment_method": "CONTANTI",
+                    "operator": "IMPORTAZIONE", "notes": f"Storico Excel — {sheet}",
+                })
+                added += 1
+                imported_row = True
+            if not imported_row and (pd.notna(deposit) or pd.notna(refund)):
+                skipped += 1
+    return added, skipped, len(book.sheet_names)
+
+
+def cash_import_page():
+    st.header("Importazione storico cassa")
+    st.caption("Importa i fogli mensili con colonne RA, data apertura, deposito/incasso, data chiusura e rimborso.")
+    upload = st.file_uploader("File Excel cassa", type=["xlsx"], key="cash_history_upload")
+    if upload and st.button("Importa storico cassa", type="primary", use_container_width=True):
+        added, skipped, sheets = import_cash_workbook(upload.getvalue())
+        st.success(f"Elaborati {sheets} fogli e importati o aggiornati {added} movimenti.")
+        if skipped:
+            st.info(f"Righe non importabili perché prive di data: {skipped}.")
+        st.rerun()
 
 
 def import_backup():
@@ -1776,6 +2193,7 @@ st.caption("Importazione automatica dei report, archivio contratti, statistiche,
 all_data = load_data()
 all_contracts = load_contracts()
 all_damages = load_damages()
+all_cash_movements = load_cash_movements()
 
 navigation = {
     "ANCILLARY": [
@@ -1794,6 +2212,13 @@ navigation = {
         ("📊 Analisi addebito danni", "Analisi addebito danni"),
         ("🗂️ Archivio addebito danni", "Archivio addebito danni"),
         ("➕ Inserimento addebito danni", "Inserimento addebito danni"),
+    ],
+    "CASSA": [
+        ("📊 Dashboard cassa", "Dashboard cassa"),
+        ("➕ Inserimento movimento", "Inserimento movimento cassa"),
+        ("🗂️ Archivio movimenti", "Archivio movimenti cassa"),
+        ("🧮 Conteggio e chiusura", "Conteggio e chiusura cassa"),
+        ("📥 Importazione storico", "Importazione storico cassa"),
     ],
     "AMMINISTRAZIONE": [
         ("🔐 Utenti e autorizzazioni", "Utenti e autorizzazioni"),
@@ -1861,6 +2286,16 @@ elif page == "Inserimento addebito danni":
     damage_form(all_damages)
 elif page == "Check-in rapido danni":
     quick_damage_checkin()
+elif page == "Dashboard cassa":
+    cash_dashboard(all_cash_movements)
+elif page == "Inserimento movimento cassa":
+    cash_movement_form(all_cash_movements)
+elif page == "Archivio movimenti cassa":
+    cash_archive(all_cash_movements)
+elif page == "Conteggio e chiusura cassa":
+    cash_closing_page(all_cash_movements)
+elif page == "Importazione storico cassa":
+    cash_import_page()
 elif page == "Archivio ancillary":
     archive(filtered)
 elif page == "Archivio contratti RA":
