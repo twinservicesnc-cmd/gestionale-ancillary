@@ -23,7 +23,11 @@ PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "AMM
 CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
 CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
 
-st.set_page_config(page_title="Gestionale Ancillary", page_icon="🚗", layout="wide")
+st.set_page_config(
+    page_title="Gestionale Noleggi, Ancillary e Danni",
+    page_icon=str(APP_DIR / "logo_gestionale.png"),
+    layout="wide",
+)
 
 
 def db():
