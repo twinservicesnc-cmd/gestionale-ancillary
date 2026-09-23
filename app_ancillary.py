@@ -823,6 +823,80 @@ def contracts_dashboard(frame):
     st.dataframe(by_operator.sort_values("valore", ascending=False), use_container_width=True, hide_index=True)
 
 
+def ancillary_ra_dashboard(frame):
+    st.header("Analisi ancillary RA")
+    st.caption("Tutti i valori provengono dai report Analisi contratti e seguono i filtri selezionati, incluso il gruppo assegnato.")
+    frame = contract_filters(frame)
+    if frame.empty:
+        st.info("Nessun dato ancillary disponibile per i filtri selezionati.")
+        return
+
+    contracts = len(frame)
+    with_ancillary = int(frame["has_ancillary_ra"].sum())
+    days = int(frame["duration_days"].fillna(0).sum())
+    ancillary_value = float(frame["ancillary_value"].fillna(0).sum())
+    ancillary_rpd = ancillary_value / days if days else 0
+    penetration = with_ancillary / contracts if contracts else 0
+    ticket = ancillary_value / with_ancillary if with_ancillary else 0
+    cols = st.columns(6)
+    cols[0].metric("Contratti analizzati", f"{contracts:,}".replace(",", "."))
+    cols[1].metric("Con ancillary", f"{with_ancillary:,}".replace(",", "."))
+    cols[2].metric("Penetrazione", f"{penetration:.1%}")
+    cols[3].metric("Valore ancillary", f"€ {ancillary_value:,.0f}".replace(",", "."))
+    cols[4].metric("RPD ancillary", f"€ {ancillary_rpd:.2f}".replace(".", ","))
+    cols[5].metric("Ticket medio ancillary", f"€ {ticket:.2f}".replace(".", ","))
+
+    daily = frame.copy()
+    daily["data"] = daily["contract_date"].dt.date
+    by_day = daily.groupby("data", as_index=False).agg(
+        valore_ancillary=("ancillary_value", "sum"),
+        contratti=("id", "count"),
+        contratti_con_ancillary=("has_ancillary_ra", "sum"),
+    )
+    by_day["penetrazione"] = by_day["contratti_con_ancillary"].div(by_day["contratti"].replace(0, pd.NA))
+
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(
+        px.line(by_day, x="data", y="valore_ancillary", markers=True, title="Valore ancillary per giorno"),
+        use_container_width=True,
+    )
+    by_operator = frame.groupby("operator", as_index=False).agg(
+        contratti=("id", "count"), giorni=("duration_days", "sum"),
+        valore_ancillary=("ancillary_value", "sum"), contratti_con_ancillary=("has_ancillary_ra", "sum"),
+    )
+    by_operator["rpd_ancillary"] = by_operator["valore_ancillary"].div(by_operator["giorni"].replace(0, pd.NA))
+    by_operator["penetrazione"] = by_operator["contratti_con_ancillary"].div(by_operator["contratti"].replace(0, pd.NA))
+    c2.plotly_chart(
+        px.bar(by_operator, x="operator", y="valore_ancillary", color="rpd_ancillary", title="Valore e RPD ancillary per operatore"),
+        use_container_width=True,
+    )
+
+    c3, c4 = st.columns(2)
+    by_group = frame.groupby("assigned_group", as_index=False).agg(
+        contratti=("id", "count"), giorni=("duration_days", "sum"),
+        valore_ancillary=("ancillary_value", "sum"), contratti_con_ancillary=("has_ancillary_ra", "sum"),
+    )
+    by_group["rpd_ancillary"] = by_group["valore_ancillary"].div(by_group["giorni"].replace(0, pd.NA))
+    by_group["penetrazione"] = by_group["contratti_con_ancillary"].div(by_group["contratti"].replace(0, pd.NA))
+    c3.plotly_chart(
+        px.bar(by_group.sort_values("valore_ancillary", ascending=False), x="assigned_group", y="valore_ancillary", color="penetrazione", title="Ancillary per gruppo assegnato"),
+        use_container_width=True,
+    )
+    by_mix = frame.groupby(["rental_channel", "rental_term", "contract_vehicle"], as_index=False).agg(
+        contratti=("id", "count"), valore_ancillary=("ancillary_value", "sum"),
+    )
+    by_mix["combinazione"] = by_mix["rental_channel"] + " - " + by_mix["rental_term"]
+    c4.plotly_chart(
+        px.bar(by_mix, x="combinazione", y="valore_ancillary", color="contract_vehicle", barmode="group", title="Ancillary per tipo, durata e veicolo"),
+        use_container_width=True,
+    )
+
+    st.subheader("Statistiche ancillary per gruppo assegnato")
+    st.dataframe(by_group.sort_values("valore_ancillary", ascending=False), use_container_width=True, hide_index=True)
+    st.subheader("Statistiche ancillary per operatore")
+    st.dataframe(by_operator.sort_values("valore_ancillary", ascending=False), use_container_width=True, hide_index=True)
+
+
 def contracts_archive(frame):
     st.header("Archivio contratti RA")
     frame = contract_filters(frame)
@@ -1016,7 +1090,7 @@ filtered = filters(all_data) if not all_data.empty else all_data
 page = st.sidebar.radio(
     "Sezione",
     [
-        "Dashboard ancillary", "Analisi contratti RA", "Analisi incrociata",
+        "Dashboard ancillary", "Analisi contratti RA", "Analisi ancillary RA", "Analisi incrociata",
         "Archivio ancillary", "Archivio contratti RA", "Inserimento / modifica",
         "Configurazione operatori", "Importazione e backup",
     ],
@@ -1026,6 +1100,8 @@ if page == "Dashboard ancillary":
     dashboard(filtered)
 elif page == "Analisi contratti RA":
     contracts_dashboard(all_contracts)
+elif page == "Analisi ancillary RA":
+    ancillary_ra_dashboard(all_contracts)
 elif page == "Analisi incrociata":
     combined_analysis(all_contracts, all_data)
 elif page == "Archivio ancillary":
