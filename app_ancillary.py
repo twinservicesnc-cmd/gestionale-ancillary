@@ -1,4 +1,6 @@
 import io
+import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -17,6 +19,7 @@ SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
 DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 ANCILLARY_START_DATE = date(2026, 10, 1)
+PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "AMMINISTRAZIONE"]
 
 st.set_page_config(page_title="Gestionale Ancillary", page_icon="🚗", layout="wide")
 
@@ -181,6 +184,20 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                display_name TEXT,
+                operator_name TEXT,
+                permissions TEXT NOT NULL DEFAULT '[]',
+                active INTEGER NOT NULL DEFAULT 1,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         cleanup_done = conn.execute(
             "SELECT value FROM app_meta WHERE key = 'ancillary_history_cleared_2026_10_01'"
         ).fetchone()
@@ -232,6 +249,41 @@ def configured_operators(active_only=True):
     query += " ORDER BY name"
     with db() as conn:
         return [dict(row) for row in conn.execute(query).fetchall()]
+
+
+def password_hash(password, salt=None):
+    salt = salt or uuid.uuid4().hex
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
+    return f"pbkdf2_sha256${salt}${digest}"
+
+
+def password_matches(password, stored_hash):
+    try:
+        algorithm, salt, expected = stored_hash.split("$", 2)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        actual = password_hash(password, salt).split("$", 2)[2]
+        return hmac.compare_digest(actual, expected)
+    except (AttributeError, ValueError):
+        return False
+
+
+def current_user():
+    return st.session_state.get("current_user", {})
+
+
+def current_operator():
+    return upper(current_user().get("operator_name", ""))
+
+
+def user_is_admin():
+    return bool(current_user().get("is_admin"))
+
+
+def allowed_areas():
+    if user_is_admin():
+        return set(PERMISSION_AREAS)
+    return set(current_user().get("permissions", []))
 
 
 def normalize_ra(value):
@@ -1243,14 +1295,20 @@ def damage_form(frame):
         key=f"{prefix}_damage_mode",
     )
     operator_options = [""] + [row["name"] for row in configured_operators()]
-    current_operator = upper(current.get("operator", ""))
-    if current_operator and current_operator not in operator_options:
-        operator_options.append(current_operator)
+    current_operator_value = upper(current.get("operator", ""))
+    linked_operator = current_operator() if not user_is_admin() else ""
+    if linked_operator:
+        current_operator_value = linked_operator
+    if current_operator_value and current_operator_value not in operator_options:
+        operator_options.append(current_operator_value)
     operator = c5.selectbox(
         "Operatore responsabile *", operator_options,
-        index=operator_options.index(current_operator) if current_operator in operator_options else 0,
+        index=operator_options.index(current_operator_value) if current_operator_value in operator_options else 0,
         key=f"{prefix}_damage_operator",
+        disabled=bool(linked_operator),
     )
+    if linked_operator:
+        c5.caption("Compilato automaticamente dall’utente collegato.")
     description = st.text_area("Descrizione sintetica del danno *", value=current.get("description", ""), key=f"{prefix}_damage_description")
     photo_url = st.text_input("Collegamento foto danno", value=current.get("photo_url", ""), key=f"{prefix}_damage_photo")
     c6, c7 = st.columns(2)
@@ -1411,20 +1469,165 @@ def operator_settings():
         st.rerun()
 
 
+def user_settings():
+    st.header("Utenti e autorizzazioni")
+    if not user_is_admin():
+        st.error("Questa funzione è riservata agli amministratori.")
+        return
+
+    st.caption("Crea gli accessi personali, collega l’operatore e scegli le aree visibili nel menu.")
+    operator_names = [row["name"] for row in configured_operators()]
+
+    with st.expander("Crea un nuovo utente", expanded=True):
+        with st.form("create_app_user", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            username = c1.text_input("Username *")
+            display_name = c2.text_input("Nome visualizzato *")
+            c3, c4 = st.columns(2)
+            password = c3.text_input("Password iniziale *", type="password")
+            operator_name = c4.selectbox("Operatore collegato", [""] + operator_names)
+            permissions = st.multiselect("Aree autorizzate *", PERMISSION_AREAS)
+            is_admin = st.checkbox("Amministratore: accesso completo e gestione utenti")
+            submitted = st.form_submit_button("Crea utente", type="primary", use_container_width=True)
+        if submitted:
+            normalized_username = clean(username).lower()
+            if not normalized_username or not display_name:
+                st.error("Inserisci username e nome visualizzato.")
+            elif len(password) < 8:
+                st.error("La password deve contenere almeno 8 caratteri.")
+            elif not is_admin and not permissions:
+                st.error("Seleziona almeno un’area autorizzata.")
+            else:
+                try:
+                    with db() as conn:
+                        conn.execute(
+                            """
+                            INSERT INTO app_users
+                            (username, password_hash, display_name, operator_name, permissions, active, is_admin, created_at)
+                            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                            """,
+                            (
+                                normalized_username, password_hash(password), clean(display_name),
+                                upper(operator_name), json.dumps(permissions), int(is_admin),
+                                datetime.now().isoformat(timespec="seconds"),
+                            ),
+                        )
+                    st.success(f"Utente {normalized_username} creato.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Questo username esiste già.")
+
+    with db() as conn:
+        users = [dict(row) for row in conn.execute("SELECT * FROM app_users ORDER BY username").fetchall()]
+    if not users:
+        st.info("Non sono ancora presenti utenti personali. L’accesso admin configurato nei Secrets resta attivo.")
+        return
+
+    summary = pd.DataFrame([
+        {
+            "Username": row["username"], "Nome": row["display_name"],
+            "Operatore": row["operator_name"], "Aree": " · ".join(json.loads(row["permissions"] or "[]")),
+            "Amministratore": bool(row["is_admin"]), "Attivo": bool(row["active"]),
+        }
+        for row in users
+    ])
+    st.subheader("Utenti configurati")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    selected_username = st.selectbox("Utente da modificare", [row["username"] for row in users])
+    selected = next(row for row in users if row["username"] == selected_username)
+    selected_permissions = json.loads(selected["permissions"] or "[]")
+    with st.form(f"edit_user_{selected_username}"):
+        c1, c2 = st.columns(2)
+        edited_name = c1.text_input("Nome visualizzato", value=selected["display_name"] or "")
+        existing_operator = upper(selected["operator_name"])
+        edit_operator_options = [""] + operator_names
+        if existing_operator and existing_operator not in edit_operator_options:
+            edit_operator_options.append(existing_operator)
+        edited_operator = c2.selectbox(
+            "Operatore collegato", edit_operator_options,
+            index=edit_operator_options.index(existing_operator) if existing_operator in edit_operator_options else 0,
+        )
+        edited_permissions = st.multiselect("Aree autorizzate", PERMISSION_AREAS, default=selected_permissions)
+        c3, c4 = st.columns(2)
+        edited_admin = c3.checkbox("Amministratore", value=bool(selected["is_admin"]))
+        edited_active = c4.checkbox("Utente attivo", value=bool(selected["active"]))
+        new_password = st.text_input("Nuova password (lascia vuoto per non cambiarla)", type="password")
+        save_user = st.form_submit_button("Salva modifiche", type="primary", use_container_width=True)
+    if save_user:
+        if not edited_name:
+            st.error("Il nome visualizzato è obbligatorio.")
+        elif new_password and len(new_password) < 8:
+            st.error("La nuova password deve contenere almeno 8 caratteri.")
+        elif not edited_admin and not edited_permissions:
+            st.error("Seleziona almeno un’area autorizzata.")
+        else:
+            with db() as conn:
+                conn.execute(
+                    """
+                    UPDATE app_users SET display_name = ?, operator_name = ?, permissions = ?,
+                    active = ?, is_admin = ? WHERE username = ?
+                    """,
+                    (
+                        clean(edited_name), upper(edited_operator), json.dumps(edited_permissions),
+                        int(edited_active), int(edited_admin), selected_username,
+                    ),
+                )
+                if new_password:
+                    conn.execute(
+                        "UPDATE app_users SET password_hash = ? WHERE username = ?",
+                        (password_hash(new_password), selected_username),
+                    )
+            st.success("Utente aggiornato.")
+            st.rerun()
+
+    confirm_delete = st.checkbox(f"Confermo l’eliminazione dell’utente {selected_username}")
+    if st.button("Elimina utente", disabled=not confirm_delete, use_container_width=True):
+        with db() as conn:
+            conn.execute("DELETE FROM app_users WHERE username = ?", (selected_username,))
+        st.success("Utente eliminato.")
+        st.rerun()
+
+
 def login():
     configured = str(st.secrets.get("ADMIN_PASSWORD", "") or "").strip()
-    if not configured:
-        return True
     if st.session_state.get("authenticated"):
+        if "current_user" not in st.session_state:
+            st.session_state["current_user"] = {
+                "username": "admin", "display_name": "Amministratore", "operator_name": "",
+                "permissions": PERMISSION_AREAS, "is_admin": True,
+            }
         return True
     st.title("Gestionale Ancillary")
+    username = st.text_input("Username", value="admin")
     password = st.text_input("Password", type="password")
     if st.button("Accedi", type="primary", use_container_width=True):
-        if password == configured:
+        normalized_username = clean(username).lower()
+        if normalized_username == "admin" and configured and hmac.compare_digest(password, configured):
             st.session_state["authenticated"] = True
+            st.session_state["current_user"] = {
+                "username": "admin", "display_name": "Amministratore", "operator_name": "",
+                "permissions": PERMISSION_AREAS, "is_admin": True,
+            }
             st.rerun()
-        else:
-            st.error("Password errata.")
+        with db() as conn:
+            row = conn.execute(
+                "SELECT * FROM app_users WHERE username = ? AND active = 1", (normalized_username,)
+            ).fetchone()
+        if row and password_matches(password, row["password_hash"]):
+            st.session_state["authenticated"] = True
+            st.session_state["current_user"] = {
+                "username": row["username"], "display_name": row["display_name"],
+                "operator_name": row["operator_name"],
+                "permissions": json.loads(row["permissions"] or "[]"), "is_admin": bool(row["is_admin"]),
+            }
+            st.rerun()
+        st.error("Username o password errati.")
+    if not configured:
+        with db() as conn:
+            user_count = conn.execute("SELECT COUNT(*) FROM app_users WHERE active = 1").fetchone()[0]
+        if user_count == 0:
+            st.warning("Configura ADMIN_PASSWORD nei Secrets per attivare il primo accesso amministratore.")
     return False
 
 
@@ -1456,16 +1659,35 @@ navigation = {
         ("➕ Inserimento addebito danni", "Inserimento addebito danni"),
     ],
     "AMMINISTRAZIONE": [
+        ("🔐 Utenti e autorizzazioni", "Utenti e autorizzazioni"),
         ("👥 Configurazione operatori", "Configurazione operatori"),
         ("💾 Importazione e backup", "Importazione e backup"),
     ],
 }
 
-if "navigation_page" not in st.session_state:
-    st.session_state.navigation_page = "Dashboard ancillary"
+visible_navigation = {
+    area: functions for area, functions in navigation.items() if area in allowed_areas()
+}
+if not user_is_admin() and "AMMINISTRAZIONE" in visible_navigation:
+    visible_navigation["AMMINISTRAZIONE"] = [
+        item for item in visible_navigation["AMMINISTRAZIONE"] if item[1] != "Utenti e autorizzazioni"
+    ]
 
+visible_pages = [page_name for functions in visible_navigation.values() for _, page_name in functions]
+if not visible_pages:
+    st.error("Questo utente non ha aree autorizzate. Contatta l’amministratore.")
+    st.stop()
+if st.session_state.get("navigation_page") not in visible_pages:
+    st.session_state.navigation_page = visible_pages[0]
+
+logged_user = current_user()
+st.sidebar.success(f"👤 {logged_user.get('display_name') or logged_user.get('username')}")
+if st.sidebar.button("Esci", use_container_width=True):
+    for key in ["authenticated", "current_user", "navigation_page"]:
+        st.session_state.pop(key, None)
+    st.rerun()
 st.sidebar.subheader("Menu")
-for area, functions in navigation.items():
+for area, functions in visible_navigation.items():
     area_pages = [page_name for _, page_name in functions]
     with st.sidebar.expander(area, expanded=st.session_state.navigation_page in area_pages):
         for button_label, page_name in functions:
@@ -1508,5 +1730,7 @@ elif page == "Inserimento ancillary":
     record_form(all_data)
 elif page == "Configurazione operatori":
     operator_settings()
+elif page == "Utenti e autorizzazioni":
+    user_settings()
 else:
     import_backup()
