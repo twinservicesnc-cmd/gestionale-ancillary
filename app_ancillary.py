@@ -15,6 +15,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ancillary.db"
 SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
+DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 ANCILLARY_START_DATE = date(2026, 10, 1)
 
 st.set_page_config(page_title="Gestionale Ancillary", page_icon="🚗", layout="wide")
@@ -142,6 +143,38 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS damage_charges (
+                id TEXT PRIMARY KEY,
+                source_key TEXT NOT NULL UNIQUE,
+                submitted_at TEXT,
+                control_date TEXT,
+                ra TEXT NOT NULL,
+                vehicle_category TEXT,
+                charge_mode TEXT,
+                operator TEXT,
+                description TEXT,
+                photo_url TEXT,
+                amount REAL,
+                payment_status TEXT,
+                notes TEXT
+            )
+            """
+        )
+        damage_count = conn.execute("SELECT COUNT(*) FROM damage_charges").fetchone()[0]
+        if damage_count == 0 and DAMAGE_SEED_PATH.exists():
+            damages = json.loads(DAMAGE_SEED_PATH.read_text(encoding="utf-8"))
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO damage_charges VALUES (
+                    :id,:source_key,:submitted_at,:control_date,:ra,
+                    :vehicle_category,:charge_mode,:operator,:description,
+                    :photo_url,:amount,:payment_status,:notes
+                )
+                """,
+                damages,
+            )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS app_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -166,6 +199,9 @@ def init_db():
                 UNION
                 SELECT DISTINCT TRIM(operator) AS name FROM contracts
                 WHERE TRIM(COALESCE(operator, '')) <> ''
+                UNION
+                SELECT DISTINCT TRIM(operator) AS name FROM damage_charges
+                WHERE TRIM(COALESCE(operator, '')) <> ''
                 """
             ).fetchall()
             conn.executemany(
@@ -175,6 +211,13 @@ def init_db():
 
 
 def clean(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
@@ -304,6 +347,73 @@ def load_data():
     return frame
 
 
+def classify_damage(description):
+    text = upper(description)
+    categories = [
+        ("PARAURTI", "PARAURTI"), ("PARABREZZA", "PARABREZZA"),
+        ("PARAFANGO", "PARAFANGO"), ("PORTA", "PORTA/PORTIERA"),
+        ("PORTIER", "PORTA/PORTIERA"), ("FIANC", "FIANCATA"),
+        ("SPECCHI", "SPECCHIETTO"), ("CERCH", "CERCHIO/PNEUMATICO"),
+        ("PNEUM", "CERCHIO/PNEUMATICO"), ("FARO", "FARO/FANALE"),
+        ("FANAL", "FARO/FANALE"), ("TETTO", "TETTO"),
+        ("INTERN", "INTERNI"), ("BOLLO", "AMMACCATURA/BOLLO"),
+        ("AMMAC", "AMMACCATURA/BOLLO"),
+    ]
+    return next((label for marker, label in categories if marker in text), "ALTRO/DA CLASSIFICARE")
+
+
+def save_damage(record):
+    record_id = record.get("id") or str(uuid.uuid4())
+    submitted_at = record.get("submitted_at") or datetime.now().isoformat(timespec="seconds")
+    source_key = clean(record.get("source_key")) or record_id
+    payload = {
+        "id": record_id,
+        "source_key": source_key,
+        "submitted_at": submitted_at,
+        "control_date": clean(record.get("control_date")),
+        "ra": normalize_ra(record.get("ra")),
+        "vehicle_category": upper(record.get("vehicle_category")),
+        "charge_mode": upper(record.get("charge_mode")),
+        "operator": upper(record.get("operator")),
+        "description": upper(record.get("description")),
+        "photo_url": clean(record.get("photo_url")),
+        "amount": record.get("amount"),
+        "payment_status": upper(record.get("payment_status")) or "DA VERIFICARE",
+        "notes": clean(record.get("notes")),
+    }
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO damage_charges VALUES (
+                :id,:source_key,:submitted_at,:control_date,:ra,
+                :vehicle_category,:charge_mode,:operator,:description,
+                :photo_url,:amount,:payment_status,:notes
+            )
+            ON CONFLICT(source_key) DO UPDATE SET
+                submitted_at=:submitted_at, control_date=:control_date, ra=:ra,
+                vehicle_category=:vehicle_category, charge_mode=:charge_mode,
+                operator=:operator, description=:description, photo_url=:photo_url,
+                amount=:amount, payment_status=:payment_status, notes=:notes
+            """,
+            payload,
+        )
+
+
+def load_damages():
+    with db() as conn:
+        frame = pd.read_sql_query(
+            "SELECT * FROM damage_charges ORDER BY control_date DESC, submitted_at DESC", conn
+        )
+    if frame.empty:
+        return frame
+    frame["submitted_at"] = pd.to_datetime(frame["submitted_at"], errors="coerce")
+    frame["control_date"] = pd.to_datetime(frame["control_date"], errors="coerce")
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
+    frame["damage_category"] = frame["description"].map(classify_damage)
+    frame["has_photo"] = frame["photo_url"].fillna("").str.strip().ne("")
+    return frame
+
+
 def load_contracts():
     with db() as conn:
         frame = pd.read_sql_query("SELECT * FROM contracts ORDER BY contract_date DESC, ra DESC", conn)
@@ -343,6 +453,12 @@ def detect_excel_type(file_bytes):
         if _find_header_row(raw) is not None:
             return "CONTRATTI_RA"
     first = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, nrows=5, dtype=object)
+    damage_columns = {
+        "Informazioni cronologiche", "Numero RA (Rental Agreement)",
+        "Categoria Veicolo", "Modalità di addebito", "Operatore responsabile",
+    }
+    if damage_columns.issubset(first.columns):
+        return "ADDEBITO_DANNI"
     if {"RA (Rental Agreement)", "DATA INIZIO NOLEGGIO", "GIORNI NOLEGGIO", "FONTE"}.issubset(first.columns):
         return "ANCILLARY"
     return "SCONOSCIUTO"
@@ -435,6 +551,45 @@ def import_contract_workbook(file_bytes, file_name):
             )
             imported += 1
     return imported, site_name, period
+
+
+def import_damage_workbook(file_bytes, file_name):
+    book = pd.ExcelFile(io.BytesIO(file_bytes))
+    imported = 0
+    skipped = 0
+    for sheet in book.sheet_names:
+        frame = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, dtype=object)
+        required = {
+            "Informazioni cronologiche", "Numero RA (Rental Agreement)",
+            "Categoria Veicolo", "Modalità di addebito", "Operatore responsabile",
+        }
+        if not required.issubset(frame.columns):
+            continue
+        for _, row in frame.iterrows():
+            ra = normalize_ra(row.get("Numero RA (Rental Agreement)"))
+            if not ra:
+                skipped += 1
+                continue
+            submitted = pd.to_datetime(row.get("Informazioni cronologiche"), errors="coerce")
+            control = pd.to_datetime(row.get("Data del controllo"), errors="coerce")
+            submitted_text = "" if pd.isna(submitted) else submitted.isoformat()
+            source_key = f"{submitted_text}|{ra}|{sheet}"
+            save_damage({
+                "source_key": source_key,
+                "submitted_at": submitted_text,
+                "control_date": "" if pd.isna(control) else control.date().isoformat(),
+                "ra": ra,
+                "vehicle_category": row.get("Categoria Veicolo"),
+                "charge_mode": row.get("Modalità di addebito"),
+                "operator": row.get("Operatore responsabile"),
+                "description": row.get("Descrizione sintetica del danno"),
+                "photo_url": row.get("Caricamento foto danno (opzionale)"),
+                "amount": None,
+                "payment_status": "DA VERIFICARE",
+                "notes": f"Importato da {file_name} - foglio {sheet}",
+            })
+            imported += 1
+    return imported, skipped
 
 
 def to_excel(frame):
@@ -947,6 +1102,193 @@ def combined_analysis(contracts, ancillary):
     st.dataframe(anomalies, use_container_width=True, hide_index=True)
 
 
+def damage_filters(frame):
+    if frame.empty:
+        return frame
+    c1, c2, c3, c4 = st.columns(4)
+    years = sorted(frame["control_date"].dropna().dt.year.unique().astype(int).tolist())
+    selected_years = c1.multiselect("Anno controllo", years, default=years)
+    vehicles = sorted(x for x in frame["vehicle_category"].dropna().unique() if x)
+    selected_vehicles = c2.multiselect("Categoria veicolo", vehicles)
+    modes = sorted(x for x in frame["charge_mode"].dropna().unique() if x)
+    selected_modes = c3.multiselect("Modalità addebito", modes)
+    operators = sorted(x for x in frame["operator"].dropna().unique() if x)
+    selected_operators = c4.multiselect("Operatore", operators)
+    c5, c6, c7 = st.columns(3)
+    categories = sorted(x for x in frame["damage_category"].dropna().unique() if x)
+    selected_categories = c5.multiselect("Tipo danno", categories)
+    statuses = sorted(x for x in frame["payment_status"].dropna().unique() if x)
+    selected_statuses = c6.multiselect("Stato addebito", statuses)
+    search = c7.text_input("Cerca RA o descrizione")
+    result = frame.copy()
+    if selected_years:
+        result = result[result["control_date"].dt.year.isin(selected_years)]
+    if selected_vehicles:
+        result = result[result["vehicle_category"].isin(selected_vehicles)]
+    if selected_modes:
+        result = result[result["charge_mode"].isin(selected_modes)]
+    if selected_operators:
+        result = result[result["operator"].isin(selected_operators)]
+    if selected_categories:
+        result = result[result["damage_category"].isin(selected_categories)]
+    if selected_statuses:
+        result = result[result["payment_status"].isin(selected_statuses)]
+    if search:
+        needle = upper(search)
+        mask = result[["ra", "description", "operator"]].fillna("").apply(
+            lambda column: column.str.upper().str.contains(needle, regex=False)
+        ).any(axis=1)
+        result = result[mask]
+    return result
+
+
+def damage_dashboard(frame):
+    st.header("Analisi addebito danni")
+    frame = damage_filters(frame)
+    if frame.empty:
+        st.info("Nessuna segnalazione danni disponibile per i filtri selezionati.")
+        return
+    total = len(frame)
+    vans = int(frame["vehicle_category"].eq("VAN").sum())
+    cars = int(frame["vehicle_category"].eq("CAR").sum())
+    photo_coverage = float(frame["has_photo"].mean()) if total else 0
+    charged = float(frame["amount"].fillna(0).sum())
+    collected = float(frame.loc[frame["payment_status"].eq("INCASSATO"), "amount"].fillna(0).sum())
+    cols = st.columns(6)
+    cols[0].metric("Segnalazioni", total)
+    cols[1].metric("CAR", cars)
+    cols[2].metric("VAN", vans)
+    cols[3].metric("Con foto", f"{photo_coverage:.1%}")
+    cols[4].metric("Importo addebitato", f"€ {charged:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    cols[5].metric("Importo incassato", f"€ {collected:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    monthly = frame.dropna(subset=["control_date"]).copy()
+    monthly["mese"] = monthly["control_date"].dt.to_period("M").astype(str)
+    monthly = monthly.groupby("mese", as_index=False).agg(segnalazioni=("id", "count"), importo=("amount", "sum"))
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(px.line(monthly, x="mese", y="segnalazioni", markers=True, title="Segnalazioni per mese"), use_container_width=True)
+    by_operator = frame.groupby("operator", as_index=False).agg(segnalazioni=("id", "count"), importo=("amount", "sum"))
+    c2.plotly_chart(px.bar(by_operator, x="operator", y="segnalazioni", color="importo", title="Danni per operatore"), use_container_width=True)
+    c3, c4 = st.columns(2)
+    by_mode = frame.groupby("charge_mode", as_index=False).size().rename(columns={"size": "segnalazioni"})
+    c3.plotly_chart(px.bar(by_mode, x="charge_mode", y="segnalazioni", title="Danni per modalità di addebito"), use_container_width=True)
+    by_category = frame.groupby(["damage_category", "vehicle_category"], as_index=False).size().rename(columns={"size": "segnalazioni"})
+    c4.plotly_chart(px.bar(by_category, x="damage_category", y="segnalazioni", color="vehicle_category", barmode="group", title="Tipologia danni CAR e VAN"), use_container_width=True)
+    st.subheader("Riepilogo per operatore")
+    st.dataframe(by_operator.sort_values("segnalazioni", ascending=False), use_container_width=True, hide_index=True)
+
+
+def damage_archive(frame):
+    st.header("Archivio addebito danni")
+    frame = damage_filters(frame)
+    if frame.empty:
+        st.info("Nessuna segnalazione presente.")
+        return
+    display = frame[[
+        "control_date", "ra", "vehicle_category", "charge_mode", "operator",
+        "damage_category", "description", "amount", "payment_status", "photo_url", "notes",
+    ]].copy()
+    display.columns = [
+        "Data controllo", "RA", "Veicolo", "Modalità", "Operatore", "Tipo danno",
+        "Descrizione", "Importo", "Stato", "Foto", "Note",
+    ]
+    st.dataframe(
+        display, use_container_width=True, hide_index=True,
+        column_config={
+            "Data controllo": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Importo": st.column_config.NumberColumn(format="€ %.2f"),
+            "Foto": st.column_config.LinkColumn(display_text="Apri foto"),
+        },
+    )
+    st.download_button("Esporta archivio danni in Excel", to_excel(display), "archivio_addebito_danni.xlsx", use_container_width=True)
+
+
+def damage_form(frame):
+    st.header("Inserimento e modifica addebito danni")
+    records = {row.id: row for row in frame.itertuples()}
+    selected = st.selectbox(
+        "Segnalazione da modificare (lascia vuoto per inserirne una nuova)",
+        [""] + list(records),
+        format_func=lambda record_id: "" if not record_id else (
+            f"{records[record_id].ra} | "
+            f"{records[record_id].control_date.date() if pd.notna(records[record_id].control_date) else ''} | "
+            f"{records[record_id].operator}"
+        ),
+    )
+    current = frame[frame["id"] == selected].iloc[0].to_dict() if selected else {}
+    prefix = current.get("id", "nuovo_danno")
+    c1, c2, c3 = st.columns(3)
+    ra = c1.text_input("RA *", value=current.get("ra", ""), key=f"{prefix}_damage_ra")
+    current_date = current.get("control_date")
+    control_date = c2.date_input(
+        "Data del controllo *",
+        value=current_date.date() if pd.notna(current_date) else date.today(),
+        key=f"{prefix}_damage_date",
+    )
+    vehicle_options = ["", "CAR", "VAN"]
+    current_vehicle = upper(current.get("vehicle_category", ""))
+    vehicle = c3.selectbox(
+        "Categoria veicolo *", vehicle_options,
+        index=vehicle_options.index(current_vehicle) if current_vehicle in vehicle_options else 0,
+        key=f"{prefix}_damage_vehicle",
+    )
+    c4, c5 = st.columns(2)
+    mode_options = ["", "IN PRESENZA", "KEY BOX", "CLIENTE NON ASPETTA (AFTER RENTAL)", "ALTRO"]
+    current_mode = upper(current.get("charge_mode", ""))
+    if current_mode and current_mode not in mode_options:
+        mode_options.append(current_mode)
+    charge_mode = c4.selectbox(
+        "Modalità di addebito *", mode_options,
+        index=mode_options.index(current_mode) if current_mode in mode_options else 0,
+        key=f"{prefix}_damage_mode",
+    )
+    operator_options = [""] + [row["name"] for row in configured_operators()]
+    current_operator = upper(current.get("operator", ""))
+    if current_operator and current_operator not in operator_options:
+        operator_options.append(current_operator)
+    operator = c5.selectbox(
+        "Operatore responsabile *", operator_options,
+        index=operator_options.index(current_operator) if current_operator in operator_options else 0,
+        key=f"{prefix}_damage_operator",
+    )
+    description = st.text_area("Descrizione sintetica del danno *", value=current.get("description", ""), key=f"{prefix}_damage_description")
+    photo_url = st.text_input("Collegamento foto danno", value=current.get("photo_url", ""), key=f"{prefix}_damage_photo")
+    c6, c7 = st.columns(2)
+    amount_value = current.get("amount")
+    amount = c6.number_input(
+        "Importo addebitato", min_value=0.0, step=10.0,
+        value=0.0 if pd.isna(amount_value) else float(amount_value), key=f"{prefix}_damage_amount",
+    )
+    status_options = ["DA VERIFICARE", "ADDEBITATO", "INCASSATO", "ANNULLATO"]
+    current_status = upper(current.get("payment_status", "")) or "DA VERIFICARE"
+    status = c7.selectbox(
+        "Stato addebito", status_options,
+        index=status_options.index(current_status) if current_status in status_options else 0,
+        key=f"{prefix}_damage_status",
+    )
+    notes = st.text_area("Note", value=current.get("notes", ""), key=f"{prefix}_damage_notes")
+    if st.button("Salva segnalazione danno", type="primary", use_container_width=True):
+        if not all([ra, vehicle, charge_mode, operator, description]):
+            st.error("Compila RA, categoria veicolo, modalità, operatore e descrizione.")
+        else:
+            save_damage({
+                "id": current.get("id"), "source_key": current.get("source_key"),
+                "submitted_at": current.get("submitted_at"), "control_date": control_date.isoformat(),
+                "ra": ra, "vehicle_category": vehicle, "charge_mode": charge_mode,
+                "operator": operator, "description": description, "photo_url": photo_url,
+                "amount": amount if amount > 0 else None, "payment_status": status, "notes": notes,
+            })
+            st.success("Segnalazione danno salvata.")
+            st.rerun()
+    if current:
+        confirm = st.checkbox(f"Confermo l’eliminazione definitiva della segnalazione {current['ra']}")
+        if st.button("Elimina segnalazione danno", disabled=not confirm, use_container_width=True):
+            with db() as conn:
+                conn.execute("DELETE FROM damage_charges WHERE id = ?", (current["id"],))
+            st.success("Segnalazione eliminata.")
+            st.rerun()
+
+
 def import_backup():
     st.header("Importazione e backup")
     st.subheader("Backup completo")
@@ -954,17 +1296,26 @@ def import_backup():
         st.download_button("Scarica database", DB_PATH.read_bytes(), "ancillary_backup.db", mime="application/octet-stream", use_container_width=True)
     st.caption("Conserva periodicamente il file di backup in una posizione sicura.")
     st.subheader("Importazione intelligente da Excel")
-    st.caption("Il gestionale riconosce automaticamente i riepiloghi ancillary e i report mensili Analisi Contratti RA, anche con più fogli per operatore.")
+    st.caption("Il gestionale riconosce automaticamente riepiloghi ancillary, report Analisi Contratti RA e file Addebito Danni.")
     upload = st.file_uploader("Carica un file Excel", type=["xlsx"])
     if upload:
         file_bytes = upload.getvalue()
         detected = detect_excel_type(file_bytes)
-        labels = {"ANCILLARY": "Riepilogo ancillary", "CONTRATTI_RA": "Analisi Contratti RA", "SCONOSCIUTO": "Formato non riconosciuto"}
+        labels = {
+            "ANCILLARY": "Riepilogo ancillary", "CONTRATTI_RA": "Analisi Contratti RA",
+            "ADDEBITO_DANNI": "Riepilogo addebito danni", "SCONOSCIUTO": "Formato non riconosciuto",
+        }
         st.info(f"Formato rilevato: **{labels[detected]}**")
         if st.button("Importa, scorpora e analizza", type="primary", disabled=detected == "SCONOSCIUTO", use_container_width=True):
             if detected == "CONTRATTI_RA":
                 added, main_sheet, period = import_contract_workbook(file_bytes, upload.name)
                 st.success(f"Importati o aggiornati {added} contratti del periodo {period}. Foglio principale: {main_sheet}.")
+                st.rerun()
+            if detected == "ADDEBITO_DANNI":
+                added, skipped = import_damage_workbook(file_bytes, upload.name)
+                st.success(f"Importate o aggiornate {added} segnalazioni danni.")
+                if skipped:
+                    st.info(f"Escluse {skipped} righe senza numero RA.")
                 st.rerun()
             imported = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, dtype=object)
             added = 0
@@ -1046,6 +1397,7 @@ def operator_settings():
                     if new_name != selected_name:
                         conn.execute("UPDATE rentals SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
                         conn.execute("UPDATE contracts SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
+                        conn.execute("UPDATE damage_charges SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
                 st.success("Operatore aggiornato.")
                 st.rerun()
             except sqlite3.IntegrityError:
@@ -1080,17 +1432,17 @@ init_db()
 if not login():
     st.stop()
 
-st.title("Gestionale Noleggi e Ancillary")
-st.caption("Importazione automatica dei report, archivio contratti, statistiche e controllo ancillary")
+st.title("Gestionale Noleggi, Ancillary e Danni")
+st.caption("Importazione automatica dei report, archivio contratti, statistiche, ancillary e addebito danni")
 all_data = load_data()
 all_contracts = load_contracts()
-if all_data.empty:
-    st.warning("Archivio vuoto. Importa il file Excel dalla sezione Importazione e backup.")
+all_damages = load_damages()
 filtered = filters(all_data) if not all_data.empty else all_data
 page = st.sidebar.radio(
     "Sezione",
     [
         "Dashboard ancillary", "Analisi contratti RA", "Analisi ancillary RA", "Analisi incrociata",
+        "Analisi addebito danni", "Archivio addebito danni", "Inserimento addebito danni",
         "Archivio ancillary", "Archivio contratti RA", "Inserimento / modifica",
         "Configurazione operatori", "Importazione e backup",
     ],
@@ -1104,6 +1456,12 @@ elif page == "Analisi ancillary RA":
     ancillary_ra_dashboard(all_contracts)
 elif page == "Analisi incrociata":
     combined_analysis(all_contracts, all_data)
+elif page == "Analisi addebito danni":
+    damage_dashboard(all_damages)
+elif page == "Archivio addebito danni":
+    damage_archive(all_damages)
+elif page == "Inserimento addebito danni":
+    damage_form(all_damages)
 elif page == "Archivio ancillary":
     archive(filtered)
 elif page == "Archivio contratti RA":
