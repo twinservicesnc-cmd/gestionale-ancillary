@@ -19,7 +19,7 @@ SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
 DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 ANCILLARY_START_DATE = date(2026, 10, 1)
-PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "AMMINISTRAZIONE"]
+PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "AMMINISTRAZIONE"]
 CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
 CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
 
@@ -250,6 +250,57 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS special_events (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                event_type TEXT,
+                start_date TEXT NOT NULL,
+                end_date TEXT,
+                start_time TEXT,
+                end_time TEXT,
+                location TEXT,
+                responsible TEXT,
+                status TEXT NOT NULL DEFAULT 'PROGRAMMATO',
+                capacity INTEGER,
+                vehicles TEXT,
+                cost REAL,
+                revenue REAL,
+                description TEXT,
+                notes TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_participants (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT,
+                contact TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_participants_event ON event_participants(event_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_files (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                mime_type TEXT,
+                file_data BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_files_event ON event_files(event_id)")
         cleanup_done = conn.execute(
             "SELECT value FROM app_meta WHERE key = 'ancillary_history_cleared_2026_10_01'"
         ).fetchone()
@@ -621,6 +672,66 @@ def load_cash_closings():
     for column in ["expected_balance", "counted_cash", "checks_total", "difference"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
     return frame
+
+
+def save_special_event(record):
+    event_id = record.get("id") or str(uuid.uuid4())
+    payload = {
+        "id": event_id, "title": clean(record.get("title")),
+        "event_type": upper(record.get("event_type")),
+        "start_date": clean(record.get("start_date")), "end_date": clean(record.get("end_date")),
+        "start_time": clean(record.get("start_time")), "end_time": clean(record.get("end_time")),
+        "location": clean(record.get("location")), "responsible": upper(record.get("responsible")),
+        "status": upper(record.get("status")) or "PROGRAMMATO",
+        "capacity": int(record.get("capacity") or 0), "vehicles": clean(record.get("vehicles")),
+        "cost": float(record.get("cost") or 0), "revenue": float(record.get("revenue") or 0),
+        "description": clean(record.get("description")), "notes": clean(record.get("notes")),
+        "created_by": clean(record.get("created_by")) or current_user().get("username", ""),
+        "created_at": record.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+    }
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO special_events VALUES (
+                :id,:title,:event_type,:start_date,:end_date,:start_time,:end_time,
+                :location,:responsible,:status,:capacity,:vehicles,:cost,:revenue,
+                :description,:notes,:created_by,:created_at
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                title=:title,event_type=:event_type,start_date=:start_date,end_date=:end_date,
+                start_time=:start_time,end_time=:end_time,location=:location,
+                responsible=:responsible,status=:status,capacity=:capacity,vehicles=:vehicles,
+                cost=:cost,revenue=:revenue,description=:description,notes=:notes,
+                created_by=:created_by,created_at=:created_at
+            """, payload,
+        )
+    return event_id
+
+
+def load_special_events():
+    with db() as conn:
+        frame = pd.read_sql_query("SELECT * FROM special_events ORDER BY start_date DESC, start_time DESC", conn)
+    if frame.empty:
+        return frame
+    frame["start_date"] = pd.to_datetime(frame["start_date"], errors="coerce")
+    frame["end_date"] = pd.to_datetime(frame["end_date"], errors="coerce")
+    for column in ["capacity", "cost", "revenue"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+    frame["margin"] = frame["revenue"] - frame["cost"]
+    with db() as conn:
+        counts = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS participants FROM event_participants GROUP BY event_id", conn)
+        files = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS files FROM event_files GROUP BY event_id", conn)
+    frame = frame.merge(counts, on="id", how="left") if not counts.empty else frame.assign(participants=0)
+    frame = frame.merge(files, on="id", how="left") if not files.empty else frame.assign(files=0)
+    frame[["participants", "files"]] = frame[["participants", "files"]].fillna(0).astype(int)
+    return frame
+
+
+def event_options(frame):
+    if frame.empty:
+        return {}, []
+    records = {row.id: row for row in frame.itertuples()}
+    return records, list(records)
 
 
 def load_contracts():
@@ -1912,6 +2023,202 @@ def cash_import_page():
         st.rerun()
 
 
+def special_events_dashboard(frame):
+    st.header("Dashboard eventi speciali")
+    if frame.empty:
+        st.info("Nessun evento presente. Usa Crea evento per inserire il primo.")
+        return
+    today = pd.Timestamp(date.today())
+    upcoming = frame[frame["start_date"].ge(today) & ~frame["status"].isin(["ANNULLATO", "CONCLUSO"])]
+    columns = st.columns(5)
+    columns[0].metric("Eventi totali", len(frame))
+    columns[1].metric("In programma", len(upcoming))
+    columns[2].metric("Partecipanti", int(frame["participants"].sum()))
+    columns[3].metric("Ricavi", f"€ {frame['revenue'].sum():,.2f}")
+    columns[4].metric("Margine", f"€ {frame['margin'].sum():,.2f}")
+    by_status = frame.groupby("status", as_index=False).size().rename(columns={"size": "eventi"})
+    by_type = frame.groupby("event_type", as_index=False).agg(eventi=("id", "count"), ricavi=("revenue", "sum"))
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(px.bar(by_status, x="status", y="eventi", title="Eventi per stato"), use_container_width=True)
+    c2.plotly_chart(px.bar(by_type, x="event_type", y="eventi", color="ricavi", title="Eventi per tipologia"), use_container_width=True)
+    st.subheader("Prossimi eventi")
+    if upcoming.empty:
+        st.info("Nessun evento futuro programmato.")
+    else:
+        display = upcoming[["start_date", "title", "event_type", "location", "responsible", "status", "participants"]].copy()
+        display.columns = ["Data", "Evento", "Tipologia", "Luogo", "Responsabile", "Stato", "Partecipanti"]
+        st.dataframe(display.sort_values("Data"), use_container_width=True, hide_index=True)
+
+
+def special_event_form(frame):
+    st.header("Crea o modifica evento")
+    records, record_ids = event_options(frame)
+    selected = st.selectbox(
+        "Evento da modificare (lascia vuoto per crearne uno nuovo)", [""] + record_ids,
+        format_func=lambda item_id: "" if not item_id else f"{records[item_id].start_date.date()} | {records[item_id].title}",
+    )
+    current = frame[frame["id"].eq(selected)].iloc[0].to_dict() if selected else {}
+    prefix = current.get("id", "new_special_event")
+    c1, c2, c3 = st.columns(3)
+    title = c1.text_input("Nome evento *", value=current.get("title", ""), key=f"{prefix}_event_title")
+    event_types = ["PROMOZIONALE", "AZIENDALE", "FIERA", "CONSEGNA SPECIALE", "ESPOSIZIONE", "ALTRO"]
+    current_type = upper(current.get("event_type", ""))
+    if current_type and current_type not in event_types:
+        event_types.append(current_type)
+    event_type = c2.selectbox("Tipologia *", [""] + event_types, index=([""] + event_types).index(current_type) if current_type else 0, key=f"{prefix}_event_type")
+    statuses = ["PROGRAMMATO", "CONFERMATO", "IN CORSO", "CONCLUSO", "ANNULLATO"]
+    current_status = upper(current.get("status", "")) or "PROGRAMMATO"
+    status = c3.selectbox("Stato", statuses, index=statuses.index(current_status), key=f"{prefix}_event_status")
+    c4, c5, c6, c7 = st.columns(4)
+    start_date_value = current.get("start_date")
+    end_date_value = current.get("end_date")
+    start_date = c4.date_input("Data inizio *", value=start_date_value.date() if pd.notna(start_date_value) else date.today(), key=f"{prefix}_event_start_date")
+    end_date = c5.date_input("Data fine", value=end_date_value.date() if pd.notna(end_date_value) else start_date, key=f"{prefix}_event_end_date")
+    start_time = c6.text_input("Ora inizio", value=current.get("start_time", ""), placeholder="09:00", key=f"{prefix}_event_start_time")
+    end_time = c7.text_input("Ora fine", value=current.get("end_time", ""), placeholder="18:00", key=f"{prefix}_event_end_time")
+    c8, c9, c10 = st.columns(3)
+    location = c8.text_input("Luogo *", value=current.get("location", ""), key=f"{prefix}_event_location")
+    responsible_options = [row["name"] for row in configured_operators()]
+    current_responsible = upper(current.get("responsible", ""))
+    if current_responsible and current_responsible not in responsible_options:
+        responsible_options.append(current_responsible)
+    responsible = c9.selectbox("Responsabile", [""] + responsible_options, index=([""] + responsible_options).index(current_responsible) if current_responsible else 0, key=f"{prefix}_event_responsible")
+    capacity = c10.number_input("Capienza prevista", min_value=0, step=1, value=int(current.get("capacity") or 0), key=f"{prefix}_event_capacity")
+    vehicles = st.text_input("Veicoli assegnati", value=current.get("vehicles", ""), placeholder="Esempio: Z1, CAR 12, furgone supporto", key=f"{prefix}_event_vehicles")
+    c11, c12 = st.columns(2)
+    cost = c11.number_input("Costi previsti", min_value=0.0, step=50.0, value=float(current.get("cost") or 0), key=f"{prefix}_event_cost")
+    revenue = c12.number_input("Incassi previsti", min_value=0.0, step=50.0, value=float(current.get("revenue") or 0), key=f"{prefix}_event_revenue")
+    description = st.text_area("Descrizione", value=current.get("description", ""), key=f"{prefix}_event_description")
+    notes = st.text_area("Note", value=current.get("notes", ""), key=f"{prefix}_event_notes")
+    st.info(f"Margine previsto: € {revenue - cost:,.2f}")
+    if st.button("Salva evento", type="primary", use_container_width=True):
+        if not all([title, event_type, start_date, location]):
+            st.error("Compila nome, tipologia, data iniziale e luogo.")
+        elif end_date < start_date:
+            st.error("La data finale non può precedere quella iniziale.")
+        else:
+            save_special_event({
+                "id": current.get("id"), "title": title, "event_type": event_type,
+                "start_date": start_date.isoformat(), "end_date": end_date.isoformat(),
+                "start_time": start_time, "end_time": end_time, "location": location,
+                "responsible": responsible, "status": status, "capacity": capacity,
+                "vehicles": vehicles, "cost": cost, "revenue": revenue,
+                "description": description, "notes": notes,
+                "created_by": current.get("created_by"), "created_at": current.get("created_at"),
+            })
+            st.success("Evento salvato.")
+            st.rerun()
+    if current:
+        confirm = st.checkbox("Confermo l’eliminazione definitiva dell’evento e dei relativi allegati")
+        if st.button("Elimina evento", disabled=not confirm, use_container_width=True):
+            with db() as conn:
+                conn.execute("DELETE FROM event_participants WHERE event_id = ?", (current["id"],))
+                conn.execute("DELETE FROM event_files WHERE event_id = ?", (current["id"],))
+                conn.execute("DELETE FROM special_events WHERE id = ?", (current["id"],))
+            st.success("Evento eliminato.")
+            st.rerun()
+
+
+def events_calendar(frame):
+    st.header("Calendario eventi")
+    if frame.empty:
+        st.info("Nessun evento presente.")
+        return
+    years = sorted(frame["start_date"].dropna().dt.year.unique().astype(int).tolist())
+    selected_year = st.selectbox("Anno", years, index=len(years) - 1)
+    result = frame[frame["start_date"].dt.year.eq(selected_year)].copy()
+    result["Mese"] = result["start_date"].dt.strftime("%Y-%m")
+    display = result[["start_date", "end_date", "title", "event_type", "location", "start_time", "end_time", "responsible", "status"]].copy()
+    display.columns = ["Data inizio", "Data fine", "Evento", "Tipologia", "Luogo", "Ora inizio", "Ora fine", "Responsabile", "Stato"]
+    st.dataframe(display.sort_values("Data inizio"), use_container_width=True, hide_index=True)
+
+
+def events_archive(frame):
+    st.header("Archivio eventi speciali")
+    if frame.empty:
+        st.info("Nessun evento presente.")
+        return
+    c1, c2, c3 = st.columns(3)
+    selected_status = c1.multiselect("Stato", sorted(frame["status"].dropna().unique()))
+    selected_types = c2.multiselect("Tipologia", sorted(frame["event_type"].dropna().unique()))
+    search = c3.text_input("Cerca evento o luogo")
+    result = frame.copy()
+    if selected_status:
+        result = result[result["status"].isin(selected_status)]
+    if selected_types:
+        result = result[result["event_type"].isin(selected_types)]
+    if search:
+        needle = upper(search)
+        result = result[result[["title", "location", "description"]].fillna("").apply(lambda col: col.str.upper().str.contains(needle, regex=False)).any(axis=1)]
+    display = result[["start_date", "title", "event_type", "location", "responsible", "status", "participants", "vehicles", "cost", "revenue", "margin", "files"]].copy()
+    display.columns = ["Data", "Evento", "Tipologia", "Luogo", "Responsabile", "Stato", "Partecipanti", "Veicoli", "Costi", "Incassi", "Margine", "Allegati"]
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.download_button("Esporta archivio eventi", table_to_excel(display, "Eventi speciali"), "eventi_speciali.xlsx", use_container_width=True)
+
+
+def event_participants_page(frame):
+    st.header("Partecipanti e personale")
+    records, record_ids = event_options(frame)
+    if not record_ids:
+        st.info("Crea prima un evento.")
+        return
+    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}")
+    with st.form("add_event_participant", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        name = c1.text_input("Nome *")
+        role = c2.selectbox("Ruolo", ["PARTECIPANTE", "OPERATORE", "RESPONSABILE", "FORNITORE", "OSPITE", "ALTRO"])
+        contact = c3.text_input("Contatto")
+        notes = st.text_input("Note")
+        add = st.form_submit_button("Aggiungi", type="primary", use_container_width=True)
+    if add:
+        if not name:
+            st.error("Inserisci il nome.")
+        else:
+            with db() as conn:
+                conn.execute("INSERT INTO event_participants VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), event_id, clean(name), upper(role), clean(contact), clean(notes), datetime.now().isoformat(timespec="seconds")))
+            st.rerun()
+    with db() as conn:
+        participants = [dict(row) for row in conn.execute("SELECT * FROM event_participants WHERE event_id = ? ORDER BY role, name", (event_id,)).fetchall()]
+    if participants:
+        st.dataframe(pd.DataFrame(participants)[["name", "role", "contact", "notes"]], use_container_width=True, hide_index=True)
+        remove_id = st.selectbox("Persona da rimuovere", [row["id"] for row in participants], format_func=lambda item_id: next(row["name"] for row in participants if row["id"] == item_id))
+        if st.button("Rimuovi persona", use_container_width=True):
+            with db() as conn:
+                conn.execute("DELETE FROM event_participants WHERE id = ?", (remove_id,))
+            st.rerun()
+    else:
+        st.info("Nessuna persona associata.")
+
+
+def event_files_page(frame):
+    st.header("Documenti e fotografie evento")
+    records, record_ids = event_options(frame)
+    if not record_ids:
+        st.info("Crea prima un evento.")
+        return
+    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}")
+    uploads = st.file_uploader("Carica documenti o fotografie", accept_multiple_files=True, key=f"event_upload_{event_id}")
+    if st.button("Archivia allegati", type="primary", disabled=not uploads, use_container_width=True):
+        rows = [(str(uuid.uuid4()), event_id, clean(file.name), clean(file.type), sqlite3.Binary(file.getvalue()), datetime.now().isoformat(timespec="seconds")) for file in uploads if file.getvalue()]
+        with db() as conn:
+            conn.executemany("INSERT INTO event_files VALUES (?, ?, ?, ?, ?, ?)", rows)
+        st.success(f"Allegati archiviati: {len(rows)}.")
+        st.rerun()
+    with db() as conn:
+        files = [dict(row) for row in conn.execute("SELECT * FROM event_files WHERE event_id = ? ORDER BY created_at DESC", (event_id,)).fetchall()]
+    if not files:
+        st.info("Nessun allegato presente.")
+        return
+    for file in files:
+        c1, c2, c3 = st.columns([4, 1, 1])
+        c1.write(file["file_name"])
+        c2.download_button("Scarica", file["file_data"], file["file_name"], mime=file["mime_type"] or "application/octet-stream", key=f"event_download_{file['id']}")
+        if c3.button("Elimina", key=f"event_delete_{file['id']}"):
+            with db() as conn:
+                conn.execute("DELETE FROM event_files WHERE id = ?", (file["id"],))
+            st.rerun()
+
+
 def import_backup():
     st.header("Importazione e backup")
     st.subheader("Backup completo")
@@ -2206,6 +2513,7 @@ all_data = load_data()
 all_contracts = load_contracts()
 all_damages = load_damages()
 all_cash_movements = load_cash_movements()
+all_special_events = load_special_events()
 
 navigation = {
     "ANCILLARY": [
@@ -2231,6 +2539,14 @@ navigation = {
         ("🗂️ Archivio movimenti", "Archivio movimenti cassa"),
         ("🧮 Conteggio e chiusura", "Conteggio e chiusura cassa"),
         ("📥 Importazione storico", "Importazione storico cassa"),
+    ],
+    "EVENTI SPECIALI": [
+        ("📊 Dashboard eventi", "Dashboard eventi speciali"),
+        ("➕ Crea evento", "Crea evento speciale"),
+        ("📅 Calendario eventi", "Calendario eventi speciali"),
+        ("👥 Partecipanti e personale", "Partecipanti eventi speciali"),
+        ("📎 Documenti e fotografie", "Allegati eventi speciali"),
+        ("🗂️ Archivio eventi", "Archivio eventi speciali"),
     ],
     "AMMINISTRAZIONE": [
         ("🔐 Utenti e autorizzazioni", "Utenti e autorizzazioni"),
@@ -2308,6 +2624,18 @@ elif page == "Conteggio e chiusura cassa":
     cash_closing_page(all_cash_movements)
 elif page == "Importazione storico cassa":
     cash_import_page()
+elif page == "Dashboard eventi speciali":
+    special_events_dashboard(all_special_events)
+elif page == "Crea evento speciale":
+    special_event_form(all_special_events)
+elif page == "Calendario eventi speciali":
+    events_calendar(all_special_events)
+elif page == "Partecipanti eventi speciali":
+    event_participants_page(all_special_events)
+elif page == "Allegati eventi speciali":
+    event_files_page(all_special_events)
+elif page == "Archivio eventi speciali":
+    events_archive(all_special_events)
 elif page == "Archivio ancillary":
     archive(filtered)
 elif page == "Archivio contratti RA":
