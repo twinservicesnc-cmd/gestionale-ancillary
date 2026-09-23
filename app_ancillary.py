@@ -1351,9 +1351,17 @@ def damage_filters(frame):
         result = result[result["payment_status"].isin(selected_statuses)]
     if search:
         needle = upper(search)
-        mask = result[["ra", "description", "operator"]].fillna("").apply(
+        compact_needle = re.sub(r"[^A-Z0-9]", "", needle)
+        searchable = result[["ra", "description", "operator"]].fillna("")
+        normal_match = searchable.apply(
             lambda column: column.str.upper().str.contains(needle, regex=False)
         ).any(axis=1)
+        compact_match = searchable.apply(
+            lambda column: column.map(
+                lambda value: compact_needle in re.sub(r"[^A-Z0-9]", "", upper(value))
+            )
+        ).any(axis=1)
+        mask = normal_match | compact_match
         result = result[mask]
     return result
 
