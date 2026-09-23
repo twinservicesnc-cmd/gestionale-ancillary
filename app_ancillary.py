@@ -73,7 +73,7 @@ def init_db():
                 contract_date TEXT,
                 prefix TEXT,
                 number INTEGER,
-                ra TEXT NOT NULL UNIQUE,
+                ra TEXT NOT NULL,
                 start_date TEXT,
                 end_date TEXT,
                 requested_group TEXT,
@@ -90,10 +90,33 @@ def init_db():
                 kpi_target REAL,
                 ancillary_value REAL,
                 ancillary_rpd REAL,
-                operator TEXT
+                operator TEXT,
+                UNIQUE(ra, contract_date)
             )
             """
         )
+        contracts_schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'contracts'"
+        ).fetchone()[0]
+        if "RA TEXT NOT NULL UNIQUE" in upper(contracts_schema):
+            conn.execute("ALTER TABLE contracts RENAME TO contracts_legacy_ra_unique")
+            conn.execute(
+                """
+                CREATE TABLE contracts (
+                    id TEXT PRIMARY KEY, import_file TEXT, import_period TEXT,
+                    contract_date TEXT, prefix TEXT, number INTEGER,
+                    ra TEXT NOT NULL, start_date TEXT, end_date TEXT,
+                    requested_group TEXT, assigned_group TEXT, source_raw TEXT,
+                    source_base TEXT, source_details TEXT, source_year TEXT,
+                    source_km TEXT, client TEXT, duration_days INTEGER,
+                    kpi1_rpd REAL, contract_value REAL, kpi_target REAL,
+                    ancillary_value REAL, ancillary_rpd REAL, operator TEXT,
+                    UNIQUE(ra, contract_date)
+                )
+                """
+            )
+            conn.execute("INSERT INTO contracts SELECT * FROM contracts_legacy_ra_unique")
+            conn.execute("DROP TABLE contracts_legacy_ra_unique")
         contracts_count = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
         if contracts_count == 0 and CONTRACT_SEED_PATH.exists():
             contracts = json.loads(CONTRACT_SEED_PATH.read_text(encoding="utf-8"))
@@ -203,6 +226,23 @@ def parse_source(value):
     }
 
 
+def classify_contract_channel(source_raw):
+    text = upper(source_raw)
+    if "REPLACEMENT" in text or "WARRANTY" in text:
+        return "REPLACEMENT"
+    if "WALK-IN" in text or "WALK IN" in text or text.startswith("RECEPTION"):
+        return "WALK-IN"
+    if "OFFICIAL BOOKING WEB" in text or re.search(r"\b(?:WEB|CNP)\b", text):
+        return "WEB/CNP"
+    broker_markers = (
+        "TRAVELJIGSAW", "TRAVELDRIVE", "DOYOUSPAIN", "VIPCARS",
+        "BOOKING GROUP", "TINOLEGGIO", "XML", "POA",
+    )
+    if any(marker in text for marker in broker_markers):
+        return "BROKER"
+    return "CORPORATE"
+
+
 def normalize_rental_type(value):
     text = upper(value).replace("WEB-CNP-ETC", "WEB - CNP ETC").replace("CORPARATE", "CORPORATE")
     parts = []
@@ -275,6 +315,16 @@ def load_contracts():
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame["has_ancillary_ra"] = frame["ancillary_value"].fillna(0).gt(0)
     frame["group_changed"] = frame["requested_group"].fillna("").ne(frame["assigned_group"].fillna(""))
+    frame["contract_vehicle"] = frame["assigned_group"].fillna("").map(
+        lambda value: "VAN" if upper(value).startswith("Z") else "CAR"
+    )
+    frame["rental_term"] = frame.apply(
+        lambda row: "MENSILE"
+        if "MENSILE" in upper(row["source_raw"]) or (row["duration_days"] or 0) >= 28
+        else "GIORNALIERO",
+        axis=1,
+    )
+    frame["rental_channel"] = frame["source_raw"].map(classify_contract_channel)
     return frame
 
 
@@ -369,7 +419,7 @@ def import_contract_workbook(file_bytes, file_name):
                     :client,:duration_days,:kpi1_rpd,:contract_value,:kpi_target,
                     :ancillary_value,:ancillary_rpd,:operator
                 )
-                ON CONFLICT(ra) DO UPDATE SET
+                ON CONFLICT(ra, contract_date) DO UPDATE SET
                     import_file=:import_file, import_period=:import_period,
                     contract_date=:contract_date, prefix=:prefix, number=:number,
                     start_date=:start_date, end_date=:end_date,
@@ -496,12 +546,20 @@ def dashboard(frame):
 
 def record_form(frame):
     st.header("Inserimento e modifica")
-    options = [""] + [f"{row.ra} | {row.start_date.date() if pd.notna(row.start_date) else ''} | {row.operator}" for row in frame.itertuples()]
-    selected = st.selectbox("Record da modificare (lascia vuoto per inserirne uno nuovo)", options)
+    records_by_id = {row.id: row for row in frame.itertuples()}
+    options = [""] + list(records_by_id)
+    selected = st.selectbox(
+        "Record da modificare (lascia vuoto per inserirne uno nuovo)",
+        options,
+        format_func=lambda record_id: "" if not record_id else (
+            f"{records_by_id[record_id].ra} | "
+            f"{records_by_id[record_id].start_date.date() if pd.notna(records_by_id[record_id].start_date) else ''} | "
+            f"{records_by_id[record_id].operator}"
+        ),
+    )
     current = None
     if selected:
-        ra = selected.split(" | ", 1)[0]
-        current = frame[frame["ra"] == ra].iloc[0].to_dict()
+        current = frame[frame["id"] == selected].iloc[0].to_dict()
     widget_prefix = (current or {}).get("id", "nuovo")
     rental_options = ["", "CORPORATE", "WALK-IN", "BROKER", "WEB/CNP", "REPLACEMENT", "MENSILE"]
     current_rental = upper((current or {}).get("rental_type", ""))
@@ -659,6 +717,13 @@ def contract_filters(frame):
     selected_sources = c3.multiselect("Fonte RA", sources)
     groups = sorted(x for x in frame["assigned_group"].dropna().unique() if x)
     selected_groups = c4.multiselect("Gruppo assegnato", groups)
+    c5, c6, c7 = st.columns(3)
+    channels = sorted(x for x in frame["rental_channel"].dropna().unique() if x)
+    selected_channels = c5.multiselect("Tipo noleggio", channels)
+    terms = [x for x in ["GIORNALIERO", "MENSILE"] if x in set(frame["rental_term"])]
+    selected_terms = c6.multiselect("Durata noleggio", terms)
+    vehicles = [x for x in ["CAR", "VAN"] if x in set(frame["contract_vehicle"])]
+    selected_vehicles = c7.multiselect("Tipo veicolo", vehicles)
     result = frame.copy()
     if selected_periods:
         result = result[result["import_period"].isin(selected_periods)]
@@ -668,6 +733,12 @@ def contract_filters(frame):
         result = result[result["source_base"].isin(selected_sources)]
     if selected_groups:
         result = result[result["assigned_group"].isin(selected_groups)]
+    if selected_channels:
+        result = result[result["rental_channel"].isin(selected_channels)]
+    if selected_terms:
+        result = result[result["rental_term"].isin(selected_terms)]
+    if selected_vehicles:
+        result = result[result["contract_vehicle"].isin(selected_vehicles)]
     return result
 
 
@@ -717,6 +788,37 @@ def contracts_dashboard(frame):
     groups["passaggio"] = groups["requested_group"] + " → " + groups["assigned_group"]
     c4.plotly_chart(px.bar(groups, x="size", y="passaggio", orientation="h", title="Gruppo richiesto e assegnato"), use_container_width=True)
 
+    breakdown = frame.groupby(
+        ["rental_channel", "rental_term", "contract_vehicle"], as_index=False
+    ).agg(
+        contratti=("id", "count"), giorni=("duration_days", "sum"),
+        valore=("contract_value", "sum"), ancillary=("ancillary_value", "sum"),
+    )
+    breakdown["rpd"] = breakdown["valore"].div(breakdown["giorni"].replace(0, pd.NA))
+    breakdown["ancillary_rpd"] = breakdown["ancillary"].div(breakdown["giorni"].replace(0, pd.NA))
+    breakdown["combinazione"] = breakdown["rental_channel"] + " - " + breakdown["rental_term"]
+    c5, c6 = st.columns(2)
+    c5.plotly_chart(
+        px.bar(
+            breakdown, x="combinazione", y="contratti", color="contract_vehicle",
+            barmode="group", title="Contratti per tipo, durata e veicolo",
+        ),
+        use_container_width=True,
+    )
+    vehicle_summary = frame.groupby("contract_vehicle", as_index=False).agg(
+        contratti=("id", "count"), valore=("contract_value", "sum"), ancillary=("ancillary_value", "sum")
+    )
+    c6.plotly_chart(
+        px.bar(
+            vehicle_summary, x="contract_vehicle", y=["valore", "ancillary"],
+            barmode="group", title="Confronto CAR e VAN",
+        ),
+        use_container_width=True,
+    )
+
+    st.subheader("Risultati per tipo di noleggio, durata e veicolo")
+    st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
     st.subheader("Risultati per operatore")
     st.dataframe(by_operator.sort_values("valore", ascending=False), use_container_width=True, hide_index=True)
 
@@ -726,11 +828,13 @@ def contracts_archive(frame):
     frame = contract_filters(frame)
     display = frame[[
         "contract_date", "ra", "operator", "client", "duration_days",
+        "rental_channel", "rental_term", "contract_vehicle",
         "requested_group", "assigned_group", "source_base", "source_details",
         "contract_value", "kpi1_rpd", "ancillary_value", "ancillary_rpd", "import_file",
     ]].copy()
     display.columns = [
-        "Data", "RA", "Operatore", "Cliente", "Giorni", "Gruppo richiesto",
+        "Data", "RA", "Operatore", "Cliente", "Giorni",
+        "Tipo noleggio", "Durata noleggio", "Veicolo", "Gruppo richiesto",
         "Gruppo assegnato", "Fonte", "Dettaglio fonte", "Valore contratto",
         "RPD contratto", "Valore ancillary", "RPD ancillary", "File importato",
     ]
@@ -742,10 +846,14 @@ def combined_analysis(contracts, ancillary):
     if contracts.empty or ancillary.empty:
         st.info("Servono sia contratti RA sia dati ancillary per eseguire il confronto.")
         return
-    ancillary_summary = ancillary.groupby("ra", as_index=False).agg(
+    ancillary = ancillary.copy()
+    contracts = contracts.copy()
+    ancillary["analysis_year"] = ancillary["start_date"].dt.year
+    contracts["analysis_year"] = contracts["contract_date"].dt.year.fillna(contracts["start_date"].dt.year)
+    ancillary_summary = ancillary.groupby(["ra", "analysis_year"], as_index=False).agg(
         ancillary_modulo=("ancillary_cost", "sum"), righe_modulo=("id", "count")
     )
-    joined = contracts.merge(ancillary_summary, on="ra", how="left")
+    joined = contracts.merge(ancillary_summary, on=["ra", "analysis_year"], how="left")
     joined["ancillary_modulo"] = joined["ancillary_modulo"].fillna(0)
     joined["differenza"] = joined["ancillary_value"].fillna(0) - joined["ancillary_modulo"]
     matched = joined["righe_modulo"].notna().sum()
