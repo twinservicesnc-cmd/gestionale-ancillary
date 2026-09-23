@@ -1439,31 +1439,46 @@ all_contracts = load_contracts()
 all_damages = load_damages()
 
 navigation = {
-    "Ancillary": [
-        "Dashboard ancillary",
-        "Analisi ancillary RA",
-        "Archivio ancillary",
-        "Inserimento ancillary",
+    "ANCILLARY": [
+        ("📊 Dashboard ancillary", "Dashboard ancillary"),
+        ("📈 Analisi ancillary RA", "Analisi ancillary RA"),
+        ("🗂️ Archivio ancillary", "Archivio ancillary"),
+        ("➕ Inserimento ancillary", "Inserimento ancillary"),
     ],
-    "Contratti RA": [
-        "Analisi contratti RA",
-        "Archivio contratti RA",
-        "Analisi incrociata",
+    "CONTRATTI RA": [
+        ("📊 Analisi contratti RA", "Analisi contratti RA"),
+        ("🗂️ Archivio contratti RA", "Archivio contratti RA"),
+        ("🔀 Analisi incrociata", "Analisi incrociata"),
     ],
-    "Addebito danni": [
-        "Analisi addebito danni",
-        "Archivio addebito danni",
-        "Inserimento addebito danni",
+    "ADDEBITO DANNI": [
+        ("📊 Analisi addebito danni", "Analisi addebito danni"),
+        ("🗂️ Archivio addebito danni", "Archivio addebito danni"),
+        ("➕ Inserimento addebito danni", "Inserimento addebito danni"),
     ],
-    "Amministrazione": [
-        "Configurazione operatori",
-        "Importazione e backup",
+    "AMMINISTRAZIONE": [
+        ("👥 Configurazione operatori", "Configurazione operatori"),
+        ("💾 Importazione e backup", "Importazione e backup"),
     ],
 }
 
-st.sidebar.subheader("Navigazione")
-main_area = st.sidebar.selectbox("Area principale", list(navigation))
-page = st.sidebar.radio("Funzione", navigation[main_area])
+if "navigation_page" not in st.session_state:
+    st.session_state.navigation_page = "Dashboard ancillary"
+
+st.sidebar.subheader("Menu")
+for area, functions in navigation.items():
+    area_pages = [page_name for _, page_name in functions]
+    with st.sidebar.expander(area, expanded=st.session_state.navigation_page in area_pages):
+        for button_label, page_name in functions:
+            if st.button(
+                button_label,
+                key=f"nav_{area}_{page_name}",
+                type="primary" if st.session_state.navigation_page == page_name else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state.navigation_page = page_name
+                st.rerun()
+
+page = st.session_state.navigation_page
 
 # I filtri generali ancillary sono mostrati solo nelle pagine che li usano.
 if page in {"Dashboard ancillary", "Archivio ancillary"} and not all_data.empty:
