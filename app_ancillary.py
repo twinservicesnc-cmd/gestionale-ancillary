@@ -452,34 +452,103 @@ def record_form(frame):
     if selected:
         ra = selected.split(" | ", 1)[0]
         current = frame[frame["ra"] == ra].iloc[0].to_dict()
-    with st.form("record_form"):
-        a, b, c = st.columns(3)
-        ra = a.text_input("RA (Rental Agreement) *", value=(current or {}).get("ra", ""))
-        start_value = (current or {}).get("start_date")
-        start_date = b.date_input("Data inizio noleggio *", value=start_value.date() if pd.notna(start_value) else date.today())
-        days = c.number_input("Giorni noleggio *", min_value=0, step=1, value=int((current or {}).get("rental_days", 1)))
-        source = st.text_input("Fonte completa *", value=(current or {}).get("source_raw", ""))
-        d, e, f = st.columns(3)
-        operator = d.text_input("Operatore", value=(current or {}).get("operator", ""))
-        vehicle = e.selectbox("Tipo veicolo", ["", "CAR", "VAN"], index=["", "CAR", "VAN"].index((current or {}).get("vehicle_type", "") or ""))
-        rental_type = f.text_input("Tipo noleggio", value=(current or {}).get("rental_type", ""))
-        g, h = st.columns(2)
-        ancillary = g.text_input("Ancillary", value=(current or {}).get("ancillary", ""))
-        existing_cost = (current or {}).get("ancillary_cost")
-        cost = h.number_input("Costo ancillary IVA esclusa", min_value=0.0, step=0.01, value=float(existing_cost) if pd.notna(existing_cost) else 0.0)
-        calculated_rpd = cost / days if days else 0
-        st.info(f"RPD calcolato automaticamente: € {calculated_rpd:.2f}")
-        notes = st.text_area("Note", value=(current or {}).get("notes", ""))
-        submitted = st.form_submit_button("Salva record", type="primary", use_container_width=True)
+    widget_prefix = (current or {}).get("id", "nuovo")
+    rental_options = ["", "CORPORATE", "WALK-IN", "BROKER", "WEB/CNP", "REPLACEMENT", "MENSILE"]
+    current_rental = upper((current or {}).get("rental_type", ""))
+    rental_aliases = {
+        "CORPARATE": "CORPORATE", "WEB - CNP ETC": "WEB/CNP", "WEB-CNP-ETC": "WEB/CNP",
+        "ASSISTENZA": "REPLACEMENT", "FULL CREDIT, ASSISTENZA": "REPLACEMENT",
+    }
+    current_rental = rental_aliases.get(current_rental, current_rental)
+    if current_rental not in rental_options:
+        current_rental = ""
+
+    a, b = st.columns(2)
+    ra = a.text_input("RA (Rental Agreement) *", value=(current or {}).get("ra", ""), key=f"{widget_prefix}_ra")
+    start_value = (current or {}).get("start_date")
+    start_date = b.date_input(
+        "Data inizio noleggio *",
+        value=start_value.date() if pd.notna(start_value) else date.today(),
+        key=f"{widget_prefix}_date",
+    )
+
+    d, e, f = st.columns(3)
+    operator = d.text_input("Operatore", value=(current or {}).get("operator", ""), key=f"{widget_prefix}_operator")
+    vehicle_options = ["", "CAR", "VAN"]
+    current_vehicle = upper((current or {}).get("vehicle_type", ""))
+    if current_vehicle not in vehicle_options:
+        current_vehicle = ""
+    vehicle = e.selectbox(
+        "Tipo veicolo", vehicle_options, index=vehicle_options.index(current_vehicle), key=f"{widget_prefix}_vehicle"
+    )
+    rental_type = f.selectbox(
+        "Tipo noleggio *", rental_options, index=rental_options.index(current_rental), key=f"{widget_prefix}_rental"
+    )
+
+    ancillary_blocked = rental_type in {"CORPORATE", "MENSILE"}
+    existing_days = int((current or {}).get("rental_days", 0) or 0)
+    days = st.number_input(
+        "Giorni noleggio *",
+        min_value=0,
+        step=1,
+        value=0 if ancillary_blocked else max(existing_days, 1),
+        disabled=ancillary_blocked,
+        key=f"{widget_prefix}_days_{rental_type}",
+    )
+
+    car_ancillary = ["", "GOLD", "PLATINUM", "UP GOLD/PLATINUM", "GIÀ PRESENTE"]
+    van_ancillary = ["", "NO PROBLEM", "SUPER VAN", "VAN PROTECTION", "CARGO VAN"]
+    ancillary_options = car_ancillary if vehicle == "CAR" else van_ancillary if vehicle == "VAN" else [""]
+    current_ancillary = upper((current or {}).get("ancillary", ""))
+    if "PRESENTE" in current_ancillary and vehicle == "CAR":
+        current_ancillary = "GIÀ PRESENTE"
+    elif "UP" in current_ancillary and vehicle == "CAR":
+        current_ancillary = "UP GOLD/PLATINUM"
+    if current_ancillary not in ancillary_options:
+        current_ancillary = ""
+
+    g, h = st.columns(2)
+    ancillary = g.selectbox(
+        "Tipo ancillary",
+        ancillary_options,
+        index=ancillary_options.index(current_ancillary),
+        disabled=ancillary_blocked or not vehicle,
+        key=f"{widget_prefix}_ancillary_{vehicle}_{rental_type}",
+    )
+    existing_cost = (current or {}).get("ancillary_cost")
+    existing_daily_cost = (
+        float(existing_cost) / existing_days
+        if pd.notna(existing_cost) and existing_days > 0
+        else 0.0
+    )
+    daily_cost = h.number_input(
+        "Costo giornaliero ancillary (IVA esclusa)",
+        min_value=0.0,
+        step=0.01,
+        value=0.0 if ancillary_blocked else round(existing_daily_cost, 2),
+        disabled=ancillary_blocked or not ancillary,
+        key=f"{widget_prefix}_cost_{vehicle}_{rental_type}_{ancillary}",
+    )
+    calculated_total = round(daily_cost * days, 2) if not ancillary_blocked and days else 0.0
+    if ancillary_blocked:
+        st.info(f"Per i noleggi {rental_type} non vengono inseriti giorni, ancillary o costi ancillary.")
+    else:
+        st.info(f"Totale ancillary calcolato: € {daily_cost:.2f} × {days} giorni = € {calculated_total:.2f}")
+    notes = st.text_area("Note", value=(current or {}).get("notes", ""), key=f"{widget_prefix}_notes")
+    submitted = st.button("Salva record", type="primary", use_container_width=True)
     if submitted:
-        if not ra or not source:
-            st.error("Inserisci almeno RA e fonte.")
+        if not ra or not rental_type:
+            st.error("Inserisci almeno RA e tipo noleggio.")
+        elif not ancillary_blocked and days <= 0:
+            st.error("Inserisci i giorni di noleggio.")
         else:
             save_record({
                 "id": (current or {}).get("id"), "created_at": (current or {}).get("created_at"),
                 "ra": ra, "start_date": start_date.isoformat(), "rental_days": days,
-                "source_raw": source, "operator": operator, "vehicle_type": vehicle,
-                "ancillary": ancillary, "ancillary_cost": cost if cost > 0 else None,
+                "source_raw": (current or {}).get("source_raw", ""),
+                "operator": operator, "vehicle_type": vehicle,
+                "ancillary": ancillary,
+                "ancillary_cost": calculated_total if calculated_total > 0 else None,
                 "rental_type": rental_type, "notes": notes,
             })
             st.success("Record salvato e normalizzato.")
