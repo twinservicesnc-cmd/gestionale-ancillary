@@ -1,2923 +1,1452 @@
-import io
-import hashlib
-import hmac
-import json
-import re
-import sqlite3
-import uuid
-from datetime import date, datetime
-from pathlib import Path
-
-import pandas as pd
-import plotly.express as px
 import streamlit as st
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+import json, os, io, hashlib, secrets, uuid, tempfile, mimetypes, re, math, shutil
+from pathlib import Path
+from datetime import date, datetime
 
+st.set_page_config(page_title="Gestionale Famiglia", page_icon="🏠", layout="wide")
+st.markdown("""
+<style>
+.stButton>button, .stDownloadButton>button {min-height:44px;width:100%}
+[data-testid="stDataFrame"] {overflow-x:auto}
+@media (max-width: 768px) {
+  .block-container {padding:1rem .65rem 4rem .65rem!important}
+  h1 {font-size:1.65rem!important} h2 {font-size:1.3rem!important}
+  [data-testid="stHorizontalBlock"] {flex-wrap:wrap!important;gap:.4rem!important}
+  [data-testid="column"] {min-width:100%!important;flex:1 1 100%!important}
+  [data-testid="stSidebar"] {min-width:82vw!important;max-width:82vw!important}
+  input, textarea, select, button {font-size:16px!important}
+}
+</style>
+""", unsafe_allow_html=True)
+DATA = Path("famiglia_data.json")
 
-APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "ancillary.db"
-SEED_PATH = APP_DIR / "dati_iniziali.json"
-CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
-DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
-ANCILLARY_START_DATE = date(2026, 10, 1)
-PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "AMMINISTRAZIONE"]
-CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
-CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
-
-st.set_page_config(
-    page_title="Gestionale Noleggi, Ancillary e Danni",
-    page_icon=str(APP_DIR / "logo_gestionale.png"),
-    layout="wide",
-)
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rentals (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                ra TEXT NOT NULL,
-                start_date TEXT,
-                rental_days INTEGER NOT NULL DEFAULT 0,
-                source_raw TEXT,
-                source_base TEXT,
-                source_details TEXT,
-                source_year TEXT,
-                source_km TEXT,
-                operator TEXT,
-                vehicle_type TEXT,
-                ancillary TEXT,
-                ancillary_cost REAL,
-                rental_type TEXT,
-                notes TEXT
-            )
-            """
-        )
-        count = conn.execute("SELECT COUNT(*) FROM rentals").fetchone()[0]
-        if count == 0 and SEED_PATH.exists():
-            rows = json.loads(SEED_PATH.read_text(encoding="utf-8"))
-            conn.executemany(
-                """
-                INSERT INTO rentals VALUES (
-                    :id,:created_at,:ra,:start_date,:rental_days,:source_raw,
-                    :source_base,:source_details,:source_year,:source_km,
-                    :operator,:vehicle_type,:ancillary,:ancillary_cost,
-                    :rental_type,:notes
-                )
-                """,
-                rows,
-            )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS contracts (
-                id TEXT PRIMARY KEY,
-                import_file TEXT,
-                import_period TEXT,
-                contract_date TEXT,
-                prefix TEXT,
-                number INTEGER,
-                ra TEXT NOT NULL,
-                start_date TEXT,
-                end_date TEXT,
-                requested_group TEXT,
-                assigned_group TEXT,
-                source_raw TEXT,
-                source_base TEXT,
-                source_details TEXT,
-                source_year TEXT,
-                source_km TEXT,
-                client TEXT,
-                duration_days INTEGER,
-                kpi1_rpd REAL,
-                contract_value REAL,
-                kpi_target REAL,
-                ancillary_value REAL,
-                ancillary_rpd REAL,
-                operator TEXT,
-                UNIQUE(ra, contract_date)
-            )
-            """
-        )
-        contracts_schema = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'contracts'"
-        ).fetchone()[0]
-        if "RA TEXT NOT NULL UNIQUE" in upper(contracts_schema):
-            conn.execute("ALTER TABLE contracts RENAME TO contracts_legacy_ra_unique")
-            conn.execute(
-                """
-                CREATE TABLE contracts (
-                    id TEXT PRIMARY KEY, import_file TEXT, import_period TEXT,
-                    contract_date TEXT, prefix TEXT, number INTEGER,
-                    ra TEXT NOT NULL, start_date TEXT, end_date TEXT,
-                    requested_group TEXT, assigned_group TEXT, source_raw TEXT,
-                    source_base TEXT, source_details TEXT, source_year TEXT,
-                    source_km TEXT, client TEXT, duration_days INTEGER,
-                    kpi1_rpd REAL, contract_value REAL, kpi_target REAL,
-                    ancillary_value REAL, ancillary_rpd REAL, operator TEXT,
-                    UNIQUE(ra, contract_date)
-                )
-                """
-            )
-            conn.execute("INSERT INTO contracts SELECT * FROM contracts_legacy_ra_unique")
-            conn.execute("DROP TABLE contracts_legacy_ra_unique")
-        contracts_count = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
-        if contracts_count == 0 and CONTRACT_SEED_PATH.exists():
-            contracts = json.loads(CONTRACT_SEED_PATH.read_text(encoding="utf-8"))
-            conn.executemany(
-                """
-                INSERT INTO contracts VALUES (
-                    :id,:import_file,:import_period,:contract_date,:prefix,:number,
-                    :ra,:start_date,:end_date,:requested_group,:assigned_group,
-                    :source_raw,:source_base,:source_details,:source_year,:source_km,
-                    :client,:duration_days,:kpi1_rpd,:contract_value,:kpi_target,
-                    :ancillary_value,:ancillary_rpd,:operator
-                )
-                """,
-                contracts,
-            )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS operator_config (
-                name TEXT PRIMARY KEY,
-                active INTEGER NOT NULL DEFAULT 1
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS damage_charges (
-                id TEXT PRIMARY KEY,
-                source_key TEXT NOT NULL UNIQUE,
-                submitted_at TEXT,
-                control_date TEXT,
-                ra TEXT NOT NULL,
-                vehicle_category TEXT,
-                charge_mode TEXT,
-                operator TEXT,
-                description TEXT,
-                photo_url TEXT,
-                amount REAL,
-                payment_status TEXT,
-                notes TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS damage_photos (
-                id TEXT PRIMARY KEY,
-                damage_id TEXT NOT NULL,
-                file_name TEXT NOT NULL,
-                mime_type TEXT,
-                file_data BLOB NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_damage_photos_damage_id ON damage_photos(damage_id)")
-        damage_count = conn.execute("SELECT COUNT(*) FROM damage_charges").fetchone()[0]
-        if damage_count == 0 and DAMAGE_SEED_PATH.exists():
-            damages = json.loads(DAMAGE_SEED_PATH.read_text(encoding="utf-8"))
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO damage_charges VALUES (
-                    :id,:source_key,:submitted_at,:control_date,:ra,
-                    :vehicle_category,:charge_mode,:operator,:description,
-                    :photo_url,:amount,:payment_status,:notes
-                )
-                """,
-                damages,
-            )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_users (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL,
-                display_name TEXT,
-                operator_name TEXT,
-                permissions TEXT NOT NULL DEFAULT '[]',
-                active INTEGER NOT NULL DEFAULT 1,
-                is_admin INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS cash_movements (
-                id TEXT PRIMARY KEY,
-                source_key TEXT UNIQUE,
-                movement_date TEXT NOT NULL,
-                ra TEXT,
-                movement_type TEXT NOT NULL,
-                amount REAL NOT NULL,
-                payment_method TEXT NOT NULL DEFAULT 'CONTANTI',
-                operator TEXT,
-                notes TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cash_movements_date ON cash_movements(movement_date)")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS cash_closings (
-                id TEXT PRIMARY KEY,
-                closing_date TEXT NOT NULL UNIQUE,
-                expected_balance REAL NOT NULL,
-                counted_cash REAL NOT NULL,
-                checks_total REAL NOT NULL DEFAULT 0,
-                difference REAL NOT NULL,
-                denominations TEXT NOT NULL DEFAULT '{}',
-                operator TEXT,
-                notes TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS special_events (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                event_type TEXT,
-                start_date TEXT NOT NULL,
-                end_date TEXT,
-                start_time TEXT,
-                end_time TEXT,
-                location TEXT,
-                responsible TEXT,
-                status TEXT NOT NULL DEFAULT 'PROGRAMMATO',
-                capacity INTEGER,
-                vehicles TEXT,
-                cost REAL,
-                revenue REAL,
-                description TEXT,
-                notes TEXT,
-                created_by TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS event_participants (
-                id TEXT PRIMARY KEY,
-                event_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                role TEXT,
-                contact TEXT,
-                notes TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_participants_event ON event_participants(event_id)")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS event_files (
-                id TEXT PRIMARY KEY,
-                event_id TEXT NOT NULL,
-                file_name TEXT NOT NULL,
-                mime_type TEXT,
-                file_data BLOB NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_files_event ON event_files(event_id)")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS event_vehicles (
-                id TEXT PRIMARY KEY,
-                event_id TEXT NOT NULL,
-                vehicle_group TEXT,
-                plate TEXT,
-                brand TEXT,
-                model TEXT,
-                assigned_to TEXT,
-                ra TEXT,
-                pickup_date TEXT,
-                notes TEXT,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_vehicles_event ON event_vehicles(event_id)")
-        cleanup_done = conn.execute(
-            "SELECT value FROM app_meta WHERE key = 'ancillary_history_cleared_2026_10_01'"
-        ).fetchone()
-        if cleanup_done is None:
-            conn.execute("DELETE FROM rentals")
-            conn.execute(
-                "INSERT INTO app_meta (key, value) VALUES (?, ?)",
-                ("ancillary_history_cleared_2026_10_01", datetime.now().isoformat(timespec="seconds")),
-            )
-        operator_count = conn.execute("SELECT COUNT(*) FROM operator_config").fetchone()[0]
-        if operator_count == 0:
-            existing_operators = conn.execute(
-                """
-                SELECT DISTINCT TRIM(operator) AS name FROM rentals
-                WHERE TRIM(COALESCE(operator, '')) <> ''
-                UNION
-                SELECT DISTINCT TRIM(operator) AS name FROM contracts
-                WHERE TRIM(COALESCE(operator, '')) <> ''
-                UNION
-                SELECT DISTINCT TRIM(operator) AS name FROM damage_charges
-                WHERE TRIM(COALESCE(operator, '')) <> ''
-                """
-            ).fetchall()
-            conn.executemany(
-                "INSERT OR IGNORE INTO operator_config (name, active) VALUES (?, 1)",
-                [(upper(row[0]),) for row in existing_operators if upper(row[0])],
-            )
-
-
-def clean(value):
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    return re.sub(r"\s+", " ", str(value or "").strip())
-
-
-def upper(value):
-    return clean(value).upper()
-
-
-def configured_operators(active_only=True):
-    query = "SELECT name, active FROM operator_config"
-    if active_only:
-        query += " WHERE active = 1"
-    query += " ORDER BY name"
-    with db() as conn:
-        return [dict(row) for row in conn.execute(query).fetchall()]
-
+SEZIONI = {
+    "📊 Dashboard": "dashboard", "📅 Calendario": "calendario", "💶 Finanze": "finanze",
+    "🛒 Lista della spesa": "spesa", "⏰ Scadenze": "scadenze", "📷 Foto e video": "media",
+    "📁 Documenti": "documenti", "🎓 Scuola e sport": "attivita", "🩺 Salute": "salute",
+    "🧹 Faccende": "faccende", "⚙️ Amministrazione": "admin", "💾 Backup": "backup"
+}
+COLLEZIONI = ["calendario", "movimenti", "spesa", "scadenze", "media", "documenti", "attivita", "salute", "faccende"]
 
 def password_hash(password, salt=None):
-    salt = salt or uuid.uuid4().hex
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
-    return f"pbkdf2_sha256${salt}${digest}"
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180000).hex()
+    return salt + ":" + digest
 
-
-def password_matches(password, stored_hash):
+def password_ok(password, encoded):
     try:
-        algorithm, salt, expected = stored_hash.split("$", 2)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        actual = password_hash(password, salt).split("$", 2)[2]
-        return hmac.compare_digest(actual, expected)
-    except (AttributeError, ValueError):
+        salt, expected = encoded.split(":", 1)
+        return secrets.compare_digest(password_hash(password, salt).split(":", 1)[1], expected)
+    except Exception:
         return False
 
-
-def current_user():
-    return st.session_state.get("current_user", {})
-
-
-def current_operator():
-    return upper(current_user().get("operator_name", ""))
-
-
-def user_is_admin():
-    return bool(current_user().get("is_admin"))
-
-
-def allowed_areas():
-    if user_is_admin():
-        return set(PERMISSION_AREAS)
-    return set(current_user().get("permissions", []))
-
-
-def normalize_ra(value):
-    text = upper(value).replace(".", "").replace(" ", "").replace("_", "-")
-    match = re.search(r"(?:TOR)?-?(\d+)", text)
-    return f"TOR-{match.group(1)}" if match else text
-
-
-def parse_source(value):
-    text = upper(value)
-    for wrong, right in {
-        "TRAVELJGSAW": "TRAVELJIGSAW",
-        "WALK IN": "WALK-IN",
-        "ILLIMITATI": "UNLIMITED",
-    }.items():
-        text = text.replace(wrong, right)
-    year_match = re.search(r"\b(20\d{2})\b", text)
-    km_match = re.search(r"\b(\d{2,5})\s*KM\b", text)
-    known = [
-        "OFFICIAL BOOKING WEB", "TRAVELJIGSAW", "TRAVELDRIVE",
-        "VIPCARS", "DOYOUSPAIN", "WALK-IN", "RECEPTION",
-        "POSTEGO", "POSTE", "WEB",
+def nuovo_db():
+    utenti = [
+        ("admin", "Papà", "amministratore", "admin123"),
+        ("mamma", "Mamma", "amministratore", "mamma123"),
+        ("figlia24", "Figlia 24 anni", "adulto", "figlia24123"),
+        ("figlia17", "Figlia 17 anni", "figlio", "figlia17123"),
+        ("figlia10", "Figlia 10 anni", "figlio", "figlia10123"),
     ]
-    base = next((item for item in known if text.startswith(item)), "")
-    if not base:
-        marker = re.search(r"\s+(?:AUTO|VAN|CAR)\b", text)
-        base = text[: marker.start()].strip() if marker else text
-    details = text[len(base):].strip(" -")
-    return {
-        "source_raw": text,
-        "source_base": base,
-        "source_details": details,
-        "source_year": year_match.group(1) if year_match else "",
-        "source_km": km_match.group(1) if km_match else "",
-    }
-
-
-def classify_contract_channel(source_raw):
-    text = upper(source_raw)
-    if "REPLACEMENT" in text or "WARRANTY" in text:
-        return "REPLACEMENT"
-    if "WALK-IN" in text or "WALK IN" in text or text.startswith("RECEPTION"):
-        return "WALK-IN"
-    if "OFFICIAL BOOKING WEB" in text or re.search(r"\b(?:WEB|CNP)\b", text):
-        return "WEB/CNP"
-    broker_markers = (
-        "TRAVELJIGSAW", "TRAVELDRIVE", "DOYOUSPAIN", "VIPCARS",
-        "BOOKING GROUP", "TINOLEGGIO", "XML", "POA",
-    )
-    if any(marker in text for marker in broker_markers):
-        return "BROKER"
-    return "CORPORATE"
-
-
-def normalize_rental_type(value):
-    text = upper(value).replace("WEB-CNP-ETC", "WEB - CNP ETC").replace("CORPARATE", "CORPORATE")
-    parts = []
-    for item in text.split(","):
-        item = clean(item)
-        if item and item not in parts:
-            parts.append(item)
-    return ", ".join(parts)
-
-
-def save_record(record):
-    source = parse_source(record["source_raw"])
-    payload = {
-        "id": record.get("id") or str(uuid.uuid4()),
-        "created_at": record.get("created_at") or datetime.now().isoformat(timespec="seconds"),
-        "ra": normalize_ra(record["ra"]),
-        "start_date": str(record.get("start_date") or ""),
-        "rental_days": int(record.get("rental_days") or 0),
-        **source,
-        "operator": upper(record.get("operator")),
-        "vehicle_type": upper(record.get("vehicle_type")),
-        "ancillary": upper(record.get("ancillary")).replace("PRESNETE", "PRESENTE"),
-        "ancillary_cost": record.get("ancillary_cost"),
-        "rental_type": normalize_rental_type(record.get("rental_type")),
-        "notes": clean(record.get("notes")),
-    }
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO rentals VALUES (
-                :id,:created_at,:ra,:start_date,:rental_days,:source_raw,
-                :source_base,:source_details,:source_year,:source_km,
-                :operator,:vehicle_type,:ancillary,:ancillary_cost,
-                :rental_type,:notes
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                created_at=:created_at, ra=:ra, start_date=:start_date,
-                rental_days=:rental_days, source_raw=:source_raw,
-                source_base=:source_base, source_details=:source_details,
-                source_year=:source_year, source_km=:source_km,
-                operator=:operator, vehicle_type=:vehicle_type,
-                ancillary=:ancillary, ancillary_cost=:ancillary_cost,
-                rental_type=:rental_type, notes=:notes
-            """,
-            payload,
-        )
-
-
-def load_data():
-    with db() as conn:
-        frame = pd.read_sql_query("SELECT * FROM rentals ORDER BY start_date DESC, created_at DESC", conn)
-    if frame.empty:
-        return frame
-    frame["start_date"] = pd.to_datetime(frame["start_date"], errors="coerce")
-    frame["rental_days"] = pd.to_numeric(frame["rental_days"], errors="coerce").fillna(0).astype(int)
-    frame["ancillary_cost"] = pd.to_numeric(frame["ancillary_cost"], errors="coerce")
-    frame["rpd"] = frame["ancillary_cost"].div(frame["rental_days"].replace(0, pd.NA))
-    frame["has_ancillary"] = frame["ancillary"].fillna("").str.strip().ne("") & frame["ancillary_cost"].fillna(0).gt(0)
-    return frame
-
-
-def classify_damage(description):
-    text = upper(description)
-    categories = [
-        ("PARAURTI", "PARAURTI"), ("PARABREZZA", "PARABREZZA"),
-        ("PARAFANGO", "PARAFANGO"), ("PORTA", "PORTA/PORTIERA"),
-        ("PORTIER", "PORTA/PORTIERA"), ("FIANC", "FIANCATA"),
-        ("SPECCHI", "SPECCHIETTO"), ("CERCH", "CERCHIO/PNEUMATICO"),
-        ("PNEUM", "CERCHIO/PNEUMATICO"), ("FARO", "FARO/FANALE"),
-        ("FANAL", "FARO/FANALE"), ("TETTO", "TETTO"),
-        ("INTERN", "INTERNI"), ("BOLLO", "AMMACCATURA/BOLLO"),
-        ("AMMAC", "AMMACCATURA/BOLLO"),
-    ]
-    return next((label for marker, label in categories if marker in text), "ALTRO/DA CLASSIFICARE")
-
-
-def save_damage(record):
-    record_id = record.get("id") or str(uuid.uuid4())
-    submitted_at = record.get("submitted_at") or datetime.now().isoformat(timespec="seconds")
-    source_key = clean(record.get("source_key")) or record_id
-    payload = {
-        "id": record_id,
-        "source_key": source_key,
-        "submitted_at": submitted_at,
-        "control_date": clean(record.get("control_date")),
-        "ra": normalize_ra(record.get("ra")),
-        "vehicle_category": upper(record.get("vehicle_category")),
-        "charge_mode": upper(record.get("charge_mode")),
-        "operator": upper(record.get("operator")),
-        "description": upper(record.get("description")),
-        "photo_url": clean(record.get("photo_url")),
-        "amount": record.get("amount"),
-        "payment_status": upper(record.get("payment_status")) or "DA VERIFICARE",
-        "notes": clean(record.get("notes")),
-    }
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO damage_charges VALUES (
-                :id,:source_key,:submitted_at,:control_date,:ra,
-                :vehicle_category,:charge_mode,:operator,:description,
-                :photo_url,:amount,:payment_status,:notes
-            )
-            ON CONFLICT(source_key) DO UPDATE SET
-                submitted_at=:submitted_at, control_date=:control_date, ra=:ra,
-                vehicle_category=:vehicle_category, charge_mode=:charge_mode,
-                operator=:operator, description=:description, photo_url=:photo_url,
-                amount=:amount, payment_status=:payment_status, notes=:notes
-            """,
-            payload,
-        )
-    return record_id
-
-
-def save_damage_photos(damage_id, uploaded_files):
-    rows = []
-    for uploaded in uploaded_files or []:
-        file_data = uploaded.getvalue()
-        if not file_data:
-            continue
-        rows.append((
-            str(uuid.uuid4()), damage_id, clean(uploaded.name) or "foto_danno.jpg",
-            clean(uploaded.type) or "image/jpeg", sqlite3.Binary(file_data),
-            datetime.now().isoformat(timespec="seconds"),
-        ))
-    if rows:
-        with db() as conn:
-            conn.executemany(
-                """
-                INSERT INTO damage_photos
-                (id, damage_id, file_name, mime_type, file_data, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-    return len(rows)
-
-
-def damage_photos(damage_id):
-    with db() as conn:
-        return [dict(row) for row in conn.execute(
-            "SELECT * FROM damage_photos WHERE damage_id = ? ORDER BY created_at", (damage_id,)
-        ).fetchall()]
-
-
-def load_damages():
-    with db() as conn:
-        frame = pd.read_sql_query(
-            "SELECT * FROM damage_charges ORDER BY control_date DESC, submitted_at DESC", conn
-        )
-    if frame.empty:
-        return frame
-    frame["submitted_at"] = pd.to_datetime(frame["submitted_at"], errors="coerce")
-    frame["control_date"] = pd.to_datetime(frame["control_date"], errors="coerce")
-    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
-    frame["damage_category"] = frame["description"].map(classify_damage)
-    with db() as conn:
-        photo_counts = pd.read_sql_query(
-            "SELECT damage_id AS id, COUNT(*) AS photo_count FROM damage_photos GROUP BY damage_id", conn
-        )
-    if photo_counts.empty:
-        frame["photo_count"] = 0
-    else:
-        frame = frame.merge(photo_counts, on="id", how="left")
-        frame["photo_count"] = frame["photo_count"].fillna(0).astype(int)
-    frame["has_photo"] = frame["photo_url"].fillna("").str.strip().ne("") | frame["photo_count"].gt(0)
-    return frame
-
-
-def cash_effect(movement_type, amount):
-    value = abs(float(amount or 0))
-    return value if upper(movement_type) in CASH_IN_TYPES else -value
-
-
-def save_cash_movement(record):
-    movement_id = record.get("id") or str(uuid.uuid4())
-    payload = {
-        "id": movement_id,
-        "source_key": clean(record.get("source_key")) or movement_id,
-        "movement_date": clean(record.get("movement_date")) or date.today().isoformat(),
-        "ra": normalize_ra(record.get("ra")) if clean(record.get("ra")) else "",
-        "movement_type": upper(record.get("movement_type")),
-        "amount": abs(float(record.get("amount") or 0)),
-        "payment_method": upper(record.get("payment_method")) or "CONTANTI",
-        "operator": upper(record.get("operator")),
-        "notes": clean(record.get("notes")),
-        "created_at": record.get("created_at") or datetime.now().isoformat(timespec="seconds"),
-    }
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO cash_movements
-            (id, source_key, movement_date, ra, movement_type, amount, payment_method, operator, notes, created_at)
-            VALUES (:id, :source_key, :movement_date, :ra, :movement_type, :amount, :payment_method, :operator, :notes, :created_at)
-            ON CONFLICT(source_key) DO UPDATE SET
-                movement_date=:movement_date, ra=:ra, movement_type=:movement_type,
-                amount=:amount, payment_method=:payment_method, operator=:operator,
-                notes=:notes, created_at=:created_at
-            """,
-            payload,
-        )
-    return movement_id
-
-
-def load_cash_movements():
-    with db() as conn:
-        frame = pd.read_sql_query(
-            "SELECT * FROM cash_movements ORDER BY movement_date DESC, created_at DESC", conn
-        )
-    if frame.empty:
-        return frame
-    frame["movement_date"] = pd.to_datetime(frame["movement_date"], errors="coerce")
-    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce").fillna(0)
-    frame["effect"] = frame.apply(lambda row: cash_effect(row["movement_type"], row["amount"]), axis=1)
-    return frame
-
-
-def cash_balance(frame=None):
-    frame = load_cash_movements() if frame is None else frame
-    return 0.0 if frame.empty else float(frame["effect"].sum())
-
-
-def load_cash_closings():
-    with db() as conn:
-        frame = pd.read_sql_query("SELECT * FROM cash_closings ORDER BY closing_date DESC", conn)
-    if frame.empty:
-        return frame
-    frame["closing_date"] = pd.to_datetime(frame["closing_date"], errors="coerce")
-    for column in ["expected_balance", "counted_cash", "checks_total", "difference"]:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
-    return frame
-
-
-def save_special_event(record):
-    event_id = record.get("id") or str(uuid.uuid4())
-    payload = {
-        "id": event_id, "title": clean(record.get("title")),
-        "event_type": upper(record.get("event_type")),
-        "start_date": clean(record.get("start_date")), "end_date": clean(record.get("end_date")),
-        "start_time": clean(record.get("start_time")), "end_time": clean(record.get("end_time")),
-        "location": clean(record.get("location")), "responsible": upper(record.get("responsible")),
-        "status": upper(record.get("status")) or "PROGRAMMATO",
-        "capacity": int(record.get("capacity") or 0), "vehicles": clean(record.get("vehicles")),
-        "cost": float(record.get("cost") or 0), "revenue": float(record.get("revenue") or 0),
-        "description": clean(record.get("description")), "notes": clean(record.get("notes")),
-        "created_by": clean(record.get("created_by")) or current_user().get("username", ""),
-        "created_at": record.get("created_at") or datetime.now().isoformat(timespec="seconds"),
-    }
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO special_events VALUES (
-                :id,:title,:event_type,:start_date,:end_date,:start_time,:end_time,
-                :location,:responsible,:status,:capacity,:vehicles,:cost,:revenue,
-                :description,:notes,:created_by,:created_at
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                title=:title,event_type=:event_type,start_date=:start_date,end_date=:end_date,
-                start_time=:start_time,end_time=:end_time,location=:location,
-                responsible=:responsible,status=:status,capacity=:capacity,vehicles=:vehicles,
-                cost=:cost,revenue=:revenue,description=:description,notes=:notes,
-                created_by=:created_by,created_at=:created_at
-            """, payload,
-        )
-    return event_id
-
-
-def load_special_events():
-    with db() as conn:
-        frame = pd.read_sql_query("SELECT * FROM special_events ORDER BY start_date DESC, start_time DESC", conn)
-    if frame.empty:
-        return frame
-    frame["start_date"] = pd.to_datetime(frame["start_date"], errors="coerce")
-    frame["end_date"] = pd.to_datetime(frame["end_date"], errors="coerce")
-    for column in ["capacity", "cost", "revenue"]:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
-    frame["margin"] = frame["revenue"] - frame["cost"]
-    with db() as conn:
-        counts = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS participants FROM event_participants GROUP BY event_id", conn)
-        files = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS files FROM event_files GROUP BY event_id", conn)
-        vehicles = pd.read_sql_query("SELECT event_id AS id, COUNT(*) AS assigned_vehicles FROM event_vehicles GROUP BY event_id", conn)
-    frame = frame.merge(counts, on="id", how="left") if not counts.empty else frame.assign(participants=0)
-    frame = frame.merge(files, on="id", how="left") if not files.empty else frame.assign(files=0)
-    frame = frame.merge(vehicles, on="id", how="left") if not vehicles.empty else frame.assign(assigned_vehicles=0)
-    frame[["participants", "files", "assigned_vehicles"]] = frame[["participants", "files", "assigned_vehicles"]].fillna(0).astype(int)
-    return frame
-
-
-def event_options(frame):
-    if frame.empty:
-        return {}, []
-    records = {row.id: row for row in frame.itertuples()}
-    return records, list(records)
-
-
-def load_contracts():
-    with db() as conn:
-        frame = pd.read_sql_query("SELECT * FROM contracts ORDER BY contract_date DESC, ra DESC", conn)
-    if frame.empty:
-        return frame
-    for column in ["contract_date", "start_date", "end_date"]:
-        frame[column] = pd.to_datetime(frame[column], errors="coerce")
-    for column in ["duration_days", "kpi1_rpd", "contract_value", "kpi_target", "ancillary_value", "ancillary_rpd"]:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame["has_ancillary_ra"] = frame["ancillary_value"].fillna(0).gt(0)
-    frame["group_changed"] = frame["requested_group"].fillna("").ne(frame["assigned_group"].fillna(""))
-    frame["contract_vehicle"] = frame["assigned_group"].fillna("").map(
-        lambda value: "VAN" if upper(value).startswith("Z") else "CAR"
-    )
-    frame["rental_term"] = frame.apply(
-        lambda row: "MENSILE"
-        if "MENSILE" in upper(row["source_raw"]) or (row["duration_days"] or 0) >= 28
-        else "GIORNALIERO",
-        axis=1,
-    )
-    frame["rental_channel"] = frame["source_raw"].map(classify_contract_channel)
-    return frame
-
-
-def _find_header_row(raw):
-    for index in range(min(25, len(raw))):
-        values = {clean(value) for value in raw.iloc[index].dropna().tolist()}
-        if {"Data contratto", "Prefisso", "Numero"}.issubset(values):
-            return index
-    return None
-
-
-def detect_excel_type(file_bytes):
-    book = pd.ExcelFile(io.BytesIO(file_bytes))
-    for sheet in book.sheet_names:
-        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=25, dtype=object)
-        if _find_header_row(raw) is not None:
-            return "CONTRATTI_RA"
-    first = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, nrows=5, dtype=object)
-    damage_columns = {
-        "Informazioni cronologiche", "Numero RA (Rental Agreement)",
-        "Categoria Veicolo", "Modalità di addebito", "Operatore responsabile",
-    }
-    if damage_columns.issubset(first.columns):
-        return "ADDEBITO_DANNI"
-    if {"RA (Rental Agreement)", "DATA INIZIO NOLEGGIO", "GIORNI NOLEGGIO", "FONTE"}.issubset(first.columns):
-        return "ANCILLARY"
-    return "SCONOSCIUTO"
-
-
-def import_contract_workbook(file_bytes, file_name):
-    book = pd.ExcelFile(io.BytesIO(file_bytes))
-    parsed = {}
-    for sheet in book.sheet_names:
-        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=25, dtype=object)
-        header = _find_header_row(raw)
-        if header is None:
-            continue
-        frame = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=header, dtype=object)
-        frame = frame[frame["Numero"].notna()].copy()
-        if not frame.empty:
-            parsed[sheet] = frame
-    if not parsed:
-        raise ValueError("Nessun foglio RA riconosciuto.")
-    site_name = max(parsed, key=lambda name: len(parsed[name]))
-    site = parsed[site_name].copy()
-
-    def ra_from_row(row):
-        number = pd.to_numeric(row.get("Numero"), errors="coerce")
-        if pd.isna(number):
-            return ""
-        return f"{upper(row.get('Prefisso'))}-{int(number)}"
-
-    operator_map = {}
-    for sheet, frame in parsed.items():
-        if sheet == site_name or sheet.upper() == "TOTALE":
-            continue
-        for _, row in frame.iterrows():
-            operator_map[ra_from_row(row)] = clean(sheet)
-
-    contract_dates = pd.to_datetime(site["Data contratto"], errors="coerce")
-    valid_dates = contract_dates.dropna()
-    period = valid_dates.min().strftime("%Y-%m") if not valid_dates.empty else ""
-    imported = 0
-    with db() as conn:
-        for _, row in site.iterrows():
-            ra = ra_from_row(row)
-            if not ra:
-                continue
-            source = parse_source(row.get("Fonte commissione"))
-            number = pd.to_numeric(row.get("Numero"), errors="coerce")
-
-            def number_value(column):
-                value = pd.to_numeric(row.get(column), errors="coerce")
-                return None if pd.isna(value) else float(value)
-
-            def date_value(column):
-                value = pd.to_datetime(row.get(column), errors="coerce")
-                return "" if pd.isna(value) else value.date().isoformat()
-
-            duration = number_value("Durata (gg)") or 0
-            payload = {
-                "id": str(uuid.uuid4()), "import_file": file_name, "import_period": period,
-                "contract_date": date_value("Data contratto"), "prefix": upper(row.get("Prefisso")),
-                "number": int(number), "ra": ra, "start_date": date_value("Data inizio contratto"),
-                "end_date": date_value("Data fine contratto"), "requested_group": upper(row.get("Gruppo richiesto")),
-                "assigned_group": upper(row.get("Gruppo assegnato")), **source,
-                "client": clean(row.get("Cliente")), "duration_days": int(round(duration)),
-                "kpi1_rpd": number_value("KPI 1"), "contract_value": number_value("Valore contratto 1"),
-                "kpi_target": number_value("KPI 1 Ob."), "ancillary_value": number_value("Valore contratto 2"),
-                "ancillary_rpd": number_value("RpD 2"), "operator": operator_map.get(ra, "NON ASSEGNATO"),
-            }
-            conn.execute(
-                """
-                INSERT INTO contracts VALUES (
-                    :id,:import_file,:import_period,:contract_date,:prefix,:number,
-                    :ra,:start_date,:end_date,:requested_group,:assigned_group,
-                    :source_raw,:source_base,:source_details,:source_year,:source_km,
-                    :client,:duration_days,:kpi1_rpd,:contract_value,:kpi_target,
-                    :ancillary_value,:ancillary_rpd,:operator
-                )
-                ON CONFLICT(ra, contract_date) DO UPDATE SET
-                    import_file=:import_file, import_period=:import_period,
-                    contract_date=:contract_date, prefix=:prefix, number=:number,
-                    start_date=:start_date, end_date=:end_date,
-                    requested_group=:requested_group, assigned_group=:assigned_group,
-                    source_raw=:source_raw, source_base=:source_base,
-                    source_details=:source_details, source_year=:source_year,
-                    source_km=:source_km, client=:client, duration_days=:duration_days,
-                    kpi1_rpd=:kpi1_rpd, contract_value=:contract_value,
-                    kpi_target=:kpi_target, ancillary_value=:ancillary_value,
-                    ancillary_rpd=:ancillary_rpd, operator=:operator
-                """,
-                payload,
-            )
-            imported += 1
-    return imported, site_name, period
-
-
-def import_damage_workbook(file_bytes, file_name):
-    book = pd.ExcelFile(io.BytesIO(file_bytes))
-    imported = 0
-    skipped = 0
-    for sheet in book.sheet_names:
-        frame = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, dtype=object)
-        required = {
-            "Informazioni cronologiche", "Numero RA (Rental Agreement)",
-            "Categoria Veicolo", "Modalità di addebito", "Operatore responsabile",
-        }
-        if not required.issubset(frame.columns):
-            continue
-        for _, row in frame.iterrows():
-            ra = normalize_ra(row.get("Numero RA (Rental Agreement)"))
-            if not ra:
-                skipped += 1
-                continue
-            submitted = pd.to_datetime(row.get("Informazioni cronologiche"), errors="coerce")
-            control = pd.to_datetime(row.get("Data del controllo"), errors="coerce")
-            submitted_text = "" if pd.isna(submitted) else submitted.isoformat()
-            source_key = f"{submitted_text}|{ra}|{sheet}"
-            save_damage({
-                "source_key": source_key,
-                "submitted_at": submitted_text,
-                "control_date": "" if pd.isna(control) else control.date().isoformat(),
-                "ra": ra,
-                "vehicle_category": row.get("Categoria Veicolo"),
-                "charge_mode": row.get("Modalità di addebito"),
-                "operator": row.get("Operatore responsabile"),
-                "description": row.get("Descrizione sintetica del danno"),
-                "photo_url": row.get("Caricamento foto danno (opzionale)"),
-                "amount": None,
-                "payment_status": "DA VERIFICARE",
-                "notes": f"Importato da {file_name} - foglio {sheet}",
-            })
-            imported += 1
-    return imported, skipped
-
-
-def to_excel(frame):
-    output = io.BytesIO()
-    export = frame.copy()
-    export["DATA INIZIO NOLEGGIO"] = export["start_date"].dt.date
-    export = export.rename(columns={
-        "ra": "RA", "rental_days": "GIORNI NOLEGGIO", "source_raw": "FONTE COMPLETA",
-        "source_base": "FONTE PRINCIPALE", "source_details": "DETTAGLIO FONTE",
-        "source_year": "ANNO FONTE", "source_km": "KM FONTE", "operator": "OPERATORE",
-        "vehicle_type": "TIPO VEICOLO", "ancillary": "ANCILLARY",
-        "ancillary_cost": "COSTO ANCILLARY IVA ESCLUSA", "rpd": "RPD",
-        "rental_type": "TIPO NOLEGGIO", "notes": "NOTE",
-    })
-    cols = [
-        "RA", "DATA INIZIO NOLEGGIO", "GIORNI NOLEGGIO", "FONTE COMPLETA",
-        "FONTE PRINCIPALE", "DETTAGLIO FONTE", "ANNO FONTE", "KM FONTE",
-        "OPERATORE", "TIPO VEICOLO", "ANCILLARY", "COSTO ANCILLARY IVA ESCLUSA",
-        "RPD", "TIPO NOLEGGIO", "NOTE",
-    ]
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export[cols].to_excel(writer, index=False, sheet_name="Dati ancillary")
-    return output.getvalue()
-
-
-def table_to_excel(frame, sheet_name="Dati"):
-    output = io.BytesIO()
-    export = frame.copy()
-    for column in export.columns:
-        if pd.api.types.is_datetime64_any_dtype(export[column]):
-            export[column] = export[column].dt.date
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-    return output.getvalue()
-
-
-def event_vehicles_to_pdf(frame, event_title):
-    output = io.BytesIO()
-    document = SimpleDocTemplate(
-        output, pagesize=landscape(A4), rightMargin=8 * mm, leftMargin=8 * mm,
-        topMargin=8 * mm, bottomMargin=8 * mm,
-    )
-    styles = getSampleStyleSheet()
-    story = [Paragraph(f"Veicoli assegnati - {event_title}", styles["Title"]), Spacer(1, 4 * mm)]
-    export = frame.copy()
-    if "_id" in export.columns:
-        export = export.drop(columns=["_id"])
-    if "Stato" in export.columns:
-        export["Stato"] = export["Data ritiro"].fillna("").astype(str).str.strip().map(lambda value: "RITIRATA" if value else "DA RITIRARE")
-    export = export.fillna("").astype(str)
-    data = [list(export.columns)] + export.values.tolist()
-    widths = [23, 24, 23, 27, 30, 39, 25, 27, 39][:len(export.columns)]
-    table = Table(data, repeatRows=1, colWidths=[width * mm for width in widths])
-    style = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DCE6F1")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#172033")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 7),
-        ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F6F8FB")]),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-    ]
-    if "Stato" in export.columns:
-        status_column = list(export.columns).index("Stato")
-        for row_number, status in enumerate(export["Stato"], start=1):
-            style.append(("TEXTCOLOR", (status_column, row_number), (status_column, row_number), colors.green if status == "RITIRATA" else colors.red))
-            style.append(("FONTNAME", (status_column, row_number), (status_column, row_number), "Helvetica-Bold"))
-    table.setStyle(TableStyle(style))
-    story.append(table)
-    document.build(story)
-    return output.getvalue()
-
-
-def filters(frame):
-    st.sidebar.markdown("### Filtri")
-    years = sorted([int(x) for x in frame["start_date"].dt.year.dropna().unique()])
-    selected_years = st.sidebar.multiselect("Anno", years, default=years)
-    operators = sorted(x for x in frame["operator"].dropna().unique() if x)
-    selected_operators = st.sidebar.multiselect("Operatore", operators)
-    vehicles = sorted(x for x in frame["vehicle_type"].dropna().unique() if x)
-    selected_vehicles = st.sidebar.multiselect("Veicolo", vehicles)
-    sources = sorted(x for x in frame["source_base"].dropna().unique() if x)
-    selected_sources = st.sidebar.multiselect("Fonte", sources)
-    search = st.sidebar.text_input("Cerca RA, fonte o dettaglio")
-    result = frame.copy()
-    if selected_years:
-        result = result[result["start_date"].dt.year.isin(selected_years)]
-    if selected_operators:
-        result = result[result["operator"].isin(selected_operators)]
-    if selected_vehicles:
-        result = result[result["vehicle_type"].isin(selected_vehicles)]
-    if selected_sources:
-        result = result[result["source_base"].isin(selected_sources)]
-    if search:
-        mask = result[["ra", "source_raw", "source_details", "operator"]].fillna("").apply(
-            lambda col: col.str.contains(search, case=False, regex=False)
-        ).any(axis=1)
-        result = result[mask]
-    return result
-
-
-def metric_row(frame):
-    rentals = len(frame)
-    ancillary_count = int(frame["has_ancillary"].sum()) if rentals else 0
-    revenue = float(frame["ancillary_cost"].fillna(0).sum()) if rentals else 0
-    conversion = ancillary_count / rentals if rentals else 0
-    average_ticket = revenue / ancillary_count if ancillary_count else 0
-    average_rpd = float(frame.loc[frame["has_ancillary"], "rpd"].mean() or 0) if ancillary_count else 0
-    cols = st.columns(6)
-    cols[0].metric("Noleggi", f"{rentals:,}".replace(",", "."))
-    cols[1].metric("Con ancillary", f"{ancillary_count:,}".replace(",", "."))
-    cols[2].metric("Conversione", f"{conversion:.1%}")
-    cols[3].metric("Ricavi ancillary", f"€ {revenue:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    cols[4].metric("Ticket medio", f"€ {average_ticket:.2f}".replace(".", ","))
-    cols[5].metric("RPD medio", f"€ {average_rpd:.2f}".replace(".", ","))
-
-
-def dashboard(frame):
-    st.header("Dashboard ancillary")
-    metric_row(frame)
-    if frame.empty:
-        st.info("Nessun dato corrisponde ai filtri selezionati.")
-        return
-    monthly = frame.dropna(subset=["start_date"]).copy()
-    monthly["mese"] = monthly["start_date"].dt.to_period("M").astype(str)
-    monthly = monthly.groupby("mese", as_index=False).agg(
-        noleggi=("id", "count"), ricavi=("ancillary_cost", "sum"), conversione=("has_ancillary", "mean")
-    )
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(px.line(monthly, x="mese", y="ricavi", markers=True, title="Ricavi ancillary per mese"), use_container_width=True)
-    by_operator = frame.groupby("operator", as_index=False).agg(
-        noleggi=("id", "count"), ricavi=("ancillary_cost", "sum"), conversione=("has_ancillary", "mean")
-    ).sort_values("ricavi", ascending=False)
-    c2.plotly_chart(px.bar(by_operator, x="operator", y="ricavi", color="conversione", title="Ricavi e conversione per operatore"), use_container_width=True)
-    c3, c4 = st.columns(2)
-    by_source = frame.groupby("source_base", as_index=False).agg(
-        noleggi=("id", "count"), ricavi=("ancillary_cost", "sum")
-    ).sort_values("ricavi", ascending=False).head(15)
-    c3.plotly_chart(px.bar(by_source, x="ricavi", y="source_base", orientation="h", title="Prime 15 fonti per ricavi"), use_container_width=True)
-    by_vehicle = frame.groupby("vehicle_type", as_index=False).agg(
-        noleggi=("id", "count"), ricavi=("ancillary_cost", "sum"), conversione=("has_ancillary", "mean")
-    )
-    c4.plotly_chart(px.bar(by_vehicle, x="vehicle_type", y=["noleggi", "ricavi"], barmode="group", title="Confronto CAR e VAN"), use_container_width=True)
-    with st.expander("Controllo qualità dei dati"):
-        duplicates = frame[frame.duplicated("ra", keep=False)].sort_values("ra")
-        q1, q2, q3 = st.columns(3)
-        q1.metric("RA duplicati", int(duplicates["ra"].nunique()))
-        q2.metric("Fonte mancante", int(frame["source_raw"].fillna("").str.strip().eq("").sum()))
-        q3.metric("Veicolo mancante", int(frame["vehicle_type"].fillna("").str.strip().eq("").sum()))
-        if not duplicates.empty:
-            st.dataframe(
-                duplicates[["start_date", "ra", "operator", "source_raw"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-def record_form(frame):
-    st.header("Inserimento e modifica")
-    records_by_id = {row.id: row for row in frame.itertuples()}
-    options = [""] + list(records_by_id)
-    selected = st.selectbox(
-        "Record da modificare (lascia vuoto per inserirne uno nuovo)",
-        options,
-        format_func=lambda record_id: "" if not record_id else (
-            f"{records_by_id[record_id].ra} | "
-            f"{records_by_id[record_id].start_date.date() if pd.notna(records_by_id[record_id].start_date) else ''} | "
-            f"{records_by_id[record_id].operator}"
-        ),
-    )
-    current = None
-    if selected:
-        current = frame[frame["id"] == selected].iloc[0].to_dict()
-    widget_prefix = (current or {}).get("id", "nuovo")
-    rental_options = ["", "CORPORATE", "WALK-IN", "BROKER", "WEB/CNP", "REPLACEMENT", "MENSILE"]
-    current_rental = upper((current or {}).get("rental_type", ""))
-    rental_aliases = {
-        "CORPARATE": "CORPORATE", "WEB - CNP ETC": "WEB/CNP", "WEB-CNP-ETC": "WEB/CNP",
-        "ASSISTENZA": "REPLACEMENT", "FULL CREDIT, ASSISTENZA": "REPLACEMENT",
-    }
-    current_rental = rental_aliases.get(current_rental, current_rental)
-    if current_rental not in rental_options:
-        current_rental = ""
-
-    a, b = st.columns(2)
-    ra = a.text_input("RA (Rental Agreement) *", value=(current or {}).get("ra", ""), key=f"{widget_prefix}_ra")
-    start_value = (current or {}).get("start_date")
-    start_date = b.date_input(
-        "Data inizio noleggio *",
-        value=start_value.date() if pd.notna(start_value) else date.today(),
-        key=f"{widget_prefix}_date",
-    )
-
-    d, e, f = st.columns(3)
-    current_operator = upper((current or {}).get("operator", ""))
-    operator_options = [""] + [row["name"] for row in configured_operators()]
-    if current_operator and current_operator not in operator_options:
-        operator_options.append(current_operator)
-    operator = d.selectbox(
-        "Operatore",
-        operator_options,
-        index=operator_options.index(current_operator) if current_operator in operator_options else 0,
-        key=f"{widget_prefix}_operator",
-    )
-    vehicle_options = ["", "CAR", "VAN"]
-    current_vehicle = upper((current or {}).get("vehicle_type", ""))
-    if current_vehicle not in vehicle_options:
-        current_vehicle = ""
-    vehicle = e.selectbox(
-        "Tipo veicolo", vehicle_options, index=vehicle_options.index(current_vehicle), key=f"{widget_prefix}_vehicle"
-    )
-    rental_type = f.selectbox(
-        "Tipo noleggio *", rental_options, index=rental_options.index(current_rental), key=f"{widget_prefix}_rental"
-    )
-
-    ancillary_blocked = rental_type in {"CORPORATE", "MENSILE"}
-    existing_days = int((current or {}).get("rental_days", 0) or 0)
-    days = st.number_input(
-        "Giorni noleggio *",
-        min_value=0,
-        step=1,
-        value=0 if ancillary_blocked else max(existing_days, 1),
-        disabled=ancillary_blocked,
-        key=f"{widget_prefix}_days_{rental_type}",
-    )
-
-    car_ancillary = ["", "GOLD", "PLATINUM", "UP GOLD/PLATINUM", "GIÀ PRESENTE"]
-    van_ancillary = ["", "NO PROBLEM", "SUPER VAN", "VAN PROTECTION", "CARGO VAN"]
-    ancillary_options = car_ancillary if vehicle == "CAR" else van_ancillary if vehicle == "VAN" else [""]
-    current_ancillary = upper((current or {}).get("ancillary", ""))
-    if "PRESENTE" in current_ancillary and vehicle == "CAR":
-        current_ancillary = "GIÀ PRESENTE"
-    elif "UP" in current_ancillary and vehicle == "CAR":
-        current_ancillary = "UP GOLD/PLATINUM"
-    if current_ancillary not in ancillary_options:
-        current_ancillary = ""
-
-    g, h = st.columns(2)
-    ancillary = g.selectbox(
-        "Tipo ancillary",
-        ancillary_options,
-        index=ancillary_options.index(current_ancillary),
-        disabled=ancillary_blocked or not vehicle,
-        key=f"{widget_prefix}_ancillary_{vehicle}_{rental_type}",
-    )
-    existing_cost = (current or {}).get("ancillary_cost")
-    existing_daily_cost = (
-        float(existing_cost) / existing_days
-        if pd.notna(existing_cost) and existing_days > 0
-        else 0.0
-    )
-    daily_cost = h.number_input(
-        "Costo giornaliero ancillary (IVA esclusa)",
-        min_value=0.0,
-        step=0.01,
-        value=0.0 if ancillary_blocked else round(existing_daily_cost, 2),
-        disabled=ancillary_blocked or not ancillary,
-        key=f"{widget_prefix}_cost_{vehicle}_{rental_type}_{ancillary}",
-    )
-    calculated_total = round(daily_cost * days, 2) if not ancillary_blocked and days else 0.0
-    if ancillary_blocked:
-        st.info(f"Per i noleggi {rental_type} non vengono inseriti giorni, ancillary o costi ancillary.")
-    else:
-        st.info(f"Totale ancillary calcolato: € {daily_cost:.2f} × {days} giorni = € {calculated_total:.2f}")
-    notes = st.text_area("Note", value=(current or {}).get("notes", ""), key=f"{widget_prefix}_notes")
-    submitted = st.button("Salva record", type="primary", use_container_width=True)
-    if submitted:
-        if not ra or not rental_type:
-            st.error("Inserisci almeno RA e tipo noleggio.")
-        elif start_date < ANCILLARY_START_DATE:
-            st.error("Lo storico ancillary parte dal 01/10/2026. Inserisci una data uguale o successiva.")
-        elif not ancillary_blocked and days <= 0:
-            st.error("Inserisci i giorni di noleggio.")
+    db = {"versione": 2, "famiglia": "La nostra famiglia", "utenti": {}, "album_drive": {}, "config": {"drive_folder_id": "", "budget_mensile": 0.0, "ultimo_backup_giornaliero": ""}}
+    for username, nome, ruolo, pwd in utenti:
+        db["utenti"][username] = {"nome": nome, "ruolo": ruolo, "password": password_hash(pwd), "attivo": True}
+    for c in COLLEZIONI: db[c] = []
+    return db
+
+def carica():
+    if not DATA.exists():
+        salva(nuovo_db(), sincronizza=False)
+    try:
+        db = json.loads(DATA.read_text(encoding="utf-8"))
+    except Exception:
+        db = nuovo_db(); salva(db, sincronizza=False)
+    try:
+        remoto = drive_carica_db(db)
+        if remoto:
+            db = remoto
+            salva(db, sincronizza=False)
+            st.session_state["drive_sync_status"] = "Dati aggiornati da Google Drive"
+    except Exception as exc:
+        st.session_state["drive_sync_error"] = str(exc)
+    for c in COLLEZIONI: db.setdefault(c, [])
+    db.setdefault("utenti", {})
+    db.setdefault("album_drive", {})
+    db.setdefault("config", {})
+    db["config"].setdefault("drive_folder_id", "")
+    db["config"].setdefault("budget_mensile", 0.0)
+    db["config"].setdefault("ultimo_backup_giornaliero", "")
+    return db
+
+def salva(db, sincronizza=True):
+    tmp = DATA.with_suffix(".tmp")
+    tmp.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, DATA)
+    if sincronizza:
+        try:
+            drive_salva_db(db)
+            st.session_state["drive_sync_status"] = f"Salvato su Google Drive alle {datetime.now().strftime('%H:%M:%S')}"
+            st.session_state.pop("drive_sync_error", None)
+        except Exception as exc:
+            st.session_state["drive_sync_error"] = str(exc)
+
+def oggi(): return date.today().isoformat()
+def nuovo_id(): return uuid.uuid4().hex
+def admin(): return st.session_state.get("ruolo") == "amministratore"
+def utente(): return st.session_state.get("username", "")
+
+def data_ora_da_nome_file(nome_file):
+    """Ricava data e ora dai nomi creati dal telefono."""
+    testo = Path(str(nome_file or "")).stem
+    trovato = re.search(r"(\d{4}-\d{2}-\d{2})[ _-]+(\d{2})[.:_-](\d{2})[.:_-](\d{2})", testo)
+    if trovato:
+        return f"{trovato.group(1)} {trovato.group(2)}:{trovato.group(3)}:{trovato.group(4)}"
+    trovato = re.search(r"(\d{4}-\d{2}-\d{2})", testo)
+    return trovato.group(1) if trovato else ""
+
+def visibili(righe):
+    if admin(): return righe
+    u = utente()
+    return [r for r in righe if r.get("condiviso", True) or r.get("proprietario") == u or u in r.get("visibile_a", [])]
+
+def registra(db, raccolta, dati, condiviso=True):
+    dati.update({"id": nuovo_id(), "proprietario": utente(), "condiviso": bool(condiviso), "creato_il": datetime.now().isoformat(timespec="seconds")})
+    db[raccolta].append(dati); salva(db)
+
+def elimina(db, raccolta, item_id):
+    db[raccolta] = [x for x in db[raccolta] if x.get("id") != item_id]
+    salva(db)
+
+def tabella_con_elimina(db, raccolta, righe, colonne):
+    if not righe:
+        st.info("Nessun elemento presente."); return
+    st.dataframe([{k:r.get(k, "") for k in colonne} for r in righe], use_container_width=True, hide_index=True)
+    opzioni = {f"{r.get(colonne[0], '')} · {r.get(colonne[1], '') if len(colonne)>1 else ''} · {r.get('id','')[:6]}": r for r in righe if admin() or r.get("proprietario") == utente()}
+    if opzioni:
+        scelta = st.selectbox("Elemento da eliminare", [""] + list(opzioni), key="del_"+raccolta)
+        if st.button("🗑️ Elimina selezionato", disabled=not scelta, key="btn_del_"+raccolta):
+            elimina(db, raccolta, opzioni[scelta]["id"]); st.rerun()
+
+def drive_service():
+    oauth_error = None
+    oauth_configured = False
+    try:
+        oauth_section = st.secrets.get("gcp_drive_oauth")
+        if oauth_section:
+            oauth_configured = True
+            oauth = dict(oauth_section)
+            content = oauth.get("content", "")
+            if content:
+                parsed = json.loads(content, strict=False) if isinstance(content, str) else dict(content)
+                oauth = {**parsed, **{k:v for k,v in oauth.items() if k != "content"}}
+            client_id = str(oauth.get("client_id", "") or "").strip()
+            client_secret = str(oauth.get("client_secret", "") or "").strip()
+            refresh_token = str(oauth.get("refresh_token", "") or "").strip()
+            token_uri = str(oauth.get("token_uri", "https://oauth2.googleapis.com/token") or "https://oauth2.googleapis.com/token").strip()
+            if client_id and client_secret and refresh_token:
+                from google.oauth2.credentials import Credentials
+                from google.auth.transport.requests import Request
+                from googleapiclient.discovery import build
+                cred = Credentials(token=None, refresh_token=refresh_token, token_uri=token_uri,
+                                   client_id=client_id, client_secret=client_secret)
+                cred.refresh(Request())
+                st.session_state["drive_auth_mode"] = "OAuth personale"
+                return build("drive", "v3", credentials=cred, cache_discovery=False)
+            oauth_error = "mancano client_id, client_secret o refresh_token"
+    except Exception as exc:
+        oauth_error = f"{type(exc).__name__}: {exc}"
+    if oauth_configured:
+        raise RuntimeError(f"OAuth Google Drive non valido: {oauth_error or 'configurazione incompleta'}")
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        raw = st.secrets.get("gcp_service_account", {})
+        raw = raw.get("content", raw) if hasattr(raw, "get") else raw
+        if isinstance(raw, str):
+            raw = raw.lstrip("\ufeff").strip()
+            try:
+                info = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                # Alcuni editor/TOML trasformano i \\n della chiave PEM in
+                # veri a-capo dentro la stringa JSON. strict=False consente di
+                # acquisirli; subito sotto la chiave viene normalizzata.
+                if "Invalid control character" not in str(exc):
+                    raise
+                info = json.loads(raw, strict=False)
         else:
-            save_record({
-                "id": (current or {}).get("id"), "created_at": (current or {}).get("created_at"),
-                "ra": ra, "start_date": start_date.isoformat(), "rental_days": days,
-                "source_raw": (current or {}).get("source_raw", ""),
-                "operator": operator, "vehicle_type": vehicle,
-                "ancillary": ancillary,
-                "ancillary_cost": calculated_total if calculated_total > 0 else None,
-                "rental_type": rental_type, "notes": notes,
-            })
-            st.success("Record salvato e normalizzato.")
-            st.rerun()
-    if current:
-        st.divider()
-        confirm = st.checkbox(f"Confermo l’eliminazione definitiva di {current['ra']}")
-        if st.button("Elimina record", disabled=not confirm, type="secondary"):
-            with db() as conn:
-                conn.execute("DELETE FROM rentals WHERE id = ?", (current["id"],))
-            st.success("Record eliminato.")
-            st.rerun()
+            info = dict(raw)
+        # Streamlit/TOML puo conservare gli a-capo della chiave come sequenze
+        # letterali. Normalizziamo entrambi i formati prima di creare le credenziali.
+        private_key = str(info.get("private_key", ""))
+        private_key = private_key.replace("\\\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n").strip()
+        if private_key:
+            info["private_key"] = private_key + "\n"
+        cred = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+        st.session_state["drive_auth_mode"] = "Service account"
+        return build("drive", "v3", credentials=cred, cache_discovery=False)
+    except Exception as e:
+        dettaglio = f" OAuth: {oauth_error}." if oauth_error else ""
+        raise RuntimeError(f"Google Drive non configurato:{dettaglio} Service account: {e}")
 
+def drive_root(db):
+    try: return str(st.secrets.get("gcp_famiglia", {}).get("folder_id", "")).strip() or db["config"].get("drive_folder_id", "")
+    except Exception: return db["config"].get("drive_folder_id", "")
 
-def archive(frame):
-    st.header("Archivio noleggi")
-    display = frame[[
-        "start_date", "ra", "rental_days", "source_base", "source_details",
-        "operator", "vehicle_type", "ancillary", "ancillary_cost", "rpd", "rental_type",
-    ]].copy()
-    display.columns = [
-        "Data", "RA", "Giorni", "Fonte", "Dettaglio fonte", "Operatore",
-        "Veicolo", "Ancillary", "Costo", "RPD", "Tipo noleggio",
-    ]
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Data": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Costo": st.column_config.NumberColumn(format="€ %.2f"),
-            "RPD": st.column_config.NumberColumn(format="€ %.2f"),
-        },
-    )
-    st.download_button("Esporta archivio filtrato in Excel", to_excel(frame), "archivio_ancillary.xlsx", use_container_width=True)
+def drive_cartella(service, nome, parent):
+    q = f"name='{nome.replace(chr(39), '')}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent: q += f" and '{parent}' in parents"
+    found = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute().get("files", [])
+    if found: return found[0]["id"]
+    body = {"name": nome, "mimeType": "application/vnd.google-apps.folder"}
+    if parent: body["parents"] = [parent]
+    return service.files().create(body=body, fields="id").execute()["id"]
 
+def drive_file(service, nome, parent):
+    nome_pulito = nome.replace("'", "")
+    q = f"name='{nome_pulito}' and trashed=false and '{parent}' in parents"
+    files = service.files().list(q=q, fields="files(id,name,webViewLink,modifiedTime)", pageSize=1).execute().get("files", [])
+    return files[0] if files else None
 
-def contract_filters(frame):
-    if frame.empty:
-        return frame
-    c1, c2, c3, c4 = st.columns(4)
-    periods = sorted(x for x in frame["import_period"].dropna().unique() if x)
-    selected_periods = c1.multiselect("Periodo RA", periods, default=periods)
-    operators = sorted(x for x in frame["operator"].dropna().unique() if x)
-    selected_operators = c2.multiselect("Operatore RA", operators)
-    sources = sorted(x for x in frame["source_base"].dropna().unique() if x)
-    selected_sources = c3.multiselect("Fonte RA", sources)
-    groups = sorted(x for x in frame["assigned_group"].dropna().unique() if x)
-    selected_groups = c4.multiselect("Gruppo assegnato", groups)
-    c5, c6, c7 = st.columns(3)
-    channels = sorted(x for x in frame["rental_channel"].dropna().unique() if x)
-    selected_channels = c5.multiselect("Tipo noleggio", channels)
-    terms = [x for x in ["GIORNALIERO", "MENSILE"] if x in set(frame["rental_term"])]
-    selected_terms = c6.multiselect("Durata noleggio", terms)
-    vehicles = [x for x in ["CAR", "VAN"] if x in set(frame["contract_vehicle"])]
-    selected_vehicles = c7.multiselect("Tipo veicolo", vehicles)
-    result = frame.copy()
-    if selected_periods:
-        result = result[result["import_period"].isin(selected_periods)]
-    if selected_operators:
-        result = result[result["operator"].isin(selected_operators)]
-    if selected_sources:
-        result = result[result["source_base"].isin(selected_sources)]
-    if selected_groups:
-        result = result[result["assigned_group"].isin(selected_groups)]
-    if selected_channels:
-        result = result[result["rental_channel"].isin(selected_channels)]
-    if selected_terms:
-        result = result[result["rental_term"].isin(selected_terms)]
-    if selected_vehicles:
-        result = result[result["contract_vehicle"].isin(selected_vehicles)]
-    return result
-
-
-def contracts_dashboard(frame):
-    st.header("Analisi contratti RA")
-    frame = contract_filters(frame)
-    if frame.empty:
-        st.info("Nessun contratto disponibile per i filtri selezionati.")
-        return
-    contracts = len(frame)
-    days = int(frame["duration_days"].fillna(0).sum())
-    value = float(frame["contract_value"].fillna(0).sum())
-    ancillary = float(frame["ancillary_value"].fillna(0).sum())
-    rpd = value / days if days else 0
-    ancillary_rpd = ancillary / days if days else 0
-    penetration = float(frame["has_ancillary_ra"].mean()) if contracts else 0
-    cols = st.columns(7)
-    cols[0].metric("Contratti", f"{contracts:,}".replace(",", "."))
-    cols[1].metric("Giorni", f"{days:,}".replace(",", "."))
-    cols[2].metric("Valore contratti", f"€ {value:,.0f}".replace(",", "."))
-    cols[3].metric("RPD contratti", f"€ {rpd:.2f}".replace(".", ","))
-    cols[4].metric("Valore ancillary", f"€ {ancillary:,.0f}".replace(",", "."))
-    cols[5].metric("RPD ancillary", f"€ {ancillary_rpd:.2f}".replace(".", ","))
-    cols[6].metric("Contratti con ancillary", f"{penetration:.1%}")
-
-    daily = frame.copy()
-    daily["data"] = daily["contract_date"].dt.date
-    by_day = daily.groupby("data", as_index=False).agg(
-        contratti=("id", "count"), valore=("contract_value", "sum"), ancillary=("ancillary_value", "sum")
-    )
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(px.line(by_day, x="data", y=["valore", "ancillary"], markers=True, title="Valore contratti e ancillary per giorno"), use_container_width=True)
-    by_operator = frame.groupby("operator", as_index=False).agg(
-        contratti=("id", "count"), giorni=("duration_days", "sum"),
-        valore=("contract_value", "sum"), ancillary=("ancillary_value", "sum")
-    )
-    by_operator["rpd"] = by_operator["valore"].div(by_operator["giorni"].replace(0, pd.NA))
-    by_operator["ancillary_rpd"] = by_operator["ancillary"].div(by_operator["giorni"].replace(0, pd.NA))
-    c2.plotly_chart(px.bar(by_operator.sort_values("valore", ascending=False), x="operator", y="valore", color="ancillary_rpd", title="Valore e RPD ancillary per operatore"), use_container_width=True)
-
-    c3, c4 = st.columns(2)
-    by_source = frame.groupby("source_base", as_index=False).agg(
-        contratti=("id", "count"), valore=("contract_value", "sum"), ancillary=("ancillary_value", "sum")
-    ).sort_values("valore", ascending=False).head(15)
-    c3.plotly_chart(px.bar(by_source, x="valore", y="source_base", color="ancillary", orientation="h", title="Prime fonti per valore contratto"), use_container_width=True)
-    groups = frame.groupby(["requested_group", "assigned_group"], as_index=False).size().sort_values("size", ascending=False).head(20)
-    groups["passaggio"] = groups["requested_group"] + " → " + groups["assigned_group"]
-    c4.plotly_chart(px.bar(groups, x="size", y="passaggio", orientation="h", title="Gruppo richiesto e assegnato"), use_container_width=True)
-
-    breakdown = frame.groupby(
-        ["rental_channel", "rental_term", "contract_vehicle"], as_index=False
-    ).agg(
-        contratti=("id", "count"), giorni=("duration_days", "sum"),
-        valore=("contract_value", "sum"), ancillary=("ancillary_value", "sum"),
-    )
-    breakdown["rpd"] = breakdown["valore"].div(breakdown["giorni"].replace(0, pd.NA))
-    breakdown["ancillary_rpd"] = breakdown["ancillary"].div(breakdown["giorni"].replace(0, pd.NA))
-    breakdown["combinazione"] = breakdown["rental_channel"] + " - " + breakdown["rental_term"]
-    c5, c6 = st.columns(2)
-    c5.plotly_chart(
-        px.bar(
-            breakdown, x="combinazione", y="contratti", color="contract_vehicle",
-            barmode="group", title="Contratti per tipo, durata e veicolo",
-        ),
-        use_container_width=True,
-    )
-    vehicle_summary = frame.groupby("contract_vehicle", as_index=False).agg(
-        contratti=("id", "count"), valore=("contract_value", "sum"), ancillary=("ancillary_value", "sum")
-    )
-    c6.plotly_chart(
-        px.bar(
-            vehicle_summary, x="contract_vehicle", y=["valore", "ancillary"],
-            barmode="group", title="Confronto CAR e VAN",
-        ),
-        use_container_width=True,
-    )
-
-    st.subheader("Risultati per tipo di noleggio, durata e veicolo")
-    st.dataframe(breakdown, use_container_width=True, hide_index=True)
-
-    st.subheader("Risultati per operatore")
-    st.dataframe(by_operator.sort_values("valore", ascending=False), use_container_width=True, hide_index=True)
-
-
-def ancillary_ra_dashboard(frame):
-    st.header("Analisi ancillary RA")
-    st.caption("Tutti i valori provengono dai report Analisi contratti e seguono i filtri selezionati, incluso il gruppo assegnato.")
-    frame = contract_filters(frame)
-    if frame.empty:
-        st.info("Nessun dato ancillary disponibile per i filtri selezionati.")
-        return
-
-    contracts = len(frame)
-    with_ancillary = int(frame["has_ancillary_ra"].sum())
-    days = int(frame["duration_days"].fillna(0).sum())
-    ancillary_value = float(frame["ancillary_value"].fillna(0).sum())
-    ancillary_rpd = ancillary_value / days if days else 0
-    penetration = with_ancillary / contracts if contracts else 0
-    ticket = ancillary_value / with_ancillary if with_ancillary else 0
-    cols = st.columns(6)
-    cols[0].metric("Contratti analizzati", f"{contracts:,}".replace(",", "."))
-    cols[1].metric("Con ancillary", f"{with_ancillary:,}".replace(",", "."))
-    cols[2].metric("Penetrazione", f"{penetration:.1%}")
-    cols[3].metric("Valore ancillary", f"€ {ancillary_value:,.0f}".replace(",", "."))
-    cols[4].metric("RPD ancillary", f"€ {ancillary_rpd:.2f}".replace(".", ","))
-    cols[5].metric("Ticket medio ancillary", f"€ {ticket:.2f}".replace(".", ","))
-
-    daily = frame.copy()
-    daily["data"] = daily["contract_date"].dt.date
-    by_day = daily.groupby("data", as_index=False).agg(
-        valore_ancillary=("ancillary_value", "sum"),
-        contratti=("id", "count"),
-        contratti_con_ancillary=("has_ancillary_ra", "sum"),
-    )
-    by_day["penetrazione"] = by_day["contratti_con_ancillary"].div(by_day["contratti"].replace(0, pd.NA))
-
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(
-        px.line(by_day, x="data", y="valore_ancillary", markers=True, title="Valore ancillary per giorno"),
-        use_container_width=True,
-    )
-    by_operator = frame.groupby("operator", as_index=False).agg(
-        contratti=("id", "count"), giorni=("duration_days", "sum"),
-        valore_ancillary=("ancillary_value", "sum"), contratti_con_ancillary=("has_ancillary_ra", "sum"),
-    )
-    by_operator["rpd_ancillary"] = by_operator["valore_ancillary"].div(by_operator["giorni"].replace(0, pd.NA))
-    by_operator["penetrazione"] = by_operator["contratti_con_ancillary"].div(by_operator["contratti"].replace(0, pd.NA))
-    c2.plotly_chart(
-        px.bar(by_operator, x="operator", y="valore_ancillary", color="rpd_ancillary", title="Valore e RPD ancillary per operatore"),
-        use_container_width=True,
-    )
-
-    c3, c4 = st.columns(2)
-    by_group = frame.groupby("assigned_group", as_index=False).agg(
-        contratti=("id", "count"), giorni=("duration_days", "sum"),
-        valore_ancillary=("ancillary_value", "sum"), contratti_con_ancillary=("has_ancillary_ra", "sum"),
-    )
-    by_group["rpd_ancillary"] = by_group["valore_ancillary"].div(by_group["giorni"].replace(0, pd.NA))
-    by_group["penetrazione"] = by_group["contratti_con_ancillary"].div(by_group["contratti"].replace(0, pd.NA))
-    c3.plotly_chart(
-        px.bar(by_group.sort_values("valore_ancillary", ascending=False), x="assigned_group", y="valore_ancillary", color="penetrazione", title="Ancillary per gruppo assegnato"),
-        use_container_width=True,
-    )
-    by_mix = frame.groupby(["rental_channel", "rental_term", "contract_vehicle"], as_index=False).agg(
-        contratti=("id", "count"), valore_ancillary=("ancillary_value", "sum"),
-    )
-    by_mix["combinazione"] = by_mix["rental_channel"] + " - " + by_mix["rental_term"]
-    c4.plotly_chart(
-        px.bar(by_mix, x="combinazione", y="valore_ancillary", color="contract_vehicle", barmode="group", title="Ancillary per tipo, durata e veicolo"),
-        use_container_width=True,
-    )
-
-    st.subheader("Statistiche ancillary per gruppo assegnato")
-    st.dataframe(by_group.sort_values("valore_ancillary", ascending=False), use_container_width=True, hide_index=True)
-    st.subheader("Statistiche ancillary per operatore")
-    st.dataframe(by_operator.sort_values("valore_ancillary", ascending=False), use_container_width=True, hide_index=True)
-
-
-def contracts_archive(frame):
-    st.header("Archivio contratti RA")
-    frame = contract_filters(frame)
-    display = frame[[
-        "contract_date", "ra", "operator", "client", "duration_days",
-        "rental_channel", "rental_term", "contract_vehicle",
-        "requested_group", "assigned_group", "source_base", "source_details",
-        "contract_value", "kpi1_rpd", "ancillary_value", "ancillary_rpd", "import_file",
-    ]].copy()
-    display.columns = [
-        "Data", "RA", "Operatore", "Cliente", "Giorni",
-        "Tipo noleggio", "Durata noleggio", "Veicolo", "Gruppo richiesto",
-        "Gruppo assegnato", "Fonte", "Dettaglio fonte", "Valore contratto",
-        "RPD contratto", "Valore ancillary", "RPD ancillary", "File importato",
-    ]
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-
-def combined_analysis(contracts, ancillary):
-    st.header("Analisi incrociata RA e ancillary")
-    if contracts.empty or ancillary.empty:
-        st.info("Servono sia contratti RA sia dati ancillary per eseguire il confronto.")
-        return
-    ancillary = ancillary.copy()
-    contracts = contracts.copy()
-    ancillary["analysis_year"] = ancillary["start_date"].dt.year
-    contracts["analysis_year"] = contracts["contract_date"].dt.year.fillna(contracts["start_date"].dt.year)
-    ancillary_summary = ancillary.groupby(["ra", "analysis_year"], as_index=False).agg(
-        ancillary_modulo=("ancillary_cost", "sum"), righe_modulo=("id", "count")
-    )
-    joined = contracts.merge(ancillary_summary, on=["ra", "analysis_year"], how="left")
-    joined["ancillary_modulo"] = joined["ancillary_modulo"].fillna(0)
-    joined["differenza"] = joined["ancillary_value"].fillna(0) - joined["ancillary_modulo"]
-    matched = joined["righe_modulo"].notna().sum()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("RA nel periodo", len(joined))
-    c2.metric("RA collegati al modulo", int(matched))
-    c3.metric("Copertura collegamento", f"{matched / len(joined):.1%}" if len(joined) else "0%")
-    c4.metric("Differenza complessiva", f"€ {joined['differenza'].sum():.2f}".replace(".", ","))
-    st.plotly_chart(
-        px.scatter(joined, x="ancillary_modulo", y="ancillary_value", color="operator", hover_data=["ra", "source_base"], title="Confronto ancillary modulo e report RA"),
-        use_container_width=True,
-    )
-    anomalies = joined[joined["differenza"].abs() > 0.02][[
-        "ra", "operator", "source_base", "ancillary_modulo", "ancillary_value", "differenza"
-    ]].sort_values("differenza", key=lambda x: x.abs(), ascending=False)
-    st.subheader("Differenze da controllare")
-    st.dataframe(anomalies, use_container_width=True, hide_index=True)
-
-
-def damage_filters(frame):
-    if frame.empty:
-        return frame
-    c1, c2, c3, c4 = st.columns(4)
-    years = sorted(frame["control_date"].dropna().dt.year.unique().astype(int).tolist())
-    selected_years = c1.multiselect("Anno controllo", years, default=years)
-    vehicles = sorted(x for x in frame["vehicle_category"].dropna().unique() if x)
-    selected_vehicles = c2.multiselect("Categoria veicolo", vehicles)
-    modes = sorted(x for x in frame["charge_mode"].dropna().unique() if x)
-    selected_modes = c3.multiselect("Modalità addebito", modes)
-    operators = sorted(x for x in frame["operator"].dropna().unique() if x)
-    selected_operators = c4.multiselect("Operatore", operators)
-    c5, c6, c7 = st.columns(3)
-    categories = sorted(x for x in frame["damage_category"].dropna().unique() if x)
-    selected_categories = c5.multiselect("Tipo danno", categories)
-    statuses = sorted(x for x in frame["payment_status"].dropna().unique() if x)
-    selected_statuses = c6.multiselect("Stato addebito", statuses)
-    search = c7.text_input("Cerca RA o descrizione")
-    result = frame.copy()
-    if selected_years:
-        result = result[result["control_date"].dt.year.isin(selected_years)]
-    if selected_vehicles:
-        result = result[result["vehicle_category"].isin(selected_vehicles)]
-    if selected_modes:
-        result = result[result["charge_mode"].isin(selected_modes)]
-    if selected_operators:
-        result = result[result["operator"].isin(selected_operators)]
-    if selected_categories:
-        result = result[result["damage_category"].isin(selected_categories)]
-    if selected_statuses:
-        result = result[result["payment_status"].isin(selected_statuses)]
-    if search:
-        needle = upper(search)
-        compact_needle = re.sub(r"[^A-Z0-9]", "", needle)
-        searchable = result[["ra", "description", "operator"]].fillna("")
-        normal_match = searchable.apply(
-            lambda column: column.str.upper().str.contains(needle, regex=False)
-        ).any(axis=1)
-        compact_match = searchable.apply(
-            lambda column: column.map(
-                lambda value: compact_needle in re.sub(r"[^A-Z0-9]", "", upper(value))
-            )
-        ).any(axis=1)
-        mask = normal_match | compact_match
-        result = result[mask]
-    return result
-
-
-def damage_dashboard(frame):
-    st.header("Analisi addebito danni")
-    frame = damage_filters(frame)
-    if frame.empty:
-        st.info("Nessuna segnalazione danni disponibile per i filtri selezionati.")
-        return
-    total = len(frame)
-    vans = int(frame["vehicle_category"].eq("VAN").sum())
-    cars = int(frame["vehicle_category"].eq("CAR").sum())
-    photo_coverage = float(frame["has_photo"].mean()) if total else 0
-    charged = float(frame["amount"].fillna(0).sum())
-    collected = float(frame.loc[frame["payment_status"].eq("INCASSATO"), "amount"].fillna(0).sum())
-    cols = st.columns(6)
-    cols[0].metric("Segnalazioni", total)
-    cols[1].metric("CAR", cars)
-    cols[2].metric("VAN", vans)
-    cols[3].metric("Con foto", f"{photo_coverage:.1%}")
-    cols[4].metric("Importo addebitato", f"€ {charged:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    cols[5].metric("Importo incassato", f"€ {collected:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-    monthly = frame.dropna(subset=["control_date"]).copy()
-    monthly["mese"] = monthly["control_date"].dt.to_period("M").astype(str)
-    monthly = monthly.groupby("mese", as_index=False).agg(segnalazioni=("id", "count"), importo=("amount", "sum"))
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(px.line(monthly, x="mese", y="segnalazioni", markers=True, title="Segnalazioni per mese"), use_container_width=True)
-    by_operator = frame.groupby("operator", as_index=False).agg(segnalazioni=("id", "count"), importo=("amount", "sum"))
-    c2.plotly_chart(px.bar(by_operator, x="operator", y="segnalazioni", color="importo", title="Danni per operatore"), use_container_width=True)
-    c3, c4 = st.columns(2)
-    by_mode = frame.groupby("charge_mode", as_index=False).size().rename(columns={"size": "segnalazioni"})
-    c3.plotly_chart(px.bar(by_mode, x="charge_mode", y="segnalazioni", title="Danni per modalità di addebito"), use_container_width=True)
-    by_category = frame.groupby(["damage_category", "vehicle_category"], as_index=False).size().rename(columns={"size": "segnalazioni"})
-    c4.plotly_chart(px.bar(by_category, x="damage_category", y="segnalazioni", color="vehicle_category", barmode="group", title="Tipologia danni CAR e VAN"), use_container_width=True)
-    st.subheader("Riepilogo per operatore")
-    st.dataframe(by_operator.sort_values("segnalazioni", ascending=False), use_container_width=True, hide_index=True)
-
-
-def damage_archive(frame):
-    st.header("Archivio addebito danni")
-    frame = damage_filters(frame)
-    if frame.empty:
-        st.info("Nessuna segnalazione presente.")
-        return
-    display = frame[[
-        "control_date", "ra", "vehicle_category", "charge_mode", "operator",
-        "damage_category", "description", "photo_count", "amount", "payment_status", "photo_url", "notes",
-    ]].copy()
-    display.columns = [
-        "Data controllo", "RA", "Veicolo", "Modalità", "Operatore", "Tipo danno",
-        "Descrizione", "Numero foto", "Importo", "Stato", "Collegamento foto", "Note",
-    ]
-    st.dataframe(
-        display, use_container_width=True, hide_index=True,
-        column_config={
-            "Data controllo": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Importo": st.column_config.NumberColumn(format="€ %.2f"),
-            "Collegamento foto": st.column_config.LinkColumn(display_text="Apri foto"),
-        },
-    )
-    st.download_button(
-        "Esporta archivio danni in Excel", table_to_excel(display, "Addebito danni"),
-        "archivio_addebito_danni.xlsx", use_container_width=True,
-    )
-
-    records_with_photos = frame[frame["photo_count"].gt(0)]
-    if not records_with_photos.empty:
-        st.subheader("Fotografie delle segnalazioni")
-        photo_record_id = st.selectbox(
-            "Seleziona RA",
-            records_with_photos["id"].tolist(),
-            format_func=lambda item_id: (
-                f"{records_with_photos.loc[records_with_photos['id'].eq(item_id), 'ra'].iloc[0]} — "
-                f"{int(records_with_photos.loc[records_with_photos['id'].eq(item_id), 'photo_count'].iloc[0])} foto"
+def drive_figli(service, parent, solo_cartelle=False):
+    """Elenca tutti i figli non cestinati di una cartella Drive."""
+    query = f"'{parent}' in parents and trashed=false"
+    if solo_cartelle:
+        query += " and mimeType='application/vnd.google-apps.folder'"
+    risultati = []
+    page_token = None
+    while True:
+        risposta = service.files().list(
+            q=query,
+            spaces="drive",
+            fields=(
+                "nextPageToken,files("
+                "id,name,mimeType,size,webViewLink,createdTime,modifiedTime,appProperties)"
             ),
-        )
-        photos = damage_photos(photo_record_id)
-        columns = st.columns(min(3, len(photos)))
-        for index, photo in enumerate(photos):
-            with columns[index % len(columns)]:
-                st.image(photo["file_data"], caption=photo["file_name"], use_container_width=True)
-                st.download_button(
-                    "Scarica", photo["file_data"], photo["file_name"],
-                    mime=photo["mime_type"] or "image/jpeg", key=f"download_photo_{photo['id']}",
-                    use_container_width=True,
-                )
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        risultati.extend(risposta.get("files", []))
+        page_token = risposta.get("nextPageToken")
+        if not page_token:
+            return risultati
 
+def drive_trova_cartella(service, nome, parent):
+    nome_pulito = str(nome).replace("'", "")
+    query = (
+        f"name='{nome_pulito}' and "
+        "mimeType='application/vnd.google-apps.folder' and "
+        f"trashed=false and '{parent}' in parents"
+    )
+    trovate = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id,name)",
+        pageSize=1,
+    ).execute().get("files", [])
+    return trovate[0]["id"] if trovate else None
 
-def quick_damage_checkin():
-    st.header("Check-in rapido danni")
-    st.caption("Compila i dati essenziali e allega più fotografie direttamente da telefono o tablet.")
+def sincronizza_archivio_dropbox(db, persona="Papà"):
+    """Registra nel gestionale i file archiviati dal worker Dropbox."""
+    service = drive_service()
+    root = drive_root(db)
+    if not root:
+        raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
 
-    linked_operator = current_operator() if not user_is_admin() else ""
-    operator_options = [row["name"] for row in configured_operators()]
-    if linked_operator and linked_operator not in operator_options:
-        operator_options.append(linked_operator)
+    archivio_id = drive_trova_cartella(service, "ARCHIVIO", root)
+    if not archivio_id:
+        return 0, 0
+    persona_id = drive_trova_cartella(service, persona, archivio_id)
+    if not persona_id:
+        return 0, 0
 
-    with st.form("quick_damage_checkin", clear_on_submit=True):
-        ra = st.text_input("RA *", placeholder="Esempio: TOR-12345")
-        c1, c2 = st.columns(2)
-        vehicle = c1.selectbox("Categoria veicolo *", ["", "CAR", "VAN"])
-        charge_mode = c2.selectbox(
-            "Modalità di addebito *",
-            ["IN PRESENZA", "KEY BOX", "CLIENTE NON ASPETTA (AFTER RENTAL)", "ALTRO"],
-        )
-        if linked_operator:
-            operator = st.selectbox(
-                "Operatore responsabile *", operator_options,
-                index=operator_options.index(linked_operator), disabled=True,
+    drive_ids_presenti = {
+        str(r.get("drive_id", "")) for r in db.get("media", []) if r.get("drive_id")
+    }
+    aggiunti = gia_presenti = 0
+
+    for cartella_anno in drive_figli(service, persona_id, solo_cartelle=True):
+        anno_nome = str(cartella_anno.get("name", "")).strip()
+        anno = int(anno_nome) if anno_nome.isdigit() else anno_nome
+
+        for cartella_evento in drive_figli(
+            service, cartella_anno["id"], solo_cartelle=True
+        ):
+            evento = str(cartella_evento.get("name", "")).strip()
+            media_id = drive_trova_cartella(
+                service, "Foto e Video", cartella_evento["id"]
             )
-            st.caption("Operatore compilato automaticamente dall’account personale.")
-        else:
-            operator = st.selectbox("Operatore responsabile *", [""] + operator_options)
-        description = st.text_area(
-            "Descrizione sintetica del danno *", placeholder="Indica posizione e tipo di danno", height=100,
-        )
-        photos = st.file_uploader(
-            "Fotografie del danno",
-            type=["jpg", "jpeg", "png", "webp", "heic"],
-            accept_multiple_files=True,
-            help="Puoi scattare o selezionare più fotografie dal telefono.",
-        )
-        notes = st.text_area("Note facoltative", height=70)
-        submitted = st.form_submit_button("Salva check-in", type="primary", use_container_width=True)
-
-    if submitted:
-        if not all([ra, vehicle, charge_mode, operator, description]):
-            st.error("Compila RA, categoria veicolo, modalità, operatore e descrizione.")
-            return
-        if not photos:
-            st.error("Allega almeno una fotografia del danno prima di salvare.")
-            return
-        if len(photos or []) > 10:
-            st.error("Puoi allegare al massimo 10 fotografie per check-in.")
-            return
-        oversized = [photo.name for photo in photos or [] if len(photo.getvalue()) > 8 * 1024 * 1024]
-        if oversized:
-            st.error("Ogni fotografia deve essere inferiore a 8 MB: " + ", ".join(oversized))
-            return
-        damage_id = save_damage({
-            "control_date": date.today().isoformat(), "ra": ra,
-            "vehicle_category": vehicle, "charge_mode": charge_mode,
-            "operator": operator, "description": description, "photo_url": "",
-            "amount": None, "payment_status": "DA VERIFICARE", "notes": notes,
-        })
-        photo_total = save_damage_photos(damage_id, photos)
-        st.success(f"Check-in {normalize_ra(ra)} salvato con {photo_total} fotografie.")
-        st.rerun()
-
-
-def damage_form(frame):
-    st.header("Inserimento e modifica addebito danni")
-    records = {row.id: row for row in frame.itertuples()}
-    selected = st.selectbox(
-        "Segnalazione da modificare (lascia vuoto per inserirne una nuova)",
-        [""] + list(records),
-        format_func=lambda record_id: "" if not record_id else (
-            f"{records[record_id].ra} | "
-            f"{records[record_id].control_date.date() if pd.notna(records[record_id].control_date) else ''} | "
-            f"{records[record_id].operator}"
-        ),
-    )
-    current = frame[frame["id"] == selected].iloc[0].to_dict() if selected else {}
-    prefix = current.get("id", "nuovo_danno")
-    c1, c2, c3 = st.columns(3)
-    ra = c1.text_input("RA *", value=current.get("ra", ""), key=f"{prefix}_damage_ra")
-    current_date = current.get("control_date")
-    control_date = c2.date_input(
-        "Data del controllo *",
-        value=current_date.date() if pd.notna(current_date) else date.today(),
-        key=f"{prefix}_damage_date",
-    )
-    vehicle_options = ["", "CAR", "VAN"]
-    current_vehicle = upper(current.get("vehicle_category", ""))
-    vehicle = c3.selectbox(
-        "Categoria veicolo *", vehicle_options,
-        index=vehicle_options.index(current_vehicle) if current_vehicle in vehicle_options else 0,
-        key=f"{prefix}_damage_vehicle",
-    )
-    c4, c5 = st.columns(2)
-    mode_options = ["", "IN PRESENZA", "KEY BOX", "CLIENTE NON ASPETTA (AFTER RENTAL)", "ALTRO"]
-    current_mode = upper(current.get("charge_mode", ""))
-    if current_mode and current_mode not in mode_options:
-        mode_options.append(current_mode)
-    charge_mode = c4.selectbox(
-        "Modalità di addebito *", mode_options,
-        index=mode_options.index(current_mode) if current_mode in mode_options else 0,
-        key=f"{prefix}_damage_mode",
-    )
-    operator_options = [""] + [row["name"] for row in configured_operators()]
-    current_operator_value = upper(current.get("operator", ""))
-    linked_operator = current_operator() if not user_is_admin() else ""
-    if linked_operator:
-        current_operator_value = linked_operator
-    if current_operator_value and current_operator_value not in operator_options:
-        operator_options.append(current_operator_value)
-    operator = c5.selectbox(
-        "Operatore responsabile *", operator_options,
-        index=operator_options.index(current_operator_value) if current_operator_value in operator_options else 0,
-        key=f"{prefix}_damage_operator",
-        disabled=bool(linked_operator),
-    )
-    if linked_operator:
-        c5.caption("Compilato automaticamente dall’utente collegato.")
-    description = st.text_area("Descrizione sintetica del danno *", value=current.get("description", ""), key=f"{prefix}_damage_description")
-    photo_url = st.text_input("Collegamento foto danno", value=current.get("photo_url", ""), key=f"{prefix}_damage_photo")
-    existing_photo_total = len(damage_photos(current["id"])) if current else 0
-    new_photos = st.file_uploader(
-        "Aggiungi fotografie",
-        type=["jpg", "jpeg", "png", "webp", "heic"], accept_multiple_files=True,
-        key=f"{prefix}_damage_new_photos",
-        help=f"Fotografie già archiviate: {existing_photo_total}. Le nuove immagini verranno aggiunte.",
-    )
-    c6, c7 = st.columns(2)
-    amount_value = current.get("amount")
-    amount = c6.number_input(
-        "Importo addebitato", min_value=0.0, step=10.0,
-        value=0.0 if pd.isna(amount_value) else float(amount_value), key=f"{prefix}_damage_amount",
-    )
-    status_options = ["DA VERIFICARE", "ADDEBITATO", "INCASSATO", "ANNULLATO"]
-    current_status = upper(current.get("payment_status", "")) or "DA VERIFICARE"
-    status = c7.selectbox(
-        "Stato addebito", status_options,
-        index=status_options.index(current_status) if current_status in status_options else 0,
-        key=f"{prefix}_damage_status",
-    )
-    notes = st.text_area("Note", value=current.get("notes", ""), key=f"{prefix}_damage_notes")
-    if st.button("Salva segnalazione danno", type="primary", use_container_width=True):
-        if not all([ra, vehicle, charge_mode, operator, description]):
-            st.error("Compila RA, categoria veicolo, modalità, operatore e descrizione.")
-        else:
-            saved_damage_id = save_damage({
-                "id": current.get("id"), "source_key": current.get("source_key"),
-                "submitted_at": current.get("submitted_at"), "control_date": control_date.isoformat(),
-                "ra": ra, "vehicle_category": vehicle, "charge_mode": charge_mode,
-                "operator": operator, "description": description, "photo_url": photo_url,
-                "amount": amount if amount > 0 else None, "payment_status": status, "notes": notes,
-            })
-            added_photos = save_damage_photos(saved_damage_id, new_photos)
-            st.success(f"Segnalazione danno salvata. Nuove fotografie aggiunte: {added_photos}.")
-            st.rerun()
-    if current:
-        confirm = st.checkbox(f"Confermo l’eliminazione definitiva della segnalazione {current['ra']}")
-        if st.button("Elimina segnalazione danno", disabled=not confirm, use_container_width=True):
-            with db() as conn:
-                conn.execute("DELETE FROM damage_photos WHERE damage_id = ?", (current["id"],))
-                conn.execute("DELETE FROM damage_charges WHERE id = ?", (current["id"],))
-            st.success("Segnalazione eliminata.")
-            st.rerun()
-
-
-def cash_filters(frame):
-    if frame.empty:
-        return frame
-    st.sidebar.subheader("Filtri cassa")
-    years = sorted(frame["movement_date"].dropna().dt.year.unique().tolist(), reverse=True)
-    selected_years = st.sidebar.multiselect("Anno cassa", years, default=years[:1])
-    movement_types = sorted(frame["movement_type"].dropna().unique().tolist())
-    selected_types = st.sidebar.multiselect("Tipo movimento", movement_types)
-    methods = sorted(frame["payment_method"].dropna().unique().tolist())
-    selected_methods = st.sidebar.multiselect("Metodo", methods)
-    search = st.sidebar.text_input("Cerca RA o note")
-    result = frame.copy()
-    if selected_years:
-        result = result[result["movement_date"].dt.year.isin(selected_years)]
-    if selected_types:
-        result = result[result["movement_type"].isin(selected_types)]
-    if selected_methods:
-        result = result[result["payment_method"].isin(selected_methods)]
-    if search:
-        needle = upper(search)
-        mask = result[["ra", "notes", "operator"]].fillna("").apply(
-            lambda column: column.str.upper().str.contains(needle, regex=False)
-        ).any(axis=1)
-        result = result[mask]
-    return result
-
-
-def cash_dashboard(frame):
-    st.header("Dashboard cassa")
-    filtered = cash_filters(frame)
-    if frame.empty:
-        st.info("Nessun movimento di cassa presente.")
-        return
-    total_in = float(filtered.loc[filtered["effect"].gt(0), "effect"].sum()) if not filtered.empty else 0
-    total_out = abs(float(filtered.loc[filtered["effect"].lt(0), "effect"].sum())) if not filtered.empty else 0
-    current_balance = cash_balance(frame)
-    open_deposits = frame[frame["ra"].fillna("").ne("")].groupby("ra", as_index=False)["effect"].sum()
-    open_deposits = open_deposits[open_deposits["effect"].gt(0.009)]
-    columns = st.columns(4)
-    columns[0].metric("Saldo cassa attuale", f"€ {current_balance:,.2f}")
-    columns[1].metric("Entrate filtrate", f"€ {total_in:,.2f}")
-    columns[2].metric("Uscite filtrate", f"€ {total_out:,.2f}")
-    columns[3].metric("RA con deposito aperto", len(open_deposits))
-    if filtered.empty:
-        st.info("Nessun movimento corrisponde ai filtri selezionati.")
-        return
-    daily = filtered.dropna(subset=["movement_date"]).copy()
-    daily["giorno"] = daily["movement_date"].dt.date
-    daily = daily.groupby("giorno", as_index=False).agg(entrate=("effect", lambda x: x[x > 0].sum()), uscite=("effect", lambda x: abs(x[x < 0].sum())))
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(
-        px.bar(daily, x="giorno", y=["entrate", "uscite"], barmode="group", title="Entrate e uscite giornaliere"),
-        use_container_width=True,
-    )
-    by_type = filtered.groupby("movement_type", as_index=False)["amount"].sum()
-    c2.plotly_chart(px.bar(by_type, x="movement_type", y="amount", title="Movimenti per tipologia"), use_container_width=True)
-    if not open_deposits.empty:
-        st.subheader("Depositi ancora presenti per RA")
-        open_deposits = open_deposits.rename(columns={"ra": "RA", "effect": "Residuo"}).sort_values("Residuo", ascending=False)
-        st.dataframe(open_deposits, use_container_width=True, hide_index=True, column_config={"Residuo": st.column_config.NumberColumn(format="€ %.2f")})
-
-
-def cash_movement_form(frame):
-    st.header("Inserimento e modifica movimento cassa")
-    records = {row.id: row for row in frame.itertuples()} if not frame.empty else {}
-    selected = st.selectbox(
-        "Movimento da modificare (lascia vuoto per inserirne uno nuovo)",
-        [""] + list(records),
-        format_func=lambda item_id: "" if not item_id else (
-            f"{records[item_id].movement_date.date()} | {records[item_id].movement_type} | "
-            f"{records[item_id].ra or 'SENZA RA'} | € {records[item_id].amount:.2f}"
-        ),
-    )
-    current = frame[frame["id"].eq(selected)].iloc[0].to_dict() if selected else {}
-    prefix = current.get("id", "new_cash_movement")
-    c1, c2, c3 = st.columns(3)
-    movement_date = c1.date_input(
-        "Data movimento *",
-        value=current["movement_date"].date() if current and pd.notna(current.get("movement_date")) else date.today(),
-        key=f"{prefix}_cash_date",
-    )
-    all_types = CASH_IN_TYPES + CASH_OUT_TYPES
-    current_type = upper(current.get("movement_type", ""))
-    movement_type = c2.selectbox(
-        "Tipo movimento *", [""] + all_types,
-        index=([""] + all_types).index(current_type) if current_type in all_types else 0,
-        key=f"{prefix}_cash_type",
-    )
-    amount = c3.number_input(
-        "Importo *", min_value=0.0, step=10.0,
-        value=float(current.get("amount") or 0), key=f"{prefix}_cash_amount",
-    )
-    c4, c5, c6 = st.columns(3)
-    ra = c4.text_input("RA", value=current.get("ra", ""), key=f"{prefix}_cash_ra")
-    methods = ["CONTANTI", "ASSEGNO", "CARTA", "BONIFICO", "ALTRO"]
-    current_method = upper(current.get("payment_method", "")) or "CONTANTI"
-    method = c5.selectbox("Metodo *", methods, index=methods.index(current_method) if current_method in methods else 0, key=f"{prefix}_cash_method")
-    linked_operator = current_operator() if not user_is_admin() else ""
-    operator_options = [row["name"] for row in configured_operators()]
-    if linked_operator and linked_operator not in operator_options:
-        operator_options.append(linked_operator)
-    current_operator_value = linked_operator or upper(current.get("operator", ""))
-    if current_operator_value and current_operator_value not in operator_options:
-        operator_options.append(current_operator_value)
-    operator = c6.selectbox(
-        "Operatore *", [""] + operator_options,
-        index=([""] + operator_options).index(current_operator_value) if current_operator_value else 0,
-        disabled=bool(linked_operator), key=f"{prefix}_cash_operator",
-    )
-    notes = st.text_area("Note", value=current.get("notes", ""), key=f"{prefix}_cash_notes")
-    effect = cash_effect(movement_type, amount) if movement_type else 0
-    st.info(f"Effetto sul saldo: € {effect:,.2f}")
-    if st.button("Salva movimento", type="primary", use_container_width=True):
-        if not movement_type or amount <= 0 or not operator:
-            st.error("Compila tipo movimento, importo e operatore.")
-        elif movement_type in {"DEPOSITO", "INCASSO", "RIMBORSO"} and not ra:
-            st.error("Per depositi, incassi e rimborsi è obbligatorio indicare il RA.")
-        else:
-            save_cash_movement({
-                "id": current.get("id"), "source_key": current.get("source_key"),
-                "movement_date": movement_date.isoformat(), "ra": ra,
-                "movement_type": movement_type, "amount": amount, "payment_method": method,
-                "operator": operator, "notes": notes, "created_at": current.get("created_at"),
-            })
-            st.success("Movimento salvato.")
-            st.rerun()
-    if current:
-        confirm = st.checkbox("Confermo l’eliminazione definitiva del movimento")
-        if st.button("Elimina movimento", disabled=not confirm, use_container_width=True):
-            with db() as conn:
-                conn.execute("DELETE FROM cash_movements WHERE id = ?", (current["id"],))
-            st.success("Movimento eliminato.")
-            st.rerun()
-
-
-def cash_archive(frame):
-    st.header("Archivio movimenti cassa")
-    filtered = cash_filters(frame)
-    if filtered.empty:
-        st.info("Nessun movimento disponibile.")
-        return
-    display = filtered[["movement_date", "ra", "movement_type", "amount", "effect", "payment_method", "operator", "notes"]].copy()
-    display.columns = ["Data", "RA", "Tipo", "Importo", "Effetto saldo", "Metodo", "Operatore", "Note"]
-    st.dataframe(
-        display, use_container_width=True, hide_index=True,
-        column_config={
-            "Data": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Importo": st.column_config.NumberColumn(format="€ %.2f"),
-            "Effetto saldo": st.column_config.NumberColumn(format="€ %.2f"),
-        },
-    )
-    st.download_button(
-        "Esporta archivio cassa in Excel", table_to_excel(display, "Movimenti cassa"),
-        "archivio_cassa.xlsx", use_container_width=True,
-    )
-
-
-def cash_closing_page(frame):
-    st.header("Conteggio e chiusura cassa")
-    expected = cash_balance(frame)
-    st.metric("Saldo contabile atteso", f"€ {expected:,.2f}")
-    denominations = [200, 100, 50, 20, 10, 5, 2, 1, 0.50, 0.20, 0.10, 0.05]
-    counts = {}
-    st.subheader("Conteggio contanti")
-    columns = st.columns(4)
-    for index, denomination in enumerate(denominations):
-        label = f"€ {denomination:g}"
-        counts[str(denomination)] = columns[index % 4].number_input(label, min_value=0, step=1, key=f"cash_count_{denomination}")
-    counted_cash = sum(float(value) * int(counts[str(value)]) for value in denominations)
-    checks_total = st.number_input("Totale assegni presenti", min_value=0.0, step=10.0)
-    physical_total = counted_cash + checks_total
-    difference = physical_total - expected
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Contanti contati", f"€ {counted_cash:,.2f}")
-    c2.metric("Totale fisico", f"€ {physical_total:,.2f}")
-    c3.metric("Differenza", f"€ {difference:,.2f}")
-    operator = current_operator()
-    if not operator:
-        operator = st.selectbox("Operatore chiusura *", [""] + [row["name"] for row in configured_operators()])
-    else:
-        st.info(f"Operatore: {operator}")
-    notes = st.text_area("Note chiusura")
-    if st.button("Registra chiusura cassa", type="primary", use_container_width=True):
-        if not operator:
-            st.error("Seleziona l’operatore.")
-        else:
-            with db() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO cash_closings
-                    (id, closing_date, expected_balance, counted_cash, checks_total, difference, denominations, operator, notes, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(closing_date) DO UPDATE SET
-                        expected_balance=excluded.expected_balance, counted_cash=excluded.counted_cash,
-                        checks_total=excluded.checks_total, difference=excluded.difference,
-                        denominations=excluded.denominations, operator=excluded.operator,
-                        notes=excluded.notes, created_at=excluded.created_at
-                    """,
-                    (
-                        str(uuid.uuid4()), date.today().isoformat(), expected, counted_cash, checks_total,
-                        difference, json.dumps(counts), operator, clean(notes), datetime.now().isoformat(timespec="seconds"),
-                    ),
-                )
-            st.success("Chiusura cassa registrata.")
-            st.rerun()
-    closings = load_cash_closings()
-    if not closings.empty:
-        st.subheader("Storico chiusure")
-        display = closings[["closing_date", "expected_balance", "counted_cash", "checks_total", "difference", "operator", "notes"]].copy()
-        display.columns = ["Data", "Saldo atteso", "Contanti", "Assegni", "Differenza", "Operatore", "Note"]
-        st.dataframe(display, use_container_width=True, hide_index=True)
-
-
-def import_cash_workbook(file_bytes):
-    book = pd.ExcelFile(io.BytesIO(file_bytes))
-    added = 0
-    skipped = 0
-    opening_added = False
-    for sheet in book.sheet_names:
-        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, dtype=object)
-        header_row = None
-        for index in range(min(12, len(raw))):
-            values = [upper(value) for value in raw.iloc[index, :6].tolist()]
-            if "RA" in values and any("DATA APERTURA" in value for value in values):
-                header_row = index
-                break
-        if header_row is None:
-            continue
-        if not opening_added and header_row + 1 < len(raw):
-            opening_label = upper(raw.iloc[header_row + 1, 0])
-            opening_value = pd.to_numeric(raw.iloc[header_row + 1, 5], errors="coerce")
-            if "RIMANENZA" in opening_label and pd.notna(opening_value) and float(opening_value) != 0:
-                source_dates = pd.concat([
-                    pd.to_datetime(raw.iloc[header_row + 1:, 1], errors="coerce"),
-                    pd.to_datetime(raw.iloc[header_row + 1:, 3], errors="coerce"),
-                ]).dropna()
-                opening_date = source_dates.min().date() if not source_dates.empty else date.today()
-                save_cash_movement({
-                    "source_key": f"cash-opening|{sheet}|{header_row + 2}",
-                    "movement_date": opening_date.isoformat(), "movement_type": "RETTIFICA POSITIVA",
-                    "amount": abs(float(opening_value)), "payment_method": "CONTANTI",
-                    "operator": "IMPORTAZIONE", "notes": clean(raw.iloc[header_row + 1, 0]),
-                })
-                opening_added = True
-                added += 1
-        for row_index in range(header_row + 1, len(raw)):
-            row = raw.iloc[row_index]
-            ra_raw = clean(row.iloc[0] if len(row) > 0 else "")
-            if not ra_raw or "RIMANENZA" in upper(ra_raw) or "TOTALE CASSA" in upper(ra_raw):
+            if not media_id:
                 continue
-            deposit = pd.to_numeric(row.iloc[2] if len(row) > 2 else None, errors="coerce")
-            refund = pd.to_numeric(row.iloc[4] if len(row) > 4 else None, errors="coerce")
-            open_date = pd.to_datetime(row.iloc[1] if len(row) > 1 else None, errors="coerce")
-            close_date = pd.to_datetime(row.iloc[3] if len(row) > 3 else None, errors="coerce")
-            is_remittance = "RIMESSA" in upper(ra_raw)
-            imported_row = False
-            if pd.notna(deposit) and float(deposit) != 0 and pd.notna(open_date):
-                save_cash_movement({
-                    "source_key": f"cash|{sheet}|{row_index + 1}|in",
-                    "movement_date": open_date.date().isoformat(), "ra": "" if is_remittance else ra_raw,
-                    "movement_type": "DEPOSITO", "amount": abs(float(deposit)),
-                    "payment_method": "CONTANTI", "operator": "IMPORTAZIONE",
-                    "notes": f"Storico Excel — {sheet}",
+
+            for file_drive in drive_figli(service, media_id):
+                if file_drive.get("mimeType") == "application/vnd.google-apps.folder":
+                    continue
+                drive_id = str(file_drive.get("id", ""))
+                if not drive_id:
+                    continue
+                if drive_id in drive_ids_presenti:
+                    gia_presenti += 1
+                    continue
+
+                db.setdefault("media", []).append({
+                    "anno": anno,
+                    "evento": evento,
+                    "data_scatto": data_ora_da_nome_file(file_drive.get("name", "")),
+                    "descrizione": f"Archivio automatico Dropbox · {persona}",
+                    "nome_file": file_drive.get("name", ""),
+                    "drive_id": drive_id,
+                    "link": file_drive.get("webViewLink", ""),
+                    "origine": "Dropbox",
+                    "persona": persona,
+                    "id": nuovo_id(),
+                    "proprietario": utente(),
+                    "condiviso": True,
+                    "creato_il": datetime.now().isoformat(timespec="seconds"),
                 })
-                added += 1
-                imported_row = True
-            if pd.notna(refund) and float(refund) != 0 and pd.notna(close_date):
-                save_cash_movement({
-                    "source_key": f"cash|{sheet}|{row_index + 1}|out",
-                    "movement_date": close_date.date().isoformat(), "ra": "" if is_remittance else ra_raw,
-                    "movement_type": "RIMESSA" if is_remittance else "RIMBORSO",
-                    "amount": abs(float(refund)), "payment_method": "CONTANTI",
-                    "operator": "IMPORTAZIONE", "notes": f"Storico Excel — {sheet}",
-                })
-                added += 1
-                imported_row = True
-            if not imported_row and (pd.notna(deposit) or pd.notna(refund)):
-                skipped += 1
-    return added, skipped, len(book.sheet_names)
+                drive_ids_presenti.add(drive_id)
+                aggiunti += 1
 
+    if aggiunti:
+        salva(db)
+    return aggiunti, gia_presenti
 
-def cash_import_page():
-    st.header("Importazione storico cassa")
-    st.caption("Importa i fogli mensili con colonne RA, data apertura, deposito/incasso, data chiusura e rimborso.")
-    upload = st.file_uploader("File Excel cassa", type=["xlsx"], key="cash_history_upload")
-    if upload and st.button("Importa storico cassa", type="primary", use_container_width=True):
-        added, skipped, sheets = import_cash_workbook(upload.getvalue())
-        st.success(f"Elaborati {sheets} fogli e importati o aggiornati {added} movimenti.")
-        if skipped:
-            st.info(f"Righe non importabili perché prive di data: {skipped}.")
-        st.rerun()
+@st.cache_data(ttl=300, show_spinner=False)
+def drive_leggi_anteprima(file_id):
+    """Scarica da Drive un singolo file scelto per mostrarne l'anteprima."""
+    from googleapiclient.http import MediaIoBaseDownload
+    service = drive_service()
+    info = service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,size,webViewLink",
+    ).execute()
+    dimensione = int(info.get("size", 0) or 0)
+    if dimensione > 200 * 1024 * 1024:
+        raise RuntimeError("Il file supera 200 MB: aprilo direttamente su Google Drive.")
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, service.files().get_media(fileId=file_id))
+    completato = False
+    while not completato:
+        _, completato = downloader.next_chunk()
+    return info, buffer.getvalue()
 
+def drive_rinomina_file(file_id, nuovo_nome):
+    """Rinomina il file su Google Drive conservando il collegamento esistente."""
+    nome = str(nuovo_nome or "").strip().replace("/", "-").replace("\\", "-")
+    if not nome:
+        raise ValueError("Inserisci un nome valido.")
+    return drive_service().files().update(
+        fileId=file_id,
+        body={"name": nome},
+        fields="id,name,webViewLink",
+    ).execute()
 
-def special_events_dashboard(frame):
-    st.header("Dashboard eventi speciali")
-    if frame.empty:
-        st.info("Nessun evento presente. Usa Crea evento per inserire il primo.")
-        return
-    today = pd.Timestamp(date.today())
-    upcoming = frame[frame["start_date"].ge(today) & ~frame["status"].isin(["ANNULLATO", "CONCLUSO"])]
-    columns = st.columns(6)
-    columns[0].metric("Eventi totali", len(frame))
-    columns[1].metric("In programma", len(upcoming))
-    columns[2].metric("Partecipanti", int(frame["participants"].sum()))
-    columns[3].metric("Ricavi", f"€ {frame['revenue'].sum():,.2f}")
-    columns[4].metric("Margine", f"€ {frame['margin'].sum():,.2f}")
-    columns[5].metric("Veicoli assegnati", int(frame["assigned_vehicles"].sum()))
-    by_status = frame.groupby("status", as_index=False).size().rename(columns={"size": "eventi"})
-    by_type = frame.groupby("event_type", as_index=False).agg(eventi=("id", "count"), ricavi=("revenue", "sum"))
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(px.bar(by_status, x="status", y="eventi", title="Eventi per stato"), use_container_width=True)
-    c2.plotly_chart(px.bar(by_type, x="event_type", y="eventi", color="ricavi", title="Eventi per tipologia"), use_container_width=True)
-    st.subheader("Prossimi eventi")
-    if upcoming.empty:
-        st.info("Nessun evento futuro programmato.")
-    else:
-        display = upcoming[["start_date", "title", "event_type", "location", "responsible", "status", "participants"]].copy()
-        display.columns = ["Data", "Evento", "Tipologia", "Luogo", "Responsabile", "Stato", "Partecipanti"]
-        st.dataframe(display.sort_values("Data"), use_container_width=True, hide_index=True)
+def drive_scarica_su_file(file_id, destinazione):
+    from googleapiclient.http import MediaIoBaseDownload
+    richiesta = drive_service().files().get_media(fileId=file_id)
+    with open(destinazione, "wb") as uscita:
+        downloader = MediaIoBaseDownload(uscita, richiesta)
+        completato = False
+        while not completato:
+            _, completato = downloader.next_chunk()
+    return destinazione
 
+def drive_carica_file_locale(db, percorso_file, nome_file, cartelle, mimetype="video/mp4"):
+    from googleapiclient.http import MediaFileUpload
+    service, parent = drive_service(), drive_root(db)
+    if not parent:
+        raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for cartella in cartelle:
+        parent = drive_cartella(service, cartella, parent)
+    media = MediaFileUpload(percorso_file, mimetype=mimetype, resumable=True)
+    return service.files().create(
+        body={"name": nome_file, "parents": [parent]},
+        media_body=media,
+        fields="id,name,webViewLink",
+    ).execute()
 
-def special_event_form(frame):
-    st.header("Crea o modifica evento")
-    records, record_ids = event_options(frame)
-    selected = st.selectbox(
-        "Evento da modificare (lascia vuoto per crearne uno nuovo)", [""] + record_ids,
-        format_func=lambda item_id: "" if not item_id else f"{records[item_id].start_date.date()} | {records[item_id].title}",
-    )
-    current = frame[frame["id"].eq(selected)].iloc[0].to_dict() if selected else {}
-    prefix = current.get("id", "new_special_event")
-    c1, c2, c3 = st.columns(3)
-    title = c1.text_input("Nome evento *", value=current.get("title", ""), key=f"{prefix}_event_title")
-    event_types = ["PROMOZIONALE", "AZIENDALE", "FIERA", "CONSEGNA SPECIALE", "ESPOSIZIONE", "ALTRO"]
-    current_type = upper(current.get("event_type", ""))
-    if current_type and current_type not in event_types:
-        event_types.append(current_type)
-    event_type = c2.selectbox("Tipologia *", [""] + event_types, index=([""] + event_types).index(current_type) if current_type else 0, key=f"{prefix}_event_type")
-    statuses = ["PROGRAMMATO", "CONFERMATO", "IN CORSO", "CONCLUSO", "ANNULLATO"]
-    current_status = upper(current.get("status", "")) or "PROGRAMMATO"
-    status = c3.selectbox("Stato", statuses, index=statuses.index(current_status), key=f"{prefix}_event_status")
-    c4, c5, c6, c7 = st.columns(4)
-    start_date_value = current.get("start_date")
-    end_date_value = current.get("end_date")
-    start_date = c4.date_input("Data inizio *", value=start_date_value.date() if pd.notna(start_date_value) else date.today(), key=f"{prefix}_event_start_date")
-    end_date = c5.date_input("Data fine", value=end_date_value.date() if pd.notna(end_date_value) else start_date, key=f"{prefix}_event_end_date")
-    start_time = c6.text_input("Ora inizio", value=current.get("start_time", ""), placeholder="09:00", key=f"{prefix}_event_start_time")
-    end_time = c7.text_input("Ora fine", value=current.get("end_time", ""), placeholder="18:00", key=f"{prefix}_event_end_time")
-    c8, c9, c10 = st.columns(3)
-    location = c8.text_input("Luogo *", value=current.get("location", ""), key=f"{prefix}_event_location")
-    responsible_options = [row["name"] for row in configured_operators()]
-    current_responsible = upper(current.get("responsible", ""))
-    if current_responsible and current_responsible not in responsible_options:
-        responsible_options.append(current_responsible)
-    responsible = c9.selectbox("Responsabile", [""] + responsible_options, index=([""] + responsible_options).index(current_responsible) if current_responsible else 0, key=f"{prefix}_event_responsible")
-    capacity = c10.number_input("Capienza prevista", min_value=0, step=1, value=int(current.get("capacity") or 0), key=f"{prefix}_event_capacity")
-    vehicles = st.text_input("Note generali veicoli", value=current.get("vehicles", ""), placeholder="L’elenco dettagliato si gestisce nella pagina Veicoli evento", key=f"{prefix}_event_vehicles")
-    c11, c12 = st.columns(2)
-    cost = c11.number_input("Costi previsti", min_value=0.0, step=50.0, value=float(current.get("cost") or 0), key=f"{prefix}_event_cost")
-    revenue = c12.number_input("Incassi previsti", min_value=0.0, step=50.0, value=float(current.get("revenue") or 0), key=f"{prefix}_event_revenue")
-    description = st.text_area("Descrizione", value=current.get("description", ""), key=f"{prefix}_event_description")
-    notes = st.text_area("Note", value=current.get("notes", ""), key=f"{prefix}_event_notes")
-    st.info(f"Margine previsto: € {revenue - cost:,.2f}")
-    if st.button("Salva evento", type="primary", use_container_width=True):
-        if not all([title, event_type, start_date, location]):
-            st.error("Compila nome, tipologia, data iniziale e luogo.")
-        elif end_date < start_date:
-            st.error("La data finale non può precedere quella iniziale.")
-        else:
-            save_special_event({
-                "id": current.get("id"), "title": title, "event_type": event_type,
-                "start_date": start_date.isoformat(), "end_date": end_date.isoformat(),
-                "start_time": start_time, "end_time": end_time, "location": location,
-                "responsible": responsible, "status": status, "capacity": capacity,
-                "vehicles": vehicles, "cost": cost, "revenue": revenue,
-                "description": description, "notes": notes,
-                "created_by": current.get("created_by"), "created_at": current.get("created_at"),
-            })
-            st.success("Evento salvato.")
-            st.rerun()
-    if current:
-        confirm = st.checkbox("Confermo l’eliminazione definitiva dell’evento e dei relativi allegati")
-        if st.button("Elimina evento", disabled=not confirm, use_container_width=True):
-            with db() as conn:
-                conn.execute("DELETE FROM event_participants WHERE event_id = ?", (current["id"],))
-                conn.execute("DELETE FROM event_files WHERE event_id = ?", (current["id"],))
-                conn.execute("DELETE FROM event_vehicles WHERE event_id = ?", (current["id"],))
-                conn.execute("DELETE FROM special_events WHERE id = ?", (current["id"],))
-            st.success("Evento eliminato.")
-            st.rerun()
+def chiave_album_drive(categoria, luogo, titolo):
+    return "|".join([
+        str(categoria or "").strip().casefold(),
+        str(luogo or "").strip().casefold(),
+        str(titolo or "").strip().casefold(),
+    ])
 
+def drive_crea_collegamento(service, cartella_id, elemento, target_presenti=None):
+    """Aggiunge all'album un collegamento Drive senza duplicare il file originale."""
+    target_id = str(elemento.get("drive_id", ""))
+    if not target_id:
+        return False
+    if target_presenti is None:
+        presenti = service.files().list(
+            q=(
+                f"'{cartella_id}' in parents and trashed=false and "
+                "mimeType='application/vnd.google-apps.shortcut'"
+            ),
+            spaces="drive",
+            fields="files(id,shortcutDetails(targetId))",
+            pageSize=1000,
+        ).execute().get("files", [])
+        target_presenti = {
+            str(x.get("shortcutDetails", {}).get("targetId", "")) for x in presenti
+        }
+    if target_id in target_presenti:
+        return False
+    service.files().create(
+        body={
+            "name": str(elemento.get("nome_file", "Foto o filmato")),
+            "mimeType": "application/vnd.google-apps.shortcut",
+            "parents": [cartella_id],
+            "shortcutDetails": {"targetId": target_id},
+        },
+        fields="id",
+    ).execute()
+    target_presenti.add(target_id)
+    return True
 
-def events_calendar(frame):
-    st.header("Calendario eventi")
-    if frame.empty:
-        st.info("Nessun evento presente.")
-        return
-    years = sorted(frame["start_date"].dropna().dt.year.unique().astype(int).tolist())
-    selected_year = st.selectbox("Anno", years, index=len(years) - 1)
-    result = frame[frame["start_date"].dt.year.eq(selected_year)].copy()
-    result["Mese"] = result["start_date"].dt.strftime("%Y-%m")
-    display = result[["start_date", "end_date", "title", "event_type", "location", "start_time", "end_time", "responsible", "status"]].copy()
-    display.columns = ["Data inizio", "Data fine", "Evento", "Tipologia", "Luogo", "Ora inizio", "Ora fine", "Responsabile", "Stato"]
-    st.dataframe(display.sort_values("Data inizio"), use_container_width=True, hide_index=True)
-
-
-def events_archive(frame):
-    st.header("Archivio eventi speciali")
-    if frame.empty:
-        st.info("Nessun evento presente.")
-        return
-    c1, c2, c3 = st.columns(3)
-    selected_status = c1.multiselect("Stato", sorted(frame["status"].dropna().unique()))
-    selected_types = c2.multiselect("Tipologia", sorted(frame["event_type"].dropna().unique()))
-    search = c3.text_input("Cerca evento o luogo")
-    result = frame.copy()
-    if selected_status:
-        result = result[result["status"].isin(selected_status)]
-    if selected_types:
-        result = result[result["event_type"].isin(selected_types)]
-    if search:
-        needle = upper(search)
-        result = result[result[["title", "location", "description"]].fillna("").apply(lambda col: col.str.upper().str.contains(needle, regex=False)).any(axis=1)]
-    display = result[["start_date", "title", "event_type", "location", "responsible", "status", "participants", "vehicles", "cost", "revenue", "margin", "files"]].copy()
-    display.columns = ["Data", "Evento", "Tipologia", "Luogo", "Responsabile", "Stato", "Partecipanti", "Veicoli", "Costi", "Incassi", "Margine", "Allegati"]
-    st.dataframe(display, use_container_width=True, hide_index=True)
-    st.download_button("Esporta archivio eventi", table_to_excel(display, "Eventi speciali"), "eventi_speciali.xlsx", use_container_width=True)
-
-
-def event_participants_page(frame):
-    st.header("Partecipanti e personale")
-    records, record_ids = event_options(frame)
-    if not record_ids:
-        st.info("Crea prima un evento.")
-        return
-    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}")
-    with st.form("add_event_participant", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        name = c1.text_input("Nome *")
-        role = c2.selectbox("Ruolo", ["PARTECIPANTE", "OPERATORE", "RESPONSABILE", "FORNITORE", "OSPITE", "ALTRO"])
-        contact = c3.text_input("Contatto")
-        notes = st.text_input("Note")
-        add = st.form_submit_button("Aggiungi", type="primary", use_container_width=True)
-    if add:
-        if not name:
-            st.error("Inserisci il nome.")
-        else:
-            with db() as conn:
-                conn.execute("INSERT INTO event_participants VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), event_id, clean(name), upper(role), clean(contact), clean(notes), datetime.now().isoformat(timespec="seconds")))
-            st.rerun()
-    with db() as conn:
-        participants = [dict(row) for row in conn.execute("SELECT * FROM event_participants WHERE event_id = ? ORDER BY role, name", (event_id,)).fetchall()]
-    if participants:
-        st.dataframe(pd.DataFrame(participants)[["name", "role", "contact", "notes"]], use_container_width=True, hide_index=True)
-        remove_id = st.selectbox("Persona da rimuovere", [row["id"] for row in participants], format_func=lambda item_id: next(row["name"] for row in participants if row["id"] == item_id))
-        if st.button("Rimuovi persona", use_container_width=True):
-            with db() as conn:
-                conn.execute("DELETE FROM event_participants WHERE id = ?", (remove_id,))
-            st.rerun()
-    else:
-        st.info("Nessuna persona associata.")
-
-
-def event_files_page(frame):
-    st.header("Documenti e fotografie evento")
-    records, record_ids = event_options(frame)
-    if not record_ids:
-        st.info("Crea prima un evento.")
-        return
-    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}")
-    uploads = st.file_uploader("Carica documenti o fotografie", accept_multiple_files=True, key=f"event_upload_{event_id}")
-    if st.button("Archivia allegati", type="primary", disabled=not uploads, use_container_width=True):
-        rows = [(str(uuid.uuid4()), event_id, clean(file.name), clean(file.type), sqlite3.Binary(file.getvalue()), datetime.now().isoformat(timespec="seconds")) for file in uploads if file.getvalue()]
-        with db() as conn:
-            conn.executemany("INSERT INTO event_files VALUES (?, ?, ?, ?, ?, ?)", rows)
-        st.success(f"Allegati archiviati: {len(rows)}.")
-        st.rerun()
-    with db() as conn:
-        files = [dict(row) for row in conn.execute("SELECT * FROM event_files WHERE event_id = ? ORDER BY created_at DESC", (event_id,)).fetchall()]
-    if not files:
-        st.info("Nessun allegato presente.")
-        return
-    for file in files:
-        c1, c2, c3 = st.columns([4, 1, 1])
-        c1.write(file["file_name"])
-        c2.download_button("Scarica", file["file_data"], file["file_name"], mime=file["mime_type"] or "application/octet-stream", key=f"event_download_{file['id']}")
-        if c3.button("Elimina", key=f"event_delete_{file['id']}"):
-            with db() as conn:
-                conn.execute("DELETE FROM event_files WHERE id = ?", (file["id"],))
-            st.rerun()
-
-
-def event_vehicles_page(frame):
-    st.header("Veicoli assegnati all’evento")
-    st.caption(
-        "Inserisci o incolla l’elenco direttamente nella tabella. Le righe vengono ordinate per gruppo, "
-        "targa, marca e modello. Il pallino diventa verde quando è indicata la data di ritiro."
-    )
-    records, record_ids = event_options(frame)
-    if not record_ids:
-        st.info("Crea prima un evento.")
-        return
-    event_id = st.selectbox(
-        "Evento",
-        record_ids,
-        format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}",
-        key="event_vehicle_event",
-    )
-    with db() as conn:
-        stored = [
-            dict(row) for row in conn.execute(
-                """
-                SELECT * FROM event_vehicles
-                WHERE event_id = ?
-                ORDER BY UPPER(COALESCE(vehicle_group, '')), UPPER(COALESCE(plate, '')),
-                         UPPER(COALESCE(brand, '')), UPPER(COALESCE(model, ''))
-                """,
-                (event_id,),
-            ).fetchall()
-        ]
-    st.subheader("Inserimento o modifica veicolo")
-    vehicle_by_id = {item["id"]: item for item in stored}
-    selected_vehicle_id = st.selectbox(
-        "Veicolo da modificare",
-        [""] + list(vehicle_by_id),
-        format_func=lambda item_id: "➕ NUOVO VEICOLO" if not item_id else " | ".join(
-            value for value in [
-                upper(vehicle_by_id[item_id].get("plate")),
-                clean(vehicle_by_id[item_id].get("brand")),
-                clean(vehicle_by_id[item_id].get("model")),
-                clean(vehicle_by_id[item_id].get("assigned_to")),
-            ] if value
+def drive_crea_o_aggiorna_album(db, categoria, luogo, titolo, elementi):
+    service, root = drive_service(), drive_root(db)
+    if not root:
+        raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    parent = root
+    for nome_cartella in ["ARCHIVIO", "ALBUM"]:
+        parent = drive_cartella(service, nome_cartella, parent)
+    nome_album = str(titolo or "Album").strip().replace("/", "-").replace("\\", "-")
+    cartella_album = drive_cartella(service, nome_album, parent)
+    collegamenti_presenti = service.files().list(
+        q=(
+            f"'{cartella_album}' in parents and trashed=false and "
+            "mimeType='application/vnd.google-apps.shortcut'"
         ),
-        key=f"event_vehicle_selector_{event_id}",
+        spaces="drive",
+        fields="files(shortcutDetails(targetId))",
+        pageSize=1000,
+    ).execute().get("files", [])
+    target_presenti = {
+        str(x.get("shortcutDetails", {}).get("targetId", "")) for x in collegamenti_presenti
+    }
+    aggiunti = 0
+    for elemento in elementi:
+        if drive_crea_collegamento(service, cartella_album, elemento, target_presenti):
+            aggiunti += 1
+    info = service.files().get(fileId=cartella_album, fields="id,name,webViewLink").execute()
+    chiave = chiave_album_drive(categoria, luogo, titolo)
+    db.setdefault("album_drive", {})[chiave] = {
+        "folder_id": cartella_album,
+        "link": info.get("webViewLink", ""),
+        "titolo": titolo,
+        "categoria": categoria,
+        "luogo": luogo,
+    }
+    salva(db)
+    return aggiunti, info
+
+def drive_aggiungi_ad_album_esistente(db, elemento):
+    chiave = chiave_album_drive(
+        elemento.get("categoria"), elemento.get("luogo"), elemento.get("titolo")
     )
-    selected_vehicle = vehicle_by_id.get(selected_vehicle_id, {})
-    form_key = selected_vehicle_id or "new"
-    existing_pickup = clean(selected_vehicle.get("pickup_date"))
-    pickup_default = date.today()
-    if existing_pickup:
-        parsed_pickup = pd.to_datetime(existing_pickup, errors="coerce", dayfirst=True)
-        if pd.notna(parsed_pickup):
-            pickup_default = parsed_pickup.date()
-    with st.form(f"event_vehicle_form_{event_id}_{form_key}", clear_on_submit=not bool(selected_vehicle_id)):
-        c1, c2, c3, c4 = st.columns(4)
-        vehicle_group = c1.text_input("Gruppo", value=clean(selected_vehicle.get("vehicle_group")))
-        plate = c2.text_input("Targa *", value=upper(selected_vehicle.get("plate")))
-        brand = c3.text_input("Marca", value=clean(selected_vehicle.get("brand")))
-        model = c4.text_input("Modello", value=clean(selected_vehicle.get("model")))
-        c5, c6, c7 = st.columns(3)
-        assigned_to = c5.text_input("Assegnata a", value=clean(selected_vehicle.get("assigned_to")))
-        ra = c6.text_input("RA", value=upper(selected_vehicle.get("ra")))
-        picked_up = c7.checkbox("Veicolo ritirato", value=bool(existing_pickup))
-        c8, c9 = st.columns([1, 2])
-        pickup_date = c8.date_input("Data ritiro", value=pickup_default, disabled=not picked_up)
-        vehicle_notes = c9.text_input("Note", value=clean(selected_vehicle.get("notes")))
-        save_vehicle = st.form_submit_button(
-            "Aggiorna veicolo" if selected_vehicle_id else "Aggiungi veicolo alla tabella",
-            type="primary", use_container_width=True,
+    album = db.get("album_drive", {}).get(chiave)
+    if not album or not album.get("folder_id"):
+        return False
+    return drive_crea_collegamento(drive_service(), album["folder_id"], elemento)
+
+def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo, transizione):
+    """Crea un MP4 16:9 usando foto e filmati già archiviati su Drive."""
+    try:
+        from moviepy import (
+            ImageClip, VideoFileClip, AudioFileClip, CompositeVideoClip,
+            concatenate_videoclips, concatenate_audioclips, vfx,
         )
-    if save_vehicle:
-        if not clean(plate):
-            st.error("Inserisci almeno la targa del veicolo.")
-        else:
-            vehicle_id = selected_vehicle_id or str(uuid.uuid4())
-            with db() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO event_vehicles
-                    (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        vehicle_group=excluded.vehicle_group,plate=excluded.plate,brand=excluded.brand,
-                        model=excluded.model,assigned_to=excluded.assigned_to,ra=excluded.ra,
-                        pickup_date=excluded.pickup_date,notes=excluded.notes,updated_at=excluded.updated_at
-                    """,
-                    (
-                        vehicle_id, event_id, clean(vehicle_group), upper(plate), clean(brand), clean(model),
-                        clean(assigned_to), upper(ra), pickup_date.isoformat() if picked_up else "",
-                        clean(vehicle_notes), datetime.now().isoformat(timespec="seconds"),
-                    ),
+        from PIL import Image, ImageOps, ImageDraw, ImageFont
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError(
+            "Mancano le librerie per creare il video. Aggiungi moviepy, pillow e imageio-ffmpeg a requirements.txt."
+        ) from exc
+
+    # Formato HD leggero, adatto ai limiti CPU di Streamlit Cloud.
+    larghezza, altezza = 854, 480
+    temp_dir = tempfile.mkdtemp(prefix="ricordo_")
+    clip_da_chiudere, clip_finali = [], []
+
+    def tela_da_immagine(percorso):
+        with Image.open(percorso) as originale:
+            foto = ImageOps.exif_transpose(originale).convert("RGB")
+            foto.thumbnail((larghezza, altezza), Image.Resampling.LANCZOS)
+            tela = Image.new("RGB", (larghezza, altezza), "black")
+            tela.paste(foto, ((larghezza-foto.width)//2, (altezza-foto.height)//2))
+            return np.array(tela)
+
+    try:
+        if titolo.strip():
+            tela = Image.new("RGB", (larghezza, altezza), (18, 25, 38))
+            draw = ImageDraw.Draw(tela)
+            font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            try:
+                font = ImageFont.truetype(font_path, 58)
+            except Exception:
+                font = ImageFont.load_default()
+            testo = titolo.strip()
+            bbox = draw.textbbox((0, 0), testo, font=font)
+            draw.text(((larghezza-(bbox[2]-bbox[0]))/2, (altezza-(bbox[3]-bbox[1]))/2), testo, fill="white", font=font)
+            clip_finali.append(ImageClip(np.array(tela), duration=3))
+
+        for indice, elemento in enumerate(elementi):
+            nome = str(elemento.get("nome_file", f"file_{indice}"))
+            estensione = Path(nome).suffix or ".bin"
+            percorso = os.path.join(temp_dir, f"sorgente_{indice}{estensione}")
+            drive_scarica_su_file(elemento["drive_id"], percorso)
+            tipo = mimetypes.guess_type(nome)[0] or ""
+            if tipo.startswith("image/"):
+                foto_clip = ImageClip(tela_da_immagine(percorso), duration=float(durata_foto))
+                if transizione == "Zoom lento + dissolvenza":
+                    zoom = foto_clip.resized(lambda t: 1 + 0.06 * (t / max(float(durata_foto), 1)))
+                    foto_animata = CompositeVideoClip(
+                        [zoom.with_position("center")],
+                        size=(larghezza, altezza), bg_color=(0, 0, 0),
+                    ).with_duration(float(durata_foto))
+                    clip_da_chiudere.extend([foto_clip, zoom, foto_animata])
+                    clip_finali.append(foto_animata)
+                else:
+                    clip_finali.append(foto_clip)
+            elif tipo.startswith("video/"):
+                video = VideoFileClip(percorso)
+                clip_da_chiudere.append(video)
+                rapporto = min(larghezza/video.w, altezza/video.h)
+                ridimensionato = video.resized(rapporto)
+                composto = CompositeVideoClip(
+                    [ridimensionato.with_position("center")],
+                    size=(larghezza, altezza),
+                    bg_color=(0, 0, 0),
+                ).with_duration(video.duration)
+                clip_da_chiudere.extend([ridimensionato, composto])
+                clip_finali.append(composto)
+
+        if not clip_finali:
+            raise RuntimeError("Nessuna foto o filmato compatibile selezionato.")
+        durata_transizione = min(0.8, max(0.3, float(durata_foto) / 4))
+        clip_montati = [clip_finali[0]]
+        for clip in clip_finali[1:]:
+            if transizione in {"Dissolvenza", "Zoom lento + dissolvenza"}:
+                clip = clip.with_effects([vfx.CrossFadeIn(durata_transizione)])
+            elif transizione == "Scorrimento laterale":
+                clip = clip.with_effects([vfx.SlideIn(durata_transizione, "left")])
+            clip_montati.append(clip)
+        sovrapposizione = -durata_transizione if transizione != "Nessuna" else 0
+        finale = concatenate_videoclips(
+            clip_montati, method="compose", padding=sovrapposizione
+        )
+        clip_da_chiudere.append(finale)
+
+        if musica is not None:
+            est_audio = Path(musica.name).suffix or ".mp3"
+            percorso_audio = os.path.join(temp_dir, "musica" + est_audio)
+            with open(percorso_audio, "wb") as uscita:
+                uscita.write(musica.getvalue())
+            audio = AudioFileClip(percorso_audio)
+            clip_da_chiudere.append(audio)
+            ripetizioni = max(1, math.ceil(finale.duration / audio.duration))
+            colonna_audio = concatenate_audioclips([audio] * ripetizioni).subclipped(0, finale.duration)
+            colonna_audio = colonna_audio.with_volume_scaled(0.35)
+            clip_da_chiudere.append(colonna_audio)
+            finale = finale.with_audio(colonna_audio)
+            clip_da_chiudere.append(finale)
+
+        nome_pulito = re.sub(r"[^A-Za-z0-9À-ÿ _-]+", "", nome_ricordo).strip() or "Ricordo"
+        percorso_finale = os.path.join(temp_dir, nome_pulito + ".mp4")
+        finale.write_videofile(
+            percorso_finale, codec="libx264", audio_codec="aac", fps=20,
+            preset="ultrafast", threads=1, logger=None,
+        )
+        for clip in reversed(clip_da_chiudere + clip_finali):
+            try: clip.close()
+            except Exception: pass
+        return percorso_finale, temp_dir
+    except Exception:
+        for clip in reversed(clip_da_chiudere + clip_finali):
+            try: clip.close()
+            except Exception: pass
+        raise
+
+def modulo_crea_ricordo(db, righe):
+    st.divider()
+    st.subheader("🎬 Crea ricordo")
+    st.caption(
+        "Seleziona foto e filmati, stabilisci l'ordine e aggiungi una musica personale. "
+        "Il risultato sarà un video MP4."
+    )
+    disponibili = [r for r in righe if r.get("drive_id")]
+    etichette = {}
+    for r in disponibili:
+        etichetta = " · ".join(filter(None, [
+            str(r.get("persona", "Famiglia")), str(r.get("luogo", "")),
+            str(r.get("titolo", r.get("nome_file", "File"))),
+            str(r.get("data_scatto", "")), str(r.get("id", ""))[:5],
+        ]))
+        etichette[etichetta] = r
+    scelte = st.multiselect(
+        "1. Seleziona almeno due foto o filmati",
+        list(etichette),
+        key="ricordo_scelte",
+    )
+    selezionati = [etichette[x] for x in scelte]
+    if len(selezionati) > 20:
+        st.warning("Per non superare i limiti di Streamlit Cloud, seleziona al massimo 20 contenuti per video.")
+    ordinati = []
+    if selezionati:
+        st.markdown("**2. Imposta l’ordine**")
+        for posizione, elemento in enumerate(selezionati, 1):
+            c1, c2 = st.columns([1, 5])
+            ordine = c1.number_input(
+                "Ordine", min_value=1, max_value=len(selezionati), value=posizione,
+                key="ordine_ricordo_" + str(elemento.get("id", posizione)),
+            )
+            c2.write(elemento.get("titolo") or elemento.get("nome_file", "File"))
+            ordinati.append((ordine, posizione, elemento))
+    c1, c2 = st.columns(2)
+    titolo_video = c1.text_input("3. Titolo iniziale", placeholder="Il nostro ricordo")
+    nome_video = c2.text_input("Nome del video", value="Ricordo di famiglia")
+    durata_foto = st.slider("Durata di ogni fotografia", 2, 10, 4, help="Secondi")
+    transizione = st.selectbox(
+        "Animazione tra una foto e l'altra",
+        ["Dissolvenza", "Zoom lento + dissolvenza", "Scorrimento laterale", "Nessuna"],
+        help="La dissolvenza è la scelta più leggera ed elegante.",
+    )
+    musica = st.file_uploader(
+        "4. Musica personale (facoltativa)",
+        type=["mp3", "m4a", "wav", "aac", "ogg"],
+        key="musica_ricordo",
+    )
+    salva_drive = st.checkbox("Salva automaticamente il video in Google Drive", True)
+    if st.button(
+        "🎞️ Genera video MP4",
+        type="primary",
+        use_container_width=True,
+        disabled=len(selezionati) < 2 or len(selezionati) > 20,
+    ):
+        temp_dir = None
+        try:
+            contenuti_ordinati = [x[2] for x in sorted(ordinati, key=lambda x: (x[0], x[1]))]
+            with st.spinner("Creazione del video in corso: può richiedere alcuni minuti..."):
+                percorso_video, temp_dir = genera_video_ricordo(
+                    db, contenuti_ordinati, titolo_video, durata_foto, musica, nome_video, transizione
                 )
-            st.success("Veicolo aggiornato nella tabella." if selected_vehicle_id else "Veicolo aggiunto automaticamente alla tabella.")
+                video_bytes = Path(percorso_video).read_bytes()
+                risultato_drive = None
+                if salva_drive:
+                    nome_mp4 = Path(percorso_video).name
+                    risultato_drive = drive_carica_file_locale(
+                        db, percorso_video, nome_mp4,
+                        ["ARCHIVIO", "RICORDI", str(date.today().year)],
+                    )
+                    registra(db, "media", {
+                        "anno": date.today().year,
+                        "evento": "Ricordi",
+                        "categoria": "Ricordi",
+                        "titolo": nome_video.strip() or "Ricordo di famiglia",
+                        "luogo": "",
+                        "data_scatto": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "descrizione": "Video ricordo creato dal gestionale",
+                        "nome_file": risultato_drive.get("name", nome_mp4),
+                        "drive_id": risultato_drive["id"],
+                        "link": risultato_drive.get("webViewLink", ""),
+                        "origine": "Crea ricordo",
+                        "persona": "Famiglia",
+                    }, True)
+            st.success("Video ricordo creato correttamente.")
+            st.video(video_bytes, format="video/mp4")
+            st.download_button(
+                "⬇️ Scarica video MP4", video_bytes,
+                file_name=Path(percorso_video).name, mime="video/mp4",
+                use_container_width=True,
+            )
+            if risultato_drive and risultato_drive.get("webViewLink"):
+                st.link_button("↗️ Apri il video su Google Drive", risultato_drive["webViewLink"], use_container_width=True)
+        except Exception as exc:
+            st.error(f"Creazione del video non riuscita: {exc}")
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+def modulo_classificazione_multipla(db, righe):
+    st.subheader("🏷️ Classificazione multipla")
+    st.caption(
+        "Seleziona più foto o filmati dello stesso evento e assegna gli stessi dati in una sola volta."
+    )
+    opzioni = {}
+    for riga in righe:
+        if not riga.get("drive_id"):
+            continue
+        etichetta = " · ".join(filter(None, [
+            str(riga.get("persona", "Famiglia")),
+            str(riga.get("nome_file", "File")),
+            str(riga.get("data_scatto", "")),
+            str(riga.get("id", ""))[:5],
+        ]))
+        opzioni[etichetta] = riga
+    selezioni = st.multiselect(
+        "Foto e filmati da classificare insieme",
+        list(opzioni),
+        key="classificazione_multipla_elementi",
+    )
+    with st.form("form_classificazione_multipla"):
+        c1, c2 = st.columns(2)
+        luogo = c1.text_input("Luogo comune", placeholder="es. Napoli")
+        titolo = c2.text_input("Titolo dell'evento", placeholder="es. Matrimonio Fabio")
+        categoria = st.selectbox(
+            "Categoria comune",
+            ["Famiglia", "Vacanze", "Compleanni", "Feste", "Scuola", "Sport", "Viaggi", "Ricordi", "Altro"],
+        )
+        parole = st.text_input(
+            "Parole chiave comuni (separate da virgola)",
+            placeholder="es. matrimonio, famiglia, festa",
+        )
+        rinomina = st.checkbox(
+            "Rinomina anche tutti i file su Google Drive",
+            True,
+            help="Data, ora e codice finale rendono univoco ogni nome.",
+        )
+        conferma = st.form_submit_button(
+            f"Classifica {len(selezioni)} elementi",
+            type="primary",
+            use_container_width=True,
+            disabled=not selezioni,
+        )
+    if conferma:
+        titolo_pulito, luogo_pulito = titolo.strip(), luogo.strip()
+        if not titolo_pulito:
+            st.error("Inserisci il titolo dell'evento.")
+            return
+        completati, errori = 0, []
+        for etichetta in selezioni:
+            elemento = opzioni[etichetta]
+            nome_corrente = str(elemento.get("nome_file", "File"))
+            estensione = Path(nome_corrente).suffix
+            data_elemento = str(
+                elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)
+            )
+            try:
+                if rinomina:
+                    data_nome = re.sub(r"[^0-9]", "", data_elemento) or "senza_data"
+                    codice = str(elemento.get("id") or elemento.get("drive_id", ""))[:5]
+                    parti_nome = [x for x in [luogo_pulito, titolo_pulito, data_nome, codice] if x]
+                    nome_finale = " - ".join(parti_nome) + estensione
+                    risultato = drive_rinomina_file(elemento["drive_id"], nome_finale)
+                    elemento["nome_file"] = risultato.get("name", nome_finale)
+                elemento["categoria"] = categoria
+                elemento["luogo"] = luogo_pulito
+                elemento["titolo"] = titolo_pulito
+                elemento["data_scatto"] = data_elemento
+                elemento["parole_chiave"] = parole.strip()
+                elemento["evento"] = titolo_pulito
+                elemento["classificato_il"] = datetime.now().isoformat(timespec="seconds")
+                drive_aggiungi_ad_album_esistente(db, elemento)
+                completati += 1
+            except Exception as exc:
+                errori.append(f"{nome_corrente}: {exc}")
+        if completati:
+            salva(db)
+            st.success(f"Classificazione completata per {completati} elementi.")
+        if errori:
+            st.error("Non classificati: " + " | ".join(errori[:5]))
+        if completati and not errori:
             st.rerun()
-    if selected_vehicle_id:
-        confirm_vehicle_delete = st.checkbox(
-            "Confermo l’eliminazione del veicolo selezionato",
-            key=f"confirm_vehicle_delete_{event_id}_{selected_vehicle_id}",
+
+def modulo_album_eventi(db, righe):
+    st.divider()
+    st.subheader("📖 Album eventi")
+    st.caption(
+        "Gli album si formano automaticamente raggruppando i contenuti con lo stesso "
+        "titolo, luogo e categoria. Non vengono create copie dei file."
+    )
+    album = {}
+    for riga in righe:
+        titolo = str(riga.get("titolo", "")).strip()
+        if not titolo or titolo.lower() in {"da classificare", "file"}:
+            continue
+        categoria = str(riga.get("categoria", "Da classificare")).strip()
+        luogo = str(riga.get("luogo", "")).strip()
+        chiave = (categoria.casefold(), luogo.casefold(), titolo.casefold())
+        album.setdefault(chiave, {
+            "categoria": categoria, "luogo": luogo, "titolo": titolo, "elementi": []
+        })["elementi"].append(riga)
+    if not album:
+        st.info("Classifica almeno una foto o un filmato per creare il primo album.")
+        return
+
+    opzioni = {}
+    for dati in album.values():
+        etichetta = " · ".join(filter(None, [
+            dati["titolo"], dati["luogo"], dati["categoria"],
+            f"{len(dati['elementi'])} contenuti",
+        ]))
+        opzioni[etichetta] = dati
+    album_scelto = st.selectbox(
+        "Scegli l'album da aprire",
+        list(opzioni),
+        key="album_evento_scelto",
+    )
+    dati = opzioni[album_scelto]
+    elementi = sorted(
+        dati["elementi"],
+        key=lambda x: str(x.get("data_scatto", "")),
+    )
+    st.markdown(f"### {dati['titolo']}")
+    dettagli = " · ".join(filter(None, [dati["categoria"], dati["luogo"]]))
+    if dettagli:
+        st.caption(dettagli)
+    foto = [x for x in elementi if (mimetypes.guess_type(str(x.get("nome_file", "")))[0] or "").startswith("image/")]
+    filmati = [x for x in elementi if (mimetypes.guess_type(str(x.get("nome_file", "")))[0] or "").startswith("video/")]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Contenuti", len(elementi))
+    c2.metric("Fotografie", len(foto))
+    c3.metric("Filmati", len(filmati))
+
+    st.markdown("#### 📕 Sfoglia il fotolibro")
+    st.caption(
+        "Le pagine vengono composte automaticamente con 2, 3 o 4 foto e filmati, "
+        "in ordine di data. Viene caricata soltanto la pagina che stai guardando."
+    )
+    chiave_libro = hashlib.md5(
+        chiave_album_drive(dati["categoria"], dati["luogo"], dati["titolo"]).encode()
+    ).hexdigest()[:10]
+    pagine_libro = []
+    indice_elemento = 0
+    schema_pagine = (2, 3, 4)
+    while indice_elemento < len(elementi):
+        quanti = schema_pagine[len(pagine_libro) % len(schema_pagine)]
+        pagine_libro.append(elementi[indice_elemento:indice_elemento + quanti])
+        indice_elemento += quanti
+
+    stato_pagina = f"fotolibro_pagina_{chiave_libro}"
+    pagina_corrente = int(st.session_state.get(stato_pagina, 0))
+    pagina_corrente = max(0, min(pagina_corrente, len(pagine_libro) - 1))
+    st.session_state[stato_pagina] = pagina_corrente
+
+    nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+    if nav1.button("⏮️", key=f"libro_prima_{chiave_libro}", disabled=pagina_corrente == 0, help="Prima pagina"):
+        st.session_state[stato_pagina] = 0
+        st.rerun()
+    if nav2.button("◀️", key=f"libro_indietro_{chiave_libro}", disabled=pagina_corrente == 0, help="Pagina precedente"):
+        st.session_state[stato_pagina] = pagina_corrente - 1
+        st.rerun()
+    nav3.markdown(
+        f"<div style='text-align:center;padding:.45rem;font-weight:700'>"
+        f"Pagina {pagina_corrente + 1} di {len(pagine_libro)}</div>",
+        unsafe_allow_html=True,
+    )
+    if nav4.button("▶️", key=f"libro_avanti_{chiave_libro}", disabled=pagina_corrente >= len(pagine_libro) - 1, help="Pagina successiva"):
+        st.session_state[stato_pagina] = pagina_corrente + 1
+        st.rerun()
+    if nav5.button("⏭️", key=f"libro_ultima_{chiave_libro}", disabled=pagina_corrente >= len(pagine_libro) - 1, help="Ultima pagina"):
+        st.session_state[stato_pagina] = len(pagine_libro) - 1
+        st.rerun()
+
+    st.markdown(
+        "<div style='height:8px;border-radius:8px 8px 0 0;"
+        "background:linear-gradient(90deg,#7b4b2a,#d7b47a,#7b4b2a);'></div>",
+        unsafe_allow_html=True,
+    )
+    elementi_libro = pagine_libro[pagina_corrente]
+    colonne_libro = st.columns(2 if len(elementi_libro) == 2 else min(len(elementi_libro), 4))
+    for posizione, elemento in enumerate(elementi_libro):
+        with colonne_libro[posizione % len(colonne_libro)]:
+            nome = str(elemento.get("nome_file", "Contenuto"))
+            tipo = mimetypes.guess_type(nome)[0] or ""
+            estensione = Path(nome).suffix.lower()
+            data_elemento = str(elemento.get("data_scatto", "")).strip()
+            if tipo.startswith("image/") and estensione not in {".heic", ".heif"}:
+                try:
+                    _, contenuto = drive_leggi_anteprima(elemento["drive_id"])
+                    st.image(contenuto, use_container_width=True)
+                except Exception:
+                    st.info("🖼️ Anteprima non disponibile")
+            elif tipo.startswith("video/"):
+                st.info("🎬 Filmato — premi sotto per visualizzarlo")
+            else:
+                st.info("🖼️ Fotografia — aprila su Google Drive")
+            st.markdown(f"**{data_elemento or nome}**")
+            if elemento.get("descrizione"):
+                st.caption(str(elemento.get("descrizione")))
+            if elemento.get("link"):
+                st.link_button("Apri", elemento["link"], use_container_width=True)
+    st.markdown(
+        "<div style='height:8px;border-radius:0 0 8px 8px;"
+        "background:linear-gradient(90deg,#7b4b2a,#d7b47a,#7b4b2a);margin-bottom:1rem'></div>",
+        unsafe_allow_html=True,
+    )
+
+    chiave_drive = chiave_album_drive(dati["categoria"], dati["luogo"], dati["titolo"])
+    album_drive = db.get("album_drive", {}).get(chiave_drive, {})
+    testo_pulsante = "🔄 Aggiorna album su Google Drive" if album_drive else "☁️ Crea album su Google Drive"
+    if st.button(
+        testo_pulsante,
+        type="primary",
+        use_container_width=True,
+        key="crea_album_drive_" + hashlib.md5(chiave_drive.encode()).hexdigest()[:10],
+    ):
+        try:
+            with st.spinner("Creazione dell'album su Google Drive..."):
+                aggiunti, info_album = drive_crea_o_aggiorna_album(
+                    db, dati["categoria"], dati["luogo"], dati["titolo"], elementi
+                )
+            album_drive = db.get("album_drive", {}).get(chiave_drive, {})
+            st.success(f"Album Drive aggiornato: {aggiunti} nuovi collegamenti aggiunti.")
+        except Exception as exc:
+            st.error(f"Creazione album su Drive non riuscita: {exc}")
+    if album_drive.get("link"):
+        st.link_button(
+            "↗️ Apri album su Google Drive",
+            album_drive["link"],
+            use_container_width=True,
+        )
+
+    carica_anteprime = st.checkbox(
+        "Carica le anteprime fotografiche dell'album",
+        False,
+        help="Lascialo disattivato quando vuoi soltanto consultare l'elenco: riduce l'uso della CPU.",
+        key="carica_anteprime_album",
+    )
+    per_pagina = 6
+    pagine = max(1, math.ceil(len(elementi) / per_pagina))
+    pagina = st.selectbox(
+        "Pagina dell'album",
+        list(range(1, pagine + 1)),
+        key="pagina_album_evento",
+        disabled=pagine == 1,
+    )
+    inizio = (pagina - 1) * per_pagina
+    elementi_pagina = elementi[inizio:inizio + per_pagina]
+    colonne_album = st.columns(3)
+    for indice, elemento in enumerate(elementi_pagina):
+        with colonne_album[indice % 3]:
+            nome = str(elemento.get("nome_file", "File"))
+            tipo = mimetypes.guess_type(nome)[0] or ""
+            data_elemento = str(elemento.get("data_scatto", ""))
+            if carica_anteprime and tipo.startswith("image/") and Path(nome).suffix.lower() not in {".heic", ".heif"}:
+                try:
+                    _, contenuto = drive_leggi_anteprima(elemento["drive_id"])
+                    st.image(contenuto, use_container_width=True)
+                except Exception:
+                    st.info("🖼️ Anteprima non disponibile")
+            elif tipo.startswith("image/"):
+                st.info("🖼️ Fotografia")
+            elif tipo.startswith("video/"):
+                st.info("🎬 Filmato")
+            else:
+                st.info("📎 Contenuto")
+            st.caption(data_elemento or nome)
+            if elemento.get("link"):
+                st.markdown(f"[Apri su Google Drive]({elemento['link']})")
+
+def drive_scrivi_bytes(db, contenuto, nome, percorso, mimetype="application/json", sovrascrivi=True):
+    from googleapiclient.http import MediaIoBaseUpload
+    srv, parent = drive_service(), drive_root(db)
+    if not parent: raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for cartella in percorso: parent = drive_cartella(srv, cartella, parent)
+    media = MediaIoBaseUpload(io.BytesIO(contenuto), mimetype=mimetype, resumable=False)
+    esistente = drive_file(srv, nome, parent) if sovrascrivi else None
+    if esistente:
+        return srv.files().update(fileId=esistente["id"], media_body=media, fields="id,webViewLink,name,modifiedTime").execute()
+    return srv.files().create(body={"name": nome, "parents": [parent]}, media_body=media, fields="id,webViewLink,name,modifiedTime").execute()
+
+def drive_salva_db(db):
+    payload = json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")
+    return drive_scrivi_bytes(db, payload, "gestionale_famiglia_live.json", ["DATI"], sovrascrivi=True)
+
+def drive_carica_db(db_locale):
+    from googleapiclient.http import MediaIoBaseDownload
+    srv, parent = drive_service(), drive_root(db_locale)
+    if not parent: return None
+    dati = drive_cartella(srv, "DATI", parent)
+    trovato = drive_file(srv, "gestionale_famiglia_live.json", dati)
+    if not trovato: return None
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, srv.files().get_media(fileId=trovato["id"]))
+    fine = False
+    while not fine:
+        _, fine = downloader.next_chunk()
+    remoto = json.loads(buffer.getvalue().decode("utf-8"))
+    return remoto if isinstance(remoto, dict) and isinstance(remoto.get("utenti"), dict) else None
+
+def backup_giornaliero(db):
+    giorno = oggi()
+    if db["config"].get("ultimo_backup_giornaliero") == giorno: return
+    payload = json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")
+    nome = f"gestionale_famiglia_{giorno.replace('-', '')}.json"
+    drive_scrivi_bytes(db, payload, nome, ["BACKUP", "AUTOMATICI"], sovrascrivi=True)
+    db["config"]["ultimo_backup_giornaliero"] = giorno
+    salva(db)
+
+def drive_upload(db, file, percorso):
+    from googleapiclient.http import MediaIoBaseUpload
+    srv, parent = drive_service(), drive_root(db)
+    if not parent: raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for nome in percorso: parent = drive_cartella(srv, nome, parent)
+    media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or "application/octet-stream", resumable=True)
+    meta = {"name": file.name, "parents": [parent]}
+    out = srv.files().create(body=meta, media_body=media, fields="id,webViewLink,name").execute()
+    return out
+
+def drive_upload_path(db, percorso_file, nome_file, mimetype, percorso):
+    from googleapiclient.http import MediaFileUpload
+    srv, parent = drive_service(), drive_root(db)
+    if not parent: raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for nome in percorso: parent = drive_cartella(srv, nome, parent)
+    media = MediaFileUpload(percorso_file, mimetype=mimetype or "application/octet-stream", resumable=True)
+    meta = {"name": nome_file, "parents": [parent]}
+    return srv.files().create(body=meta, media_body=media, fields="id,webViewLink,name").execute()
+
+def photos_credentials():
+    try:
+        raw = dict(st.secrets["gcp_photos_oauth"])
+        client_id = str(raw.get("client_id", "")).strip()
+        client_secret = str(raw.get("client_secret", "")).strip()
+        refresh_token = str(raw.get("refresh_token", "")).strip()
+        token_uri = str(raw.get("token_uri", "https://oauth2.googleapis.com/token")).strip()
+        if not client_id or not client_secret or not refresh_token:
+            raise RuntimeError("mancano client_id, client_secret o refresh_token")
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        cred = Credentials(token=None, refresh_token=refresh_token, token_uri=token_uri,
+                           client_id=client_id, client_secret=client_secret,
+                           scopes=["https://www.googleapis.com/auth/photospicker.mediaitems.readonly"])
+        cred.refresh(Request())
+        return cred
+    except Exception as exc:
+        raise RuntimeError(f"Google Foto non configurato: {exc}")
+
+def photos_api(method, endpoint, cred, **kwargs):
+    import requests
+    headers = dict(kwargs.pop("headers", {}))
+    headers["Authorization"] = f"Bearer {cred.token}"
+    response = requests.request(method, f"https://photospicker.googleapis.com/v1/{endpoint}", headers=headers, timeout=60, **kwargs)
+    if not response.ok:
+        try: dettaglio = response.json().get("error", {}).get("message", response.text)
+        except Exception: dettaglio = response.text
+        raise RuntimeError(f"Google Foto: {response.status_code} {dettaglio}")
+    return response.json() if response.content else {}
+
+def photos_crea_sessione():
+    cred = photos_credentials()
+    sessione = photos_api("POST", "sessions", cred, json={})
+    if not sessione.get("id") or not sessione.get("pickerUri"):
+        raise RuntimeError("Google Foto non ha restituito una sessione valida.")
+    return sessione
+
+def photos_lista_selezionati(session_id, cred):
+    elementi, token = [], None
+    while True:
+        params = {"sessionId": session_id, "pageSize": 100}
+        if token: params["pageToken"] = token
+        risposta = photos_api("GET", "mediaItems", cred, params=params)
+        elementi.extend(risposta.get("mediaItems", []))
+        token = risposta.get("nextPageToken")
+        if not token: return elementi
+
+def photos_importa_selezione(db, session_id, anno, evento, descrizione, condiviso):
+    import requests
+    cred = photos_credentials()
+    sessione = photos_api("GET", f"sessions/{session_id}", cred)
+    if not sessione.get("mediaItemsSet"):
+        return 0, 0, False
+    elementi = photos_lista_selezionati(session_id, cred)
+    gia_presenti = {str(x.get("photos_picker_id")) for x in db["media"] if x.get("photos_picker_id")}
+    importati = saltati = 0
+    for item in elementi:
+        picker_id = str(item.get("id", ""))
+        if picker_id and picker_id in gia_presenti:
+            saltati += 1; continue
+        media_file = item.get("mediaFile", {})
+        base_url = str(media_file.get("baseUrl", ""))
+        mime = str(media_file.get("mimeType", "application/octet-stream"))
+        nome = Path(str(media_file.get("filename") or f"google_foto_{picker_id}{mimetypes.guess_extension(mime) or ''}")).name
+        if not base_url: continue
+        url = base_url + ("=dv" if mime.startswith("video/") else "=d")
+        temp_path = None
+        try:
+            with requests.get(url, headers={"Authorization": f"Bearer {cred.token}"}, stream=True, timeout=180) as risposta:
+                risposta.raise_for_status()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(nome).suffix) as temp:
+                    temp_path = temp.name
+                    totale = 0
+                    for blocco in risposta.iter_content(chunk_size=1024*1024):
+                        if not blocco: continue
+                        totale += len(blocco)
+                        if totale > 1024*1024*1024:
+                            raise RuntimeError(f"{nome}: file superiore a 1 GB")
+                        temp.write(blocco)
+            out = drive_upload_path(db, temp_path, nome, mime, ["ARCHIVIO",str(anno),evento,"Foto e Video"])
+            dati = {"anno":anno,"evento":evento,"descrizione":descrizione,"nome_file":out["name"],"drive_id":out["id"],"link":out.get("webViewLink",""),"photos_picker_id":picker_id,"origine":"Google Foto"}
+            registra(db,"media",dati,condiviso); importati += 1
+        finally:
+            if temp_path and os.path.exists(temp_path): os.unlink(temp_path)
+    try: photos_api("DELETE", f"sessions/{session_id}", cred)
+    except Exception: pass
+    return importati, saltati, True
+
+def login(db):
+    st.title("🏠 Gestionale Famiglia")
+    st.caption("Accesso riservato ai componenti della famiglia")
+    with st.form("login"):
+        user = st.text_input("Utente").strip().lower()
+        pwd = st.text_input("Password", type="password")
+        entra = st.form_submit_button("Accedi", use_container_width=True)
+    if entra:
+        info = db["utenti"].get(user)
+        if info and info.get("attivo", True) and password_ok(pwd, info.get("password", "")):
+            st.session_state.update(username=user, ruolo=info["ruolo"], autenticato=True); st.rerun()
+        st.error("Credenziali non valide.")
+    st.warning("Primo accesso: admin / admin123. Cambia subito la password da Amministrazione.")
+
+def dashboard(db):
+    st.title("📊 Dashboard familiare")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Impegni", len(visibili(db["calendario"])))
+    c2.metric("Scadenze aperte", len([x for x in visibili(db["scadenze"]) if not x.get("completata")]))
+    saldo = sum(float(x.get("importo",0)) * (1 if x.get("tipo")=="Entrata" else -1) for x in visibili(db["movimenti"]))
+    c3.metric("Saldo", f"€ {saldo:,.2f}")
+    c4.metric("Spesa da comprare", len([x for x in visibili(db["spesa"]) if not x.get("acquistato")]))
+    st.subheader("Prossimi impegni")
+    prossimi = sorted([x for x in visibili(db["calendario"]) if x.get("data","") >= oggi()], key=lambda x:x.get("data",""))[:10]
+    st.dataframe(prossimi, use_container_width=True, hide_index=True)
+    st.subheader("Prossime scadenze")
+    prossime_scadenze = sorted([x for x in visibili(db["scadenze"]) if not x.get("completata") and x.get("data", "") >= oggi()], key=lambda x:x.get("data", ""))[:10]
+    st.dataframe(prossime_scadenze, use_container_width=True, hide_index=True)
+
+def calendario(db):
+    st.title("📅 Calendario e impegni")
+    with st.form("f_cal"):
+        c1,c2,c3=st.columns(3); titolo=c1.text_input("Impegno"); data=c2.date_input("Data"); ora=c3.time_input("Ora")
+        persona=st.selectbox("Persona", ["Tutta la famiglia"]+[x["nome"] for x in db["utenti"].values()]); note=st.text_area("Note"); condiviso=st.checkbox("Condiviso", True)
+        if st.form_submit_button("Salva impegno") and titolo:
+            registra(db,"calendario",{"titolo":titolo,"data":str(data),"ora":str(ora)[:5],"persona":persona,"note":note},condiviso); st.rerun()
+    tabella_con_elimina(db,"calendario",visibili(db["calendario"]),["data","ora","titolo","persona","note"])
+
+def finanze(db):
+    st.title("💶 Entrate, spese e budget")
+    with st.form("f_fin"):
+        c1,c2,c3=st.columns(3); tipo=c1.selectbox("Tipo",["Spesa","Entrata"]); data=c2.date_input("Data"); importo=c3.number_input("Importo €",min_value=0.0,step=1.0)
+        c4,c5=st.columns(2); categoria=c4.text_input("Categoria"); descrizione=c5.text_input("Descrizione"); condiviso=st.checkbox("Visibile alla famiglia",False)
+        if st.form_submit_button("Registra movimento") and importo>0:
+            registra(db,"movimenti",{"tipo":tipo,"data":str(data),"importo":importo,"categoria":categoria,"descrizione":descrizione},condiviso); st.rerun()
+    righe=visibili(db["movimenti"]); entrate=sum(float(x.get("importo",0)) for x in righe if x.get("tipo")=="Entrata"); spese=sum(float(x.get("importo",0)) for x in righe if x.get("tipo")=="Spesa")
+    mese=oggi()[:7]; spese_mese=sum(float(x.get("importo",0)) for x in righe if x.get("tipo")=="Spesa" and str(x.get("data","")).startswith(mese)); budget=float(db["config"].get("budget_mensile",0) or 0)
+    a,b,c,d=st.columns(4); a.metric("Entrate",f"€ {entrate:,.2f}"); b.metric("Spese",f"€ {spese:,.2f}"); c.metric("Saldo",f"€ {entrate-spese:,.2f}"); d.metric("Budget residuo mese",f"€ {budget-spese_mese:,.2f}" if budget else "Non impostato")
+    if budget:
+        st.progress(min(spese_mese/budget,1.0),text=f"Spese del mese: € {spese_mese:,.2f} su € {budget:,.2f}")
+        if spese_mese>budget: st.warning(f"Budget mensile superato di € {spese_mese-budget:,.2f}.")
+    tabella_con_elimina(db,"movimenti",righe,["data","tipo","categoria","descrizione","importo"])
+
+def spesa(db):
+    st.title("🛒 Lista della spesa")
+    with st.form("f_spesa"):
+        c1,c2,c3=st.columns(3); articolo=c1.text_input("Articolo"); quantita=c2.text_input("Quantità"); negozio=c3.text_input("Negozio")
+        if st.form_submit_button("Aggiungi") and articolo:
+            registra(db,"spesa",{"articolo":articolo,"quantita":quantita,"negozio":negozio,"acquistato":False},True); st.rerun()
+    for x in visibili(db["spesa"]):
+        c1,c2=st.columns([8,1]); nuovo=c1.checkbox(f"{x.get('articolo')} · {x.get('quantita')} · {x.get('negozio')}",value=x.get("acquistato",False),key=x["id"])
+        if nuovo != x.get("acquistato",False): x["acquistato"]=nuovo; salva(db); st.rerun()
+        if c2.button("🗑️",key="s"+x["id"]): elimina(db,"spesa",x["id"]); st.rerun()
+
+def scadenze(db):
+    st.title("⏰ Scadenze e promemoria")
+    with st.form("f_scad"):
+        c1,c2=st.columns(2); titolo=c1.text_input("Scadenza"); data=c2.date_input("Data"); note=st.text_area("Note"); condiviso=st.checkbox("Condivisa",True)
+        if st.form_submit_button("Salva") and titolo: registra(db,"scadenze",{"titolo":titolo,"data":str(data),"note":note,"completata":False},condiviso); st.rerun()
+    for x in visibili(db["scadenze"]):
+        c1,c2=st.columns([8,1]); nuovo=c1.checkbox(f"{x.get('data')} · {x.get('titolo')} · {x.get('note','')}",value=x.get("completata",False),key="scad_"+x["id"])
+        if nuovo != x.get("completata",False): x["completata"]=nuovo; salva(db); st.rerun()
+        if c2.button("🗑️",key="scad_del_"+x["id"]): elimina(db,"scadenze",x["id"]); st.rerun()
+
+def archivio(db, tipo):
+    media = tipo=="media"; st.title("📷 Foto e filmati" if media else "📁 Documenti importanti")
+    anno=st.selectbox("Anno",list(range(date.today().year+1,1999,-1))); evento=st.text_input("Evento / categoria"); descrizione=st.text_input("Descrizione")
+    if media:
+        st.subheader("📱 Carica dal telefono, tablet o computer")
+    files=st.file_uploader("Seleziona file",accept_multiple_files=True,type=None if media else ["pdf","doc","docx","jpg","jpeg","png","xlsx"])
+    condiviso=st.checkbox("Visibile alla famiglia",True)
+    if st.button("Carica su Google Drive",type="primary",disabled=not files or not evento):
+        ok=0
+        for f in files:
+            try:
+                out=drive_upload(db,f,["ARCHIVIO",str(anno),evento,"Foto e Video" if media else "Documenti"])
+                registra(db,tipo,{"anno":anno,"evento":evento,"descrizione":descrizione,"nome_file":out["name"],"drive_id":out["id"],"link":out.get("webViewLink","")},condiviso); ok+=1
+            except Exception as e: st.error(str(e)); break
+        if ok: st.success(f"Caricati {ok} file su Google Drive.")
+    if media:
+        st.divider(); st.subheader("🖼️ Importa da Google Foto")
+        st.caption("Seleziona anche molte foto e filmati insieme; il gestionale li copierà automaticamente nell'evento indicato sopra.")
+        if st.button("1. Avvia selezione Google Foto", disabled=not evento, use_container_width=True):
+            try:
+                sessione=photos_crea_sessione()
+                st.session_state["photos_session_id"]=sessione["id"]
+                st.session_state["photos_picker_uri"]=sessione["pickerUri"]
+            except Exception as exc: st.error(str(exc))
+        picker_uri=st.session_state.get("photos_picker_uri")
+        session_id=st.session_state.get("photos_session_id")
+        if picker_uri and session_id:
+            uri=picker_uri.rstrip("/")+"/autoclose"
+            st.link_button("2. Apri Google Foto e scegli i file",uri,use_container_width=True)
+            if st.button("3. Completa importazione",type="primary",use_container_width=True):
+                try:
+                    with st.spinner("Importazione da Google Foto e caricamento su Drive..."):
+                        importati,saltati,completata=photos_importa_selezione(db,session_id,anno,evento,descrizione,condiviso)
+                    if not completata: st.info("La selezione non è ancora terminata in Google Foto. Completala e riprova.")
+                    else:
+                        st.session_state.pop("photos_session_id",None); st.session_state.pop("photos_picker_uri",None)
+                        st.success(f"Importazione completata: {importati} file copiati su Drive"+(f", {saltati} già presenti." if saltati else "."))
+                except Exception as exc: st.error(str(exc))
+        st.divider()
+        st.subheader("☁️ Archivio automatico Dropbox")
+        st.caption(
+            "Aggiorna l'elenco con le foto e i filmati già copiati in "
+            "Google Drive dal collegamento Dropbox. I file non vengono duplicati."
+        )
+        scelta_dropbox = st.selectbox(
+            "Persona da sincronizzare",
+            ["Entrambi", "Papà", "Mamma"],
+            key="persona_sync_dropbox",
         )
         if st.button(
-            "Elimina veicolo selezionato", disabled=not confirm_vehicle_delete,
-            key=f"delete_vehicle_{event_id}_{selected_vehicle_id}", use_container_width=True,
+            "Sincronizza archivio Dropbox da Google Drive",
+            use_container_width=True,
         ):
-            with db() as conn:
-                conn.execute("DELETE FROM event_vehicles WHERE id = ? AND event_id = ?", (selected_vehicle_id, event_id))
-            st.success("Veicolo eliminato.")
-            st.rerun()
-    st.divider()
-    st.subheader("Elenco veicoli dell’evento")
-    columns = ["_id", "Stato", "Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Note"]
-    rows = []
-    for item in stored:
-        pickup = clean(item.get("pickup_date"))
-        rows.append({
-            "_id": item["id"], "Stato": "🟢" if pickup else "🔴",
-            "Gruppo": item.get("vehicle_group", ""), "Targa": item.get("plate", ""),
-            "Marca": item.get("brand", ""), "Modello": item.get("model", ""),
-            "Assegnata a": item.get("assigned_to", ""), "RA": item.get("ra", ""),
-            "Data ritiro": pickup, "Note": item.get("notes", ""),
-        })
-    source = pd.DataFrame(rows, columns=columns)
-    if source.empty:
-        source = pd.DataFrame(columns=columns)
-    total = len(stored)
-    collected = sum(bool(clean(item.get("pickup_date"))) for item in stored)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Veicoli assegnati", total, delta=f"su 40 previsti" if total <= 40 else "oltre 40 previsti")
-    m2.metric("Ritirati", collected)
-    m3.metric("Da ritirare", max(total - collected, 0))
-    edited = st.data_editor(
-        source,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        key=f"event_vehicle_editor_{event_id}",
-        column_config={
-            "_id": None,
-            "Stato": st.column_config.TextColumn("Ritiro", disabled=True, width="small", help="🟢 ritirata; 🔴 non ancora ritirata"),
-            "Gruppo": st.column_config.TextColumn("Gruppo", width="medium"),
-            "Targa": st.column_config.TextColumn("Targa", width="small"),
-            "Marca": st.column_config.TextColumn("Marca", width="medium"),
-            "Modello": st.column_config.TextColumn("Modello", width="medium"),
-            "Assegnata a": st.column_config.TextColumn("Assegnata a", width="medium"),
-            "RA": st.column_config.TextColumn("RA", width="small"),
-            "Data ritiro": st.column_config.TextColumn("Data ritiro", help="Esempio: 25/09/2026", width="small"),
-            "Note": st.column_config.TextColumn("Note", width="large"),
-        },
-        disabled=["Stato"],
-    )
-    st.caption("Puoi copiare più righe da Excel e incollarle nella prima cella. Usa il + in fondo per aggiungere una riga.")
-    export = edited.copy()
-    if "_id" in export.columns:
-        export = export.drop(columns=["_id"])
-    export["Stato"] = export.get("Data ritiro", pd.Series(dtype=str)).fillna("").astype(str).str.strip().map(
-        lambda value: "RITIRATA" if value else "DA RITIRARE"
-    )
-    export = export.sort_values(
-        ["Gruppo", "Targa", "Marca", "Modello"],
-        key=lambda column: column.fillna("").astype(str).str.upper(),
-    )
-    safe_event_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(records[event_id].title)).strip("_") or "evento"
-    d1, d2 = st.columns(2)
-    d1.download_button(
-        "Scarica elenco in Excel", table_to_excel(export, "Veicoli evento"),
-        f"veicoli_{safe_event_name}.xlsx", use_container_width=True,
-    )
-    d2.download_button(
-        "Scarica elenco in PDF", event_vehicles_to_pdf(export, str(records[event_id].title)),
-        f"veicoli_{safe_event_name}.pdf", mime="application/pdf", use_container_width=True,
-    )
-    if st.button("Salva elenco veicoli", type="primary", use_container_width=True):
-        saved_ids = []
-        now = datetime.now().isoformat(timespec="seconds")
-        with db() as conn:
-            for _, row in edited.fillna("").iterrows():
-                values = {name: clean(row.get(name, "")) for name in ["Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Note"]}
-                if not any(values.values()):
-                    continue
-                vehicle_id = clean(row.get("_id")) or str(uuid.uuid4())
-                saved_ids.append(vehicle_id)
-                conn.execute(
-                    """
-                    INSERT INTO event_vehicles
-                    (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        vehicle_group=excluded.vehicle_group,plate=excluded.plate,brand=excluded.brand,
-                        model=excluded.model,assigned_to=excluded.assigned_to,ra=excluded.ra,
-                        pickup_date=excluded.pickup_date,notes=excluded.notes,updated_at=excluded.updated_at
-                    """,
-                    (vehicle_id, event_id, values["Gruppo"], upper(values["Targa"]), values["Marca"],
-                     values["Modello"], values["Assegnata a"], upper(values["RA"]),
-                     values["Data ritiro"], values["Note"], now),
-                )
-            if saved_ids:
-                placeholders = ",".join("?" for _ in saved_ids)
-                conn.execute(
-                    f"DELETE FROM event_vehicles WHERE event_id = ? AND id NOT IN ({placeholders})",
-                    [event_id] + saved_ids,
-                )
-            else:
-                conn.execute("DELETE FROM event_vehicles WHERE event_id = ?", (event_id,))
-        st.success(f"Elenco salvato: {len(saved_ids)} veicoli.")
-        st.rerun()
-
-
-def import_backup():
-    st.header("Importazione e backup")
-    st.subheader("Backup completo")
-    if DB_PATH.exists():
-        st.download_button("Scarica database", DB_PATH.read_bytes(), "ancillary_backup.db", mime="application/octet-stream", use_container_width=True)
-    st.caption("Conserva periodicamente il file di backup in una posizione sicura.")
-    st.subheader("Importazione intelligente da Excel")
-    st.caption("Il gestionale riconosce automaticamente riepiloghi ancillary, report Analisi Contratti RA e file Addebito Danni.")
-    upload = st.file_uploader("Carica un file Excel", type=["xlsx"])
-    if upload:
-        file_bytes = upload.getvalue()
-        detected = detect_excel_type(file_bytes)
-        labels = {
-            "ANCILLARY": "Riepilogo ancillary", "CONTRATTI_RA": "Analisi Contratti RA",
-            "ADDEBITO_DANNI": "Riepilogo addebito danni", "SCONOSCIUTO": "Formato non riconosciuto",
-        }
-        st.info(f"Formato rilevato: **{labels[detected]}**")
-        if st.button("Importa, scorpora e analizza", type="primary", disabled=detected == "SCONOSCIUTO", use_container_width=True):
-            if detected == "CONTRATTI_RA":
-                added, main_sheet, period = import_contract_workbook(file_bytes, upload.name)
-                st.success(f"Importati o aggiornati {added} contratti del periodo {period}. Foglio principale: {main_sheet}.")
-                st.rerun()
-            if detected == "ADDEBITO_DANNI":
-                added, skipped = import_damage_workbook(file_bytes, upload.name)
-                st.success(f"Importate o aggiornate {added} segnalazioni danni.")
-                if skipped:
-                    st.info(f"Escluse {skipped} righe senza numero RA.")
-                st.rerun()
-            imported = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, dtype=object)
-            added = 0
-            skipped_before_start = 0
-            for _, row in imported.iterrows():
-                days = pd.to_numeric(row.get("GIORNI NOLEGGIO"), errors="coerce")
-                cost = pd.to_numeric(row.get("COSTO TOTALE ANCILLARY (iva esclusa)"), errors="coerce")
-                start = pd.to_datetime(row.get("DATA INIZIO NOLEGGIO"), errors="coerce")
-                if pd.notna(start) and start.date() < ANCILLARY_START_DATE:
-                    skipped_before_start += 1
-                    continue
-                vehicle = upper(row.get("TIPO DI VEICOLO"))
-                ancillary = upper(row.get("SCELTA ANCILLARY (CAR)")) or upper(row.get("SCELTA ANCILLARY (VAN)"))
-                save_record({
-                    "ra": row.get("RA (Rental Agreement)"),
-                    "start_date": "" if pd.isna(start) else start.date().isoformat(),
-                    "rental_days": 0 if pd.isna(days) else int(days),
-                    "source_raw": row.get("FONTE"), "operator": row.get("OPERATORE"),
-                    "vehicle_type": vehicle, "ancillary": ancillary,
-                    "ancillary_cost": None if pd.isna(cost) else float(cost),
-                    "rental_type": row.get("TIPO NOLEGGIO"), "notes": "Importato da Excel",
-                })
-                added += 1
-            st.success(f"Importati {added} record ancillary.")
-            if skipped_before_start:
-                st.info(f"Esclusi {skipped_before_start} record anteriori al 01/10/2026.")
-            st.rerun()
-
-
-def operator_settings():
-    st.header("Configurazione operatori")
-    st.caption("Gli operatori attivi compaiono nella tendina del modulo di inserimento. Lo storico non viene modificato.")
-
-    with st.form("add_operator", clear_on_submit=True):
-        new_operator = st.text_input("Nuovo operatore")
-        add_operator = st.form_submit_button("Aggiungi operatore", type="primary", use_container_width=True)
-    if add_operator:
-        name = upper(new_operator)
-        if not name:
-            st.error("Inserisci il nome dell’operatore.")
-        else:
-            with db() as conn:
-                conn.execute(
-                    "INSERT INTO operator_config (name, active) VALUES (?, 1) "
-                    "ON CONFLICT(name) DO UPDATE SET active = 1",
-                    (name,),
-                )
-            st.success(f"Operatore {name} disponibile nel modulo.")
-            st.rerun()
-
-    rows = configured_operators(active_only=False)
-    if not rows:
-        st.info("Nessun operatore configurato.")
-        return
-
-    st.subheader("Operatori configurati")
-    st.dataframe(
-        pd.DataFrame(rows).rename(columns={"name": "Operatore", "active": "Attivo"}),
-        use_container_width=True,
-        hide_index=True,
-        column_config={"Attivo": st.column_config.CheckboxColumn()},
-    )
-    selected_name = st.selectbox("Operatore da gestire", [row["name"] for row in rows])
-    selected_row = next(row for row in rows if row["name"] == selected_name)
-    c1, c2 = st.columns(2)
-    renamed = c1.text_input("Nuovo nome", value=selected_name, key=f"rename_{selected_name}")
-    active = c2.checkbox("Attivo nella tendina", value=bool(selected_row["active"]), key=f"active_{selected_name}")
-    if st.button("Salva modifiche operatore", type="primary", use_container_width=True):
-        new_name = upper(renamed)
-        if not new_name:
-            st.error("Il nome non può essere vuoto.")
-        else:
             try:
-                with db() as conn:
-                    conn.execute(
-                        "UPDATE operator_config SET name = ?, active = ? WHERE name = ?",
-                        (new_name, int(active), selected_name),
-                    )
-                    if new_name != selected_name:
-                        conn.execute("UPDATE rentals SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
-                        conn.execute("UPDATE contracts SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
-                        conn.execute("UPDATE damage_charges SET operator = ? WHERE UPPER(TRIM(operator)) = ?", (new_name, selected_name))
-                st.success("Operatore aggiornato.")
-                st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("Esiste già un operatore con questo nome.")
-
-    confirm_delete = st.checkbox("Confermo la rimozione dalla configurazione")
-    if st.button("Elimina operatore", disabled=not confirm_delete, use_container_width=True):
-        with db() as conn:
-            conn.execute("DELETE FROM operator_config WHERE name = ?", (selected_name,))
-        st.success("Operatore rimosso dalla tendina. I dati storici restano invariati.")
-        st.rerun()
-
-
-def user_settings():
-    st.header("Utenti e autorizzazioni")
-    if not user_is_admin():
-        st.error("Questa funzione è riservata agli amministratori.")
-        return
-
-    st.caption("Crea gli accessi personali, collega l’operatore e scegli le aree visibili nel menu.")
-    operator_names = [row["name"] for row in configured_operators()]
-
-    with st.expander("Crea un nuovo utente", expanded=True):
-        with st.form("create_app_user", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            username = c1.text_input("Username *")
-            display_name = c2.text_input("Nome visualizzato *")
-            c3, c4 = st.columns(2)
-            password = c3.text_input("Password iniziale *", type="password")
-            operator_name = c4.selectbox("Operatore collegato", [""] + operator_names)
-            permissions = st.multiselect("Aree autorizzate *", PERMISSION_AREAS)
-            is_admin = st.checkbox("Amministratore: accesso completo e gestione utenti")
-            submitted = st.form_submit_button("Crea utente", type="primary", use_container_width=True)
-        if submitted:
-            normalized_username = clean(username).lower()
-            if not normalized_username or not display_name:
-                st.error("Inserisci username e nome visualizzato.")
-            elif len(password) < 8:
-                st.error("La password deve contenere almeno 8 caratteri.")
-            elif not is_admin and not permissions:
-                st.error("Seleziona almeno un’area autorizzata.")
-            else:
-                try:
-                    with db() as conn:
-                        conn.execute(
-                            """
-                            INSERT INTO app_users
-                            (username, password_hash, display_name, operator_name, permissions, active, is_admin, created_at)
-                            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                            """,
-                            (
-                                normalized_username, password_hash(password), clean(display_name),
-                                upper(operator_name), json.dumps(permissions), int(is_admin),
-                                datetime.now().isoformat(timespec="seconds"),
-                            ),
-                        )
-                    st.success(f"Utente {normalized_username} creato.")
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("Questo username esiste già.")
-
-    with db() as conn:
-        users = [dict(row) for row in conn.execute("SELECT * FROM app_users ORDER BY username").fetchall()]
-    if not users:
-        st.info("Non sono ancora presenti utenti personali. L’accesso admin configurato nei Secrets resta attivo.")
-        return
-
-    summary = pd.DataFrame([
-        {
-            "Username": row["username"], "Nome": row["display_name"],
-            "Operatore": row["operator_name"], "Aree": " · ".join(json.loads(row["permissions"] or "[]")),
-            "Amministratore": bool(row["is_admin"]), "Attivo": bool(row["active"]),
-        }
-        for row in users
-    ])
-    st.subheader("Utenti configurati")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    selected_username = st.selectbox("Utente da modificare", [row["username"] for row in users])
-    selected = next(row for row in users if row["username"] == selected_username)
-    selected_permissions = json.loads(selected["permissions"] or "[]")
-    with st.form(f"edit_user_{selected_username}"):
-        c1, c2 = st.columns(2)
-        edited_name = c1.text_input("Nome visualizzato", value=selected["display_name"] or "")
-        existing_operator = upper(selected["operator_name"])
-        edit_operator_options = [""] + operator_names
-        if existing_operator and existing_operator not in edit_operator_options:
-            edit_operator_options.append(existing_operator)
-        edited_operator = c2.selectbox(
-            "Operatore collegato", edit_operator_options,
-            index=edit_operator_options.index(existing_operator) if existing_operator in edit_operator_options else 0,
-        )
-        edited_permissions = st.multiselect("Aree autorizzate", PERMISSION_AREAS, default=selected_permissions)
-        c3, c4 = st.columns(2)
-        edited_admin = c3.checkbox("Amministratore", value=bool(selected["is_admin"]))
-        edited_active = c4.checkbox("Utente attivo", value=bool(selected["active"]))
-        new_password = st.text_input("Nuova password (lascia vuoto per non cambiarla)", type="password")
-        save_user = st.form_submit_button("Salva modifiche", type="primary", use_container_width=True)
-    if save_user:
-        if not edited_name:
-            st.error("Il nome visualizzato è obbligatorio.")
-        elif new_password and len(new_password) < 8:
-            st.error("La nuova password deve contenere almeno 8 caratteri.")
-        elif not edited_admin and not edited_permissions:
-            st.error("Seleziona almeno un’area autorizzata.")
-        else:
-            with db() as conn:
-                conn.execute(
-                    """
-                    UPDATE app_users SET display_name = ?, operator_name = ?, permissions = ?,
-                    active = ?, is_admin = ? WHERE username = ?
-                    """,
-                    (
-                        clean(edited_name), upper(edited_operator), json.dumps(edited_permissions),
-                        int(edited_active), int(edited_admin), selected_username,
-                    ),
+                with st.spinner("Lettura dell'archivio Google Drive..."):
+                    persone = ["Papà", "Mamma"] if scelta_dropbox == "Entrambi" else [scelta_dropbox]
+                    aggiunti = gia_presenti = 0
+                    for persona_dropbox in persone:
+                        nuovi, presenti = sincronizza_archivio_dropbox(db, persona_dropbox)
+                        aggiunti += nuovi
+                        gia_presenti += presenti
+                st.success(
+                    f"Sincronizzazione completata: {aggiunti} nuovi file registrati, "
+                    f"{gia_presenti} già presenti."
                 )
-                if new_password:
-                    conn.execute(
-                        "UPDATE app_users SET password_hash = ? WHERE username = ?",
-                        (password_hash(new_password), selected_username),
-                    )
-            st.success("Utente aggiornato.")
-            st.rerun()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Sincronizzazione archivio non riuscita: {exc}")
+    righe=visibili(db[tipo])
+    if media:
+        dati_aggiornati = False
+        for riga_media in righe:
+            if not riga_media.get("data_scatto"):
+                data_rilevata = data_ora_da_nome_file(riga_media.get("nome_file", ""))
+                if data_rilevata:
+                    riga_media["data_scatto"] = data_rilevata
+                    dati_aggiornati = True
+            titolo_esistente = str(riga_media.get("titolo", "")).strip()
+            parole_esistenti = str(riga_media.get("parole_chiave", "")).strip()
+            if parole_esistenti and re.fullmatch(r"\d{4}-\d{2}-\d{2}[ .:_-]*\d{2}[ .:_-]*\d{2}[ .:_-]*\d{2}", titolo_esistente):
+                riga_media["titolo"] = parole_esistenti
+                titolo_esistente = parole_esistenti
+                dati_aggiornati = True
+            if "DA_CLASSIFICARE" in str(riga_media.get("evento", "")).upper() and titolo_esistente:
+                riga_media["evento"] = titolo_esistente
+                dati_aggiornati = True
+        if dati_aggiornati:
+            salva(db)
+    if not righe: st.info("Nessun file archiviato."); return
+    anni=["Tutti"]+[str(x) for x in sorted({r.get("anno") for r in righe},reverse=True)]
+    eventi=["Tutti"]+sorted({str(r.get("evento","")) for r in righe if r.get("evento")})
+    filtro_anno=st.selectbox("Filtra per anno",anni,key="anno_"+tipo); filtro_evento=st.selectbox("Filtra per evento",eventi,key="evento_"+tipo)
+    filtro_persona = "Tutti"
+    if media:
+        persone = ["Tutti"] + sorted({str(r.get("persona", "Famiglia")) for r in righe})
+        filtro_persona = st.selectbox("Filtra per persona", persone, key="persona_"+tipo)
+    filtrate=[r for r in righe if (filtro_anno=="Tutti" or str(r.get("anno"))==filtro_anno) and (filtro_evento=="Tutti" or r.get("evento")==filtro_evento) and (filtro_persona=="Tutti" or str(r.get("persona", "Famiglia"))==filtro_persona)]
+    if media and filtrate:
+        modulo_classificazione_multipla(db, filtrate)
+        st.divider()
+        st.subheader("👁️ Visualizza foto o filmato")
+        opzioni_anteprima = {
+            " · ".join(filter(None, [
+                str(r.get("persona", "Famiglia")),
+                str(r.get("categoria", "Da classificare")),
+                str(r.get("luogo", "")),
+                str(r.get("titolo", r.get("nome_file", "File"))),
+                str(r.get("data_scatto", "")),
+            ])): r
+            for r in filtrate if r.get("drive_id")
+        }
+        scelta_anteprima = st.selectbox(
+            "Scegli il file da visualizzare",
+            [""] + list(opzioni_anteprima),
+            key="anteprima_media",
+        )
+        if scelta_anteprima:
+            elemento = opzioni_anteprima[scelta_anteprima]
+            if elemento.get("link"):
+                st.link_button("↗️ Apri su Google Drive", elemento["link"], use_container_width=True)
+            try:
+                with st.spinner("Caricamento anteprima..."):
+                    info_file, contenuto_file = drive_leggi_anteprima(elemento["drive_id"])
+                mime = str(info_file.get("mimeType", ""))
+                if mime.startswith("image/") and mime not in {"image/heic", "image/heif"}:
+                    st.image(contenuto_file, caption=info_file.get("name", "Foto"), use_container_width=True)
+                elif mime.startswith("video/"):
+                    st.video(contenuto_file, format=mime)
+                else:
+                    st.info("Anteprima non disponibile per questo formato. Usa il pulsante Apri su Google Drive.")
+            except Exception as exc:
+                st.warning(f"Anteprima non disponibile: {exc}")
+            st.subheader("🏷️ Classifica e rinomina")
+            nome_corrente = str(elemento.get("nome_file", "File"))
+            estensione = Path(nome_corrente).suffix
+            nome_base = Path(nome_corrente).stem
+            categorie = [
+                "Da classificare", "Famiglia", "Vacanze", "Compleanni",
+                "Feste", "Scuola", "Sport", "Viaggi", "Ricordi", "Altro",
+            ]
+            categoria_corrente = str(elemento.get("categoria", "Da classificare"))
+            if categoria_corrente not in categorie:
+                categorie.append(categoria_corrente)
+            with st.form("classifica_" + str(elemento.get("id", elemento.get("drive_id", "file")))):
+                nuovo_luogo = st.text_input(
+                    "Luogo (es. Napoli)",
+                    value=str(elemento.get("luogo", "")),
+                )
+                nuovo_titolo = st.text_input(
+                    "Titolo (es. Matrimonio Fabio)",
+                    value=str(elemento.get("titolo", nome_base)),
+                )
+                st.text_input(
+                    "Data e ora della foto/filmato",
+                    value=str(elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)),
+                    disabled=True,
+                )
+                nuova_categoria = st.selectbox(
+                    "Categoria",
+                    categorie,
+                    index=categorie.index(categoria_corrente),
+                )
+                nuove_parole = st.text_input(
+                    "Parole chiave (separate da virgola)",
+                    value=str(elemento.get("parole_chiave", "")),
+                    placeholder="es. mare, estate, nonni",
+                )
+                rinomina_drive = st.checkbox("Rinomina anche il file su Google Drive", True)
+                salva_classificazione = st.form_submit_button(
+                    "Salva classificazione",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if salva_classificazione:
+                titolo_pulito = nuovo_titolo.strip()
+                if not titolo_pulito:
+                    st.error("Inserisci un titolo.")
+                else:
+                    try:
+                        luogo_pulito = nuovo_luogo.strip()
+                        nome_finale = f"{luogo_pulito} - {titolo_pulito}" if luogo_pulito else titolo_pulito
+                        if estensione and not nome_finale.lower().endswith(estensione.lower()):
+                            nome_finale += estensione
+                        if rinomina_drive:
+                            risultato_nome = drive_rinomina_file(elemento["drive_id"], nome_finale)
+                            elemento["nome_file"] = risultato_nome.get("name", nome_finale)
+                        elemento["titolo"] = titolo_pulito
+                        elemento["luogo"] = luogo_pulito
+                        if "DA_CLASSIFICARE" in str(elemento.get("evento", "")).upper():
+                            elemento["evento"] = titolo_pulito
+                        elemento["data_scatto"] = elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)
+                        elemento["categoria"] = nuova_categoria
+                        elemento["parole_chiave"] = nuove_parole.strip()
+                        elemento["classificato_il"] = datetime.now().isoformat(timespec="seconds")
+                        drive_aggiungi_ad_album_esistente(db, elemento)
+                        salva(db)
+                        st.success("Foto o filmato classificato correttamente.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Classificazione non riuscita: {exc}")
+    colonne = ["anno","evento","descrizione","nome_file","link"]
+    if media:
+        colonne = ["persona", "categoria", "luogo", "titolo", "data_scatto"] + colonne
+    tabella_con_elimina(db,tipo,filtrate,colonne)
+    if media:
+        modulo_album_eventi(db, filtrate)
+        modulo_crea_ricordo(db, filtrate)
 
-    confirm_delete = st.checkbox(f"Confermo l’eliminazione dell’utente {selected_username}")
-    if st.button("Elimina utente", disabled=not confirm_delete, use_container_width=True):
-        with db() as conn:
-            conn.execute("DELETE FROM app_users WHERE username = ?", (selected_username,))
-        st.success("Utente eliminato.")
+def semplice(db, raccolta, titolo, campi, condiviso_default):
+    st.title(titolo)
+    with st.form("f_"+raccolta):
+        vals={}
+        for key,label,kind in campi:
+            vals[key]=st.date_input(label) if kind=="date" else st.text_area(label) if kind=="area" else st.text_input(label)
+        condiviso=st.checkbox("Condiviso",condiviso_default)
+        if st.form_submit_button("Salva") and str(vals[campi[0][0]]).strip():
+            vals={k:str(v) for k,v in vals.items()}; registra(db,raccolta,vals,condiviso); st.rerun()
+    if raccolta=="faccende":
+        for x in visibili(db[raccolta]):
+            c1,c2=st.columns([8,1]); nuovo=c1.checkbox(f"{x.get('data')} · {x.get('titolo')} · {x.get('persona')} · {x.get('note','')}",value=x.get("completata",False),key="fac_"+x["id"])
+            if nuovo != x.get("completata",False): x["completata"]=nuovo; salva(db); st.rerun()
+            if c2.button("🗑️",key="fac_del_"+x["id"]): elimina(db,raccolta,x["id"]); st.rerun()
+    else:
+        tabella_con_elimina(db,raccolta,visibili(db[raccolta]),[x[0] for x in campi])
+
+def amministrazione(db):
+    st.title("⚙️ Amministrazione")
+    if not admin(): st.error("Sezione riservata agli amministratori."); return
+    st.subheader("Componenti della famiglia")
+    st.dataframe([{"Utente":u,"Nome":x["nome"],"Ruolo":x["ruolo"],"Attivo":x.get("attivo",True)} for u,x in db["utenti"].items()],hide_index=True,use_container_width=True)
+    scelto=st.selectbox("Utente da aggiornare",list(db["utenti"])); info=db["utenti"][scelto]
+    with st.form("utenti"):
+        nome=st.text_input("Nome visualizzato",info["nome"]); ruolo=st.selectbox("Ruolo",["amministratore","adulto","figlio"],index=["amministratore","adulto","figlio"].index(info["ruolo"])); pwd=st.text_input("Nuova password",type="password"); attivo=st.checkbox("Account attivo",info.get("attivo",True))
+        if st.form_submit_button("Aggiorna utente"):
+            info.update(nome=nome,ruolo=ruolo,attivo=attivo)
+            if pwd: info["password"]=password_hash(pwd)
+            salva(db); st.success("Utente aggiornato.")
+    folder=st.text_input("ID cartella principale Google Drive",db["config"].get("drive_folder_id",""))
+    if st.button("Salva configurazione Drive"): db["config"]["drive_folder_id"]=folder.strip(); salva(db); st.success("Configurazione salvata.")
+    budget=st.number_input("Budget familiare mensile €",min_value=0.0,value=float(db["config"].get("budget_mensile",0) or 0),step=50.0)
+    if st.button("Salva budget mensile"): db["config"]["budget_mensile"]=budget; salva(db); st.success("Budget mensile salvato.")
+    st.subheader("Stato Google Drive")
+    if st.session_state.get("drive_sync_error"): st.error(st.session_state["drive_sync_error"])
+    else: st.success(st.session_state.get("drive_sync_status","Google Drive configurato"))
+
+def backup(db):
+    st.title("💾 Backup")
+    payload=json.dumps(db,ensure_ascii=False,indent=2).encode()
+    st.download_button("Scarica backup JSON",payload,f"gestionale_famiglia_{oggi()}.json","application/json",use_container_width=True)
+    if st.button("Crea backup su Google Drive",type="primary"):
+        class F:
+            name=f"gestionale_famiglia_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"; type="application/json"
+            def getvalue(self): return payload
+        try:
+            out=drive_upload(db,F(),["BACKUP"]); st.success(f"Backup creato: {out['name']}")
+        except Exception as e: st.error(str(e))
+
+db=carica()
+if not st.session_state.get("autenticato"):
+    login(db); st.stop()
+
+try:
+    backup_giornaliero(db)
+    st.session_state.pop("backup_giornaliero_error",None)
+except Exception as exc:
+    st.session_state["backup_giornaliero_error"]=str(exc)
+
+info=db["utenti"][utente()]
+with st.sidebar:
+    st.title("🏠 Gestionale Famiglia"); st.write(f"👤 **{info['nome']}**"); st.caption(info["ruolo"].title())
+    if st.session_state.get("drive_sync_error"): st.error("Sincronizzazione Drive non riuscita")
+    else: st.success("Google Drive sincronizzato")
+    if st.session_state.get("backup_giornaliero_error"): st.warning("Backup giornaliero da verificare")
+    opzioni=list(SEZIONI)
+    if not admin(): opzioni.remove("⚙️ Amministrazione")
+    scelta=st.radio("Menu",opzioni)
+    if st.button("Esci",use_container_width=True):
+        for k in ["autenticato","username","ruolo"]: st.session_state.pop(k,None)
         st.rerun()
 
-
-def login():
-    configured = str(st.secrets.get("ADMIN_PASSWORD", "") or "").strip()
-    if st.session_state.get("authenticated"):
-        if "current_user" not in st.session_state:
-            st.session_state["current_user"] = {
-                "username": "admin", "display_name": "Amministratore", "operator_name": "",
-                "permissions": PERMISSION_AREAS, "is_admin": True,
-            }
-        return True
-    st.title("Gestionale Ancillary")
-    username = st.text_input("Username", value="admin")
-    password = st.text_input("Password", type="password")
-    if st.button("Accedi", type="primary", use_container_width=True):
-        normalized_username = clean(username).lower()
-        if normalized_username == "admin" and configured and hmac.compare_digest(password, configured):
-            st.session_state["authenticated"] = True
-            st.session_state["current_user"] = {
-                "username": "admin", "display_name": "Amministratore", "operator_name": "",
-                "permissions": PERMISSION_AREAS, "is_admin": True,
-            }
-            st.rerun()
-        with db() as conn:
-            row = conn.execute(
-                "SELECT * FROM app_users WHERE username = ? AND active = 1", (normalized_username,)
-            ).fetchone()
-        if row and password_matches(password, row["password_hash"]):
-            st.session_state["authenticated"] = True
-            st.session_state["current_user"] = {
-                "username": row["username"], "display_name": row["display_name"],
-                "operator_name": row["operator_name"],
-                "permissions": json.loads(row["permissions"] or "[]"), "is_admin": bool(row["is_admin"]),
-            }
-            st.rerun()
-        st.error("Username o password errati.")
-    if not configured:
-        with db() as conn:
-            user_count = conn.execute("SELECT COUNT(*) FROM app_users WHERE active = 1").fetchone()[0]
-        if user_count == 0:
-            st.warning("Configura ADMIN_PASSWORD nei Secrets per attivare il primo accesso amministratore.")
-    return False
-
-
-init_db()
-if not login():
-    st.stop()
-
-st.title("Gestionale Noleggi, Ancillary e Danni")
-st.caption("Importazione automatica dei report, archivio contratti, statistiche, ancillary e addebito danni")
-all_data = load_data()
-all_contracts = load_contracts()
-all_damages = load_damages()
-all_cash_movements = load_cash_movements()
-all_special_events = load_special_events()
-
-navigation = {
-    "ANCILLARY": [
-        ("📊 Dashboard ancillary", "Dashboard ancillary"),
-        ("📈 Analisi ancillary RA", "Analisi ancillary RA"),
-        ("🗂️ Archivio ancillary", "Archivio ancillary"),
-        ("➕ Inserimento ancillary", "Inserimento ancillary"),
-    ],
-    "CONTRATTI RA": [
-        ("📊 Analisi contratti RA", "Analisi contratti RA"),
-        ("🗂️ Archivio contratti RA", "Archivio contratti RA"),
-        ("🔀 Analisi incrociata", "Analisi incrociata"),
-    ],
-    "ADDEBITO DANNI": [
-        ("📱 Check-in rapido danni", "Check-in rapido danni"),
-        ("📊 Analisi addebito danni", "Analisi addebito danni"),
-        ("🗂️ Archivio addebito danni", "Archivio addebito danni"),
-        ("➕ Inserimento addebito danni", "Inserimento addebito danni"),
-    ],
-    "CASSA": [
-        ("📊 Dashboard cassa", "Dashboard cassa"),
-        ("➕ Inserimento movimento", "Inserimento movimento cassa"),
-        ("🗂️ Archivio movimenti", "Archivio movimenti cassa"),
-        ("🧮 Conteggio e chiusura", "Conteggio e chiusura cassa"),
-        ("📥 Importazione storico", "Importazione storico cassa"),
-    ],
-    "EVENTI SPECIALI": [
-        ("📊 Dashboard eventi", "Dashboard eventi speciali"),
-        ("➕ Crea evento", "Crea evento speciale"),
-        ("📅 Calendario eventi", "Calendario eventi speciali"),
-        ("🚗 Veicoli evento", "Veicoli eventi speciali"),
-        ("👥 Partecipanti e personale", "Partecipanti eventi speciali"),
-        ("📎 Documenti e fotografie", "Allegati eventi speciali"),
-        ("🗂️ Archivio eventi", "Archivio eventi speciali"),
-    ],
-    "AMMINISTRAZIONE": [
-        ("🔐 Utenti e autorizzazioni", "Utenti e autorizzazioni"),
-        ("👥 Configurazione operatori", "Configurazione operatori"),
-        ("💾 Importazione e backup", "Importazione e backup"),
-    ],
-}
-
-visible_navigation = {
-    area: functions for area, functions in navigation.items() if area in allowed_areas()
-}
-if not user_is_admin() and "AMMINISTRAZIONE" in visible_navigation:
-    visible_navigation["AMMINISTRAZIONE"] = [
-        item for item in visible_navigation["AMMINISTRAZIONE"] if item[1] != "Utenti e autorizzazioni"
-    ]
-
-visible_pages = [page_name for functions in visible_navigation.values() for _, page_name in functions]
-if not visible_pages:
-    st.error("Questo utente non ha aree autorizzate. Contatta l’amministratore.")
-    st.stop()
-if st.session_state.get("navigation_page") not in visible_pages:
-    st.session_state.navigation_page = visible_pages[0]
-
-logged_user = current_user()
-st.sidebar.success(f"👤 {logged_user.get('display_name') or logged_user.get('username')}")
-if st.sidebar.button("Esci", use_container_width=True):
-    for key in ["authenticated", "current_user", "navigation_page"]:
-        st.session_state.pop(key, None)
-    st.rerun()
-st.sidebar.subheader("Menu")
-for area, functions in visible_navigation.items():
-    area_pages = [page_name for _, page_name in functions]
-    with st.sidebar.expander(area, expanded=st.session_state.navigation_page in area_pages):
-        for button_label, page_name in functions:
-            if st.button(
-                button_label,
-                key=f"nav_{area}_{page_name}",
-                type="primary" if st.session_state.navigation_page == page_name else "secondary",
-                use_container_width=True,
-            ):
-                st.session_state.navigation_page = page_name
-                st.rerun()
-
-page = st.session_state.navigation_page
-
-# I filtri generali ancillary sono mostrati solo nelle pagine che li usano.
-if page in {"Dashboard ancillary", "Archivio ancillary"} and not all_data.empty:
-    filtered = filters(all_data)
-else:
-    filtered = all_data
-
-if page == "Dashboard ancillary":
-    dashboard(filtered)
-elif page == "Analisi contratti RA":
-    contracts_dashboard(all_contracts)
-elif page == "Analisi ancillary RA":
-    ancillary_ra_dashboard(all_contracts)
-elif page == "Analisi incrociata":
-    combined_analysis(all_contracts, all_data)
-elif page == "Analisi addebito danni":
-    damage_dashboard(all_damages)
-elif page == "Archivio addebito danni":
-    damage_archive(all_damages)
-elif page == "Inserimento addebito danni":
-    damage_form(all_damages)
-elif page == "Check-in rapido danni":
-    quick_damage_checkin()
-elif page == "Dashboard cassa":
-    cash_dashboard(all_cash_movements)
-elif page == "Inserimento movimento cassa":
-    cash_movement_form(all_cash_movements)
-elif page == "Archivio movimenti cassa":
-    cash_archive(all_cash_movements)
-elif page == "Conteggio e chiusura cassa":
-    cash_closing_page(all_cash_movements)
-elif page == "Importazione storico cassa":
-    cash_import_page()
-elif page == "Dashboard eventi speciali":
-    special_events_dashboard(all_special_events)
-elif page == "Crea evento speciale":
-    special_event_form(all_special_events)
-elif page == "Calendario eventi speciali":
-    events_calendar(all_special_events)
-elif page == "Veicoli eventi speciali":
-    event_vehicles_page(all_special_events)
-elif page == "Partecipanti eventi speciali":
-    event_participants_page(all_special_events)
-elif page == "Allegati eventi speciali":
-    event_files_page(all_special_events)
-elif page == "Archivio eventi speciali":
-    events_archive(all_special_events)
-elif page == "Archivio ancillary":
-    archive(filtered)
-elif page == "Archivio contratti RA":
-    contracts_archive(all_contracts)
-elif page == "Inserimento ancillary":
-    record_form(all_data)
-elif page == "Configurazione operatori":
-    operator_settings()
-elif page == "Utenti e autorizzazioni":
-    user_settings()
-else:
-    import_backup()
+sez=SEZIONI[scelta]
+if sez=="dashboard": dashboard(db)
+elif sez=="calendario": calendario(db)
+elif sez=="finanze": finanze(db)
+elif sez=="spesa": spesa(db)
+elif sez=="scadenze": scadenze(db)
+elif sez in ["media","documenti"]: archivio(db,sez)
+elif sez=="attivita": semplice(db,"attivita","🎓 Attività scolastiche e sportive",[("titolo","Attività","text"),("data","Data","date"),("persona","Persona","text"),("note","Note","area")],True)
+elif sez=="salute": semplice(db,"salute","🩺 Farmaci e visite mediche",[("titolo","Farmaco / visita","text"),("data","Data","date"),("persona","Persona","text"),("note","Indicazioni","area")],False)
+elif sez=="faccende": semplice(db,"faccende","🧹 Faccende domestiche",[("titolo","Faccenda","text"),("data","Scadenza","date"),("persona","Assegnata a","text"),("note","Note","area")],True)
+elif sez=="admin": amministrazione(db)
+elif sez=="backup": backup(db)
