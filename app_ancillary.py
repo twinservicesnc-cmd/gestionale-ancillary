@@ -1035,7 +1035,7 @@ def documents_page():
     choices = {f"{r['number']} · {r['document_date']} · {r['destination'] or 'senza destinazione'}": r for r in docs}
     selected_label = st.selectbox("Documento", ["Nuovo DDT"] + list(choices))
     selected = choices.get(selected_label)
-    if st.session_state.get("ddt_selected_id") != (selected["id"] if selected else None):
+    if "ddt_selected_id" not in st.session_state or st.session_state.ddt_selected_id != (selected["id"] if selected else None):
         st.session_state.ddt_selected_id = selected["id"] if selected else None
         st.session_state.ddt_number = selected["number"] if selected else ""
         st.session_state.ddt_date = date.fromisoformat(selected["document_date"]) if selected else date.today()
