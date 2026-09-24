@@ -1188,8 +1188,21 @@ def documents_page():
     with db() as conn:
         docs = conn.execute("SELECT * FROM transport_documents ORDER BY document_date DESC, created_at DESC").fetchall()
     choices = {f"{r['number']} · {r['document_date']} · {r['destination'] or 'senza destinazione'}": r for r in docs}
-    selected_label = st.selectbox("Documento", ["Nuovo DDT"] + list(choices))
+    options = list(choices) + ["➕ Nuovo DDT"]
+    selected_label = st.selectbox("Apri un DDT salvato o creane uno nuovo", options, key="ddt_document_selector_v2")
     selected = choices.get(selected_label)
+    if selected:
+        st.info(f"DDT {selected['number']} aperto. Modifica i campi qui sotto e premi «Salva modifiche». Più in basso trovi timbro, firme, PDF, Excel, stampa ed eliminazione.")
+        quick_pdf = ddt_pdf(selected)
+        left, right = st.columns(2)
+        left.download_button("📄 Scarica PDF", quick_pdf,
+                             f"DDT_{re.sub(r'[^A-Za-z0-9_-]', '_', selected['number'])}.pdf",
+                             mime="application/pdf", use_container_width=True)
+        right.download_button("📊 Scarica Excel", ddt_excel(selected),
+                              f"DDT_{re.sub(r'[^A-Za-z0-9_-]', '_', selected['number'])}.xlsx",
+                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    else:
+        st.info("Compila il nuovo DDT e premi «Salva DDT». Dopo il salvataggio compariranno timbro, firme, PDF, Excel, stampa ed eliminazione.")
     if "ddt_selected_id" not in st.session_state or st.session_state.ddt_selected_id != (selected["id"] if selected else None):
         st.session_state.ddt_selected_id = selected["id"] if selected else None
         st.session_state.ddt_number = selected["number"] if selected else ""
@@ -1219,7 +1232,7 @@ def documents_page():
         station_signature = st.text_input("Firma operatore stazione (nome)", value=value("station_signature"))
         driver_signature = st.text_input("Firma autista (nome)", value=value("driver_signature"))
         delivery_signature = st.text_input("Firma operatore stazione consegna / piazzale (nome)", value=value("delivery_signature"))
-        saved = st.form_submit_button("Salva DDT", type="primary")
+        saved = st.form_submit_button("Salva modifiche" if selected else "Salva DDT", type="primary")
     if saved:
         number = number.strip()
         if not number:
