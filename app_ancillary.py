@@ -1,4 +1,5 @@
 import io
+from html import escape
 import hashlib
 import hmac
 import json
@@ -24,7 +25,7 @@ SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
 DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 ANCILLARY_START_DATE = date(2026, 10, 1)
-PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "AMMINISTRAZIONE"]
+PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "AMMINISTRAZIONE"]
 CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
 CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
 
@@ -324,6 +325,16 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_event_vehicles_event ON event_vehicles(event_id)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS transport_documents (
+                id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, document_date TEXT NOT NULL,
+                loading_date TEXT, departure TEXT, destination TEXT, carrier TEXT,
+                truck_plate TEXT, station_signature TEXT, driver_signature TEXT,
+                delivery_signature TEXT, vehicles_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_transport_documents_date ON transport_documents(document_date)")
         cleanup_done = conn.execute(
             "SELECT value FROM app_meta WHERE key = 'ancillary_history_cleared_2026_10_01'"
         ).fetchone()
@@ -969,6 +980,129 @@ def table_to_excel(frame, sheet_name="Dati"):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export.to_excel(writer, index=False, sheet_name=sheet_name[:31])
     return output.getvalue()
+
+
+def next_ddt_number(conn, year):
+    rows = conn.execute("SELECT number FROM transport_documents WHERE document_date LIKE ?", (f"{year}-%",)).fetchall()
+    used = [int(match.group(1)) for row in rows if (match := re.fullmatch(rf"{year}/(\d+)", row["number"] or ""))]
+    return f"{year}/{max(used, default=0) + 1:04d}"
+
+
+def ddt_pdf(row):
+    output = io.BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=A4, leftMargin=14*mm, rightMargin=14*mm,
+                            topMargin=14*mm, bottomMargin=14*mm)
+    styles = getSampleStyleSheet()
+    def para(value):
+        return Paragraph(escape(str(value or "")), styles["Normal"])
+    def field(label, value):
+        return [para(label), para(value)]
+    story = [Paragraph("DOCUMENTO DI TRASPORTO", styles["Title"]), Spacer(1, 5*mm),
+             para(f"Bolla n° {row['number']}    ·    Data {row['document_date']}"), Spacer(1, 5*mm)]
+    details = [field("Data carico", row["loading_date"]), field("Stazione di partenza", row["departure"]),
+               field("Destinazione", row["destination"]), field("Vettore / Autisti", row["carrier"]),
+               field("Targa bisarca", row["truck_plate"])]
+    table = Table(details, colWidths=[49*mm, 133*mm], hAlign="LEFT")
+    table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),
+                               ("VALIGN",(0,0),(-1,-1),"TOP"),
+                               ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#EFF3F8")),
+                               ("PADDING",(0,0),(-1,-1),6)]))
+    story += [table, Spacer(1, 7*mm)]
+    vehicles = json.loads(row["vehicles_json"] or "[]")
+    headings = ["n°", "Marca", "Modello", "Targa", "Materiale a bordo / Note"]
+    entries = [[para(h) for h in headings]]
+    entries.extend([[para(i), para(v.get("marca")), para(v.get("modello")),
+                     para(v.get("targa")), para(v.get("note"))] for i,v in enumerate(vehicles, 1)])
+    entries.extend([[para("") for _ in headings] for _ in range(max(0, 10-len(vehicles)))])
+    vehicles_table = Table(entries, colWidths=[12*mm, 31*mm, 35*mm, 27*mm, 77*mm], repeatRows=1, hAlign="LEFT")
+    vehicles_table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),
+                                         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#DCE6F1")),
+                                         ("VALIGN",(0,0),(-1,-1),"TOP"),
+                                         ("PADDING",(0,0),(-1,-1),5)]))
+    story += [vehicles_table, Spacer(1, 9*mm)]
+    for label, key in [("Firma operatore stazione", "station_signature"),
+                       ("Uscita - firma autista", "driver_signature"),
+                       ("Scarico vetture - firma operatore stazione consegna / piazzale", "delivery_signature")]:
+        story.extend([para(f"{label}: {row[key] or '________________________________________'}"), Spacer(1, 4*mm)])
+    doc.build(story)
+    return output.getvalue()
+
+
+def documents_page():
+    st.header("Documenti · DDT")
+    with db() as conn:
+        docs = conn.execute("SELECT * FROM transport_documents ORDER BY document_date DESC, created_at DESC").fetchall()
+    choices = {f"{r['number']} · {r['document_date']} · {r['destination'] or 'senza destinazione'}": r for r in docs}
+    selected_label = st.selectbox("Documento", ["Nuovo DDT"] + list(choices))
+    selected = choices.get(selected_label)
+    if st.session_state.get("ddt_selected_id") != (selected["id"] if selected else None):
+        st.session_state.ddt_selected_id = selected["id"] if selected else None
+        st.session_state.ddt_number = selected["number"] if selected else ""
+        st.session_state.ddt_date = date.fromisoformat(selected["document_date"]) if selected else date.today()
+    def value(key):
+        return selected[key] or "" if selected else ""
+    if not selected and not st.session_state.ddt_number:
+        with db() as conn:
+            st.session_state.ddt_number = next_ddt_number(conn, st.session_state.ddt_date.year)
+    with st.form("ddt_form"):
+        a,b = st.columns(2)
+        number = a.text_input("Numero DDT * (automatico, modificabile)", key="ddt_number")
+        document_date = b.date_input("Data documento *", key="ddt_date", format="DD/MM/YYYY")
+        loading_date = st.date_input("Data carico", value=date.fromisoformat(value("loading_date")) if value("loading_date") else document_date, format="DD/MM/YYYY")
+        a,b = st.columns(2)
+        departure = a.text_input("Stazione di partenza", value=value("departure"))
+        destination = b.text_input("Destinazione", value=value("destination"))
+        a,b = st.columns(2)
+        carrier = a.text_input("Vettore / Autisti", value=value("carrier"))
+        truck_plate = b.text_input("Targa bisarca", value=value("truck_plate"))
+        st.subheader("Veicoli trasportati")
+        existing = json.loads(value("vehicles_json") or "[]")
+        vehicle_rows = st.data_editor(pd.DataFrame(existing, columns=["marca", "modello", "targa", "note"]),
+                                      num_rows="dynamic", hide_index=True, use_container_width=True,
+                                      column_config={"marca":"Marca", "modello":"Modello", "targa":"Targa", "note":"Materiale a bordo / Note"})
+        st.caption("Aggiungi o elimina righe con i comandi della tabella.")
+        station_signature = st.text_input("Firma operatore stazione (nome)", value=value("station_signature"))
+        driver_signature = st.text_input("Firma autista (nome)", value=value("driver_signature"))
+        delivery_signature = st.text_input("Firma operatore stazione consegna / piazzale (nome)", value=value("delivery_signature"))
+        saved = st.form_submit_button("Salva DDT", type="primary")
+    if saved:
+        number = number.strip()
+        if not number:
+            st.error("Inserisci il numero del DDT.")
+        else:
+            vehicles = [{key: str(row.get(key) or "").strip() for key in ["marca","modello","targa","note"]}
+                        for row in vehicle_rows.fillna("").to_dict("records")]
+            vehicles = [row for row in vehicles if any(row.values())]
+            now = datetime.now().isoformat(timespec="seconds")
+            try:
+                with db() as conn:
+                    conn.execute("""INSERT INTO transport_documents
+                        (id,number,document_date,loading_date,departure,destination,carrier,truck_plate,
+                         station_signature,driver_signature,delivery_signature,vehicles_json,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(id) DO UPDATE SET number=excluded.number,document_date=excluded.document_date,
+                        loading_date=excluded.loading_date,departure=excluded.departure,destination=excluded.destination,
+                        carrier=excluded.carrier,truck_plate=excluded.truck_plate,station_signature=excluded.station_signature,
+                        driver_signature=excluded.driver_signature,delivery_signature=excluded.delivery_signature,
+                        vehicles_json=excluded.vehicles_json,updated_at=excluded.updated_at""",
+                        (selected["id"] if selected else uuid.uuid4().hex, number, document_date.isoformat(),
+                         loading_date.isoformat(), departure.strip(), destination.strip(), carrier.strip(),
+                         truck_plate.strip(), station_signature.strip(), driver_signature.strip(),
+                         delivery_signature.strip(), json.dumps(vehicles, ensure_ascii=False), now, now))
+                st.success(f"DDT {number} salvato.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.error(f"Il numero {number} è già assegnato a un altro DDT.")
+    if selected:
+        st.download_button("Scarica DDT in PDF", ddt_pdf(selected),
+                           f"DDT_{re.sub(r'[^A-Za-z0-9_-]', '_', selected['number'])}.pdf",
+                           mime="application/pdf", use_container_width=True)
+    if docs:
+        st.subheader("Archivio DDT")
+        st.dataframe(pd.DataFrame([{"Numero":r["number"],"Data":r["document_date"],
+                                   "Partenza":r["departure"],"Destinazione":r["destination"],
+                                   "Veicoli":len(json.loads(r["vehicles_json"] or "[]"))} for r in docs]),
+                     hide_index=True, use_container_width=True)
 
 
 def event_vehicles_to_pdf(frame, event_title):
@@ -2819,6 +2953,7 @@ navigation = {
         ("📎 Documenti e fotografie", "Allegati eventi speciali"),
         ("🗂️ Archivio eventi", "Archivio eventi speciali"),
     ],
+    "DOCUMENTI": [("📄 Documenti di trasporto", "Documenti di trasporto")],
     "AMMINISTRAZIONE": [
         ("🔐 Utenti e autorizzazioni", "Utenti e autorizzazioni"),
         ("👥 Configurazione operatori", "Configurazione operatori"),
@@ -2915,6 +3050,8 @@ elif page == "Archivio contratti RA":
     contracts_archive(all_contracts)
 elif page == "Inserimento ancillary":
     record_form(all_data)
+elif page == "Documenti di trasporto":
+    documents_page()
 elif page == "Configurazione operatori":
     operator_settings()
 elif page == "Utenti e autorizzazioni":
