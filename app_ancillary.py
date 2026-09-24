@@ -1,4 +1,8 @@
 import io
+import base64
+import secrets
+from urllib.parse import quote
+from datetime import timedelta
 from html import escape
 import hashlib
 import hmac
@@ -12,6 +16,9 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from PIL import Image
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import Image as PdfImage, KeepTogether
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
@@ -335,6 +342,15 @@ def init_db():
             )"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_transport_documents_date ON transport_documents(document_date)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS document_assets (
+            document_id TEXT NOT NULL, kind TEXT NOT NULL, image_data BLOB NOT NULL,
+            signer_name TEXT, signed_at TEXT, PRIMARY KEY(document_id,kind)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS document_sign_requests (
+            token_hash TEXT PRIMARY KEY, document_id TEXT NOT NULL,
+            role TEXT NOT NULL, expires_at TEXT NOT NULL, signed_at TEXT
+        )""")
+
         cleanup_done = conn.execute(
             "SELECT value FROM app_meta WHERE key = 'ancillary_history_cleared_2026_10_01'"
         ).fetchone()
@@ -988,11 +1004,37 @@ def next_ddt_number(conn, year):
     return f"{year}/{max(used, default=0) + 1:04d}"
 
 
+DDT_SIGNATURE_ROLES = {"driver": "Firma autista", "station": "Firma operatore stazione",
+                       "delivery": "Firma operatore stazione consegna / piazzale"}
+DDT_ASSET_KINDS = {"stamp": "Timbro", **DDT_SIGNATURE_ROLES}
+
+
+def ddt_assets(document_id):
+    with db() as conn:
+        return {row["kind"]: dict(row) for row in conn.execute(
+            "SELECT * FROM document_assets WHERE document_id = ?", (document_id,))}
+
+
+def image_for_pdf(raw, max_width, max_height):
+    with Image.open(io.BytesIO(raw)) as original:
+        img = original.convert("RGBA")
+        img.thumbnail((1200, 500))
+        background = Image.new("RGB", img.size, "white")
+        background.paste(img, mask=img.getchannel("A"))
+        buffer = io.BytesIO()
+        background.save(buffer, format="PNG")
+    buffer.seek(0)
+    width, height = background.size
+    scale = min(max_width / width, max_height / height)
+    return PdfImage(buffer, width=width*scale, height=height*scale)
+
+
 def ddt_pdf(row):
     output = io.BytesIO()
     doc = SimpleDocTemplate(output, pagesize=A4, leftMargin=14*mm, rightMargin=14*mm,
                             topMargin=14*mm, bottomMargin=14*mm)
     styles = getSampleStyleSheet()
+    assets = ddt_assets(row["id"])
     def para(value):
         return Paragraph(escape(str(value or "")), styles["Normal"])
     def field(label, value):
@@ -1020,12 +1062,125 @@ def ddt_pdf(row):
                                          ("VALIGN",(0,0),(-1,-1),"TOP"),
                                          ("PADDING",(0,0),(-1,-1),5)]))
     story += [vehicles_table, Spacer(1, 9*mm)]
-    for label, key in [("Firma operatore stazione", "station_signature"),
-                       ("Uscita - firma autista", "driver_signature"),
-                       ("Scarico vetture - firma operatore stazione consegna / piazzale", "delivery_signature")]:
-        story.extend([para(f"{label}: {row[key] or '________________________________________'}"), Spacer(1, 4*mm)])
+    if "stamp" in assets:
+        story.extend([para("Timbro"), image_for_pdf(assets["stamp"]["image_data"], 55*mm, 27*mm), Spacer(1, 4*mm)])
+    for kind, label in DDT_SIGNATURE_ROLES.items():
+        asset = assets.get(kind)
+        signature = [para(label)]
+        if asset:
+            signature += [image_for_pdf(asset["image_data"], 75*mm, 23*mm),
+                          para(f"{asset['signer_name'] or ''} · {asset['signed_at'] or ''}")]
+        else:
+            signature.append(para(row[f"{kind if kind != 'driver' else 'driver'}_signature"] or "________________________________________"))
+        story.extend([KeepTogether(signature), Spacer(1, 4*mm)])
     doc.build(story)
     return output.getvalue()
+
+
+def ddt_excel(row):
+    details = {"Numero": row["number"], "Data documento": row["document_date"],
+               "Data carico": row["loading_date"], "Partenza": row["departure"],
+               "Destinazione": row["destination"], "Vettore / Autisti": row["carrier"],
+               "Targa bisarca": row["truck_plate"]}
+    vehicles = json.loads(row["vehicles_json"] or "[]")
+    assets = ddt_assets(row["id"])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(list(details.items()), columns=["Campo", "Valore"]).to_excel(writer, index=False, sheet_name="DDT")
+        pd.DataFrame([{"N°": i, "Marca": v.get("marca"), "Modello": v.get("modello"),
+                       "Targa": v.get("targa"), "Materiale e note": v.get("note")}
+                      for i, v in enumerate(vehicles, 1)],
+                     columns=["N°", "Marca", "Modello", "Targa", "Materiale e note"]).to_excel(
+                         writer, index=False, sheet_name="Veicoli")
+        pd.DataFrame([{"Ruolo": label, "Firmatario": assets.get(role, {}).get("signer_name", ""),
+                       "Data firma": assets.get(role, {}).get("signed_at", "")}
+                      for role, label in DDT_SIGNATURE_ROLES.items()]).to_excel(
+                          writer, index=False, sheet_name="Firme")
+        from openpyxl.drawing.image import Image as ExcelImage
+        from openpyxl.utils import get_column_letter
+        sheet = writer.sheets["DDT"]
+        sheet.column_dimensions["A"].width = 25
+        sheet.column_dimensions["B"].width = 55
+        for index, (kind, label) in enumerate(DDT_ASSET_KINDS.items(), start=12):
+            if kind in assets:
+                sheet.cell(index, 1, label)
+                img = ExcelImage(io.BytesIO(assets[kind]["image_data"]))
+                img.width, img.height = 160, 55
+                sheet.add_image(img, f"B{index}")
+                sheet.row_dimensions[index].height = 46
+        vehicle_sheet = writer.sheets["Veicoli"]
+        for col, width in enumerate([8, 22, 24, 20, 50], 1):
+            vehicle_sheet.column_dimensions[get_column_letter(col)].width = width
+    return output.getvalue()
+
+
+def validate_ddt_image(data):
+    if len(data) > 3_000_000:
+        raise ValueError("L'immagine deve essere inferiore a 3 MB.")
+    with Image.open(io.BytesIO(data)) as img:
+        img.verify()
+    with Image.open(io.BytesIO(data)) as img:
+        if img.format != "PNG" or img.width > 3000 or img.height > 3000:
+            raise ValueError("Carica un PNG fino a 3000 × 3000 pixel.")
+    return data
+
+
+def signing_page(token):
+    if not re.fullmatch(r"[0-9a-f]{64}", token or ""):
+        st.error("Link di firma non valido.")
+        return
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with db() as conn:
+        request = conn.execute("SELECT * FROM document_sign_requests WHERE token_hash = ?", (token_hash,)).fetchone()
+        doc = conn.execute("SELECT * FROM transport_documents WHERE id = ?", (request["document_id"],)).fetchone() if request else None
+    if not request or not doc:
+        st.error("Link di firma non valido.")
+        return
+    if request["signed_at"]:
+        st.success("Documento già firmato. Grazie.")
+        return
+    if datetime.now() > datetime.fromisoformat(request["expires_at"]):
+        st.error("Il link di firma è scaduto. Richiedi un nuovo link.")
+        return
+    st.title("Firma documento di trasporto")
+    st.write(f"DDT {doc['number']} · {doc['document_date']}")
+    st.write(f"Da {doc['departure'] or '—'} a {doc['destination'] or '—'}")
+    st.write(f"Ruolo: {DDT_SIGNATURE_ROLES[request['role']]}")
+    st.dataframe(pd.DataFrame(json.loads(doc["vehicles_json"] or "[]")), hide_index=True, use_container_width=True)
+    st.download_button("Visualizza o scarica il DDT prima di firmare", ddt_pdf(doc),
+                       f"DDT_{doc['number'].replace('/', '_')}.pdf", mime="application/pdf")
+    from streamlit_drawable_canvas import st_canvas
+    signer = st.text_input("Nome e cognome del firmatario *")
+    st.caption("Traccia la firma con il dito, un pennino o il mouse. Usa il comando del riquadro per cancellare e rifare.")
+    canvas = st_canvas(fill_color="rgba(255, 255, 255, 0)", stroke_width=3,
+                       stroke_color="#12233c", background_color="#ffffff",
+                       height=170, width=320, drawing_mode="freedraw", update_streamlit=True,
+                       key=f"sign_{token_hash}")
+    consent = st.checkbox("Confermo di aver letto il DDT e autorizzo l'apposizione della mia firma al documento.")
+    if st.button("Firma il DDT", type="primary", disabled=not consent):
+        if not signer.strip():
+            st.error("Inserisci nome e cognome.")
+        elif not canvas.json_data or not canvas.json_data.get("objects") or canvas.image_data is None:
+            st.error("Traccia la firma prima di confermare.")
+        else:
+            image = Image.fromarray(canvas.image_data.astype("uint8"), "RGBA")
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            now = datetime.now().isoformat(timespec="seconds")
+            with db() as conn:
+                updated = conn.execute("UPDATE document_sign_requests SET signed_at = ? WHERE token_hash = ? AND signed_at IS NULL AND expires_at > ?",
+                                       (now, token_hash, now)).rowcount
+                if updated:
+                    conn.execute("""INSERT INTO document_assets(document_id,kind,image_data,signer_name,signed_at)
+                                    VALUES(?,?,?,?,?) ON CONFLICT(document_id,kind) DO UPDATE SET
+                                    image_data=excluded.image_data,signer_name=excluded.signer_name,signed_at=excluded.signed_at""",
+                                 (doc["id"], request["role"], buffer.getvalue(), signer.strip(), now))
+            if updated:
+                st.success("Firma acquisita. Grazie.")
+                st.rerun()
+            else:
+                st.error("Il link è già stato usato o è scaduto.")
+
 
 
 def documents_page():
@@ -1089,14 +1244,110 @@ def documents_page():
                          loading_date.isoformat(), departure.strip(), destination.strip(), carrier.strip(),
                          truck_plate.strip(), station_signature.strip(), driver_signature.strip(),
                          delivery_signature.strip(), json.dumps(vehicles, ensure_ascii=False), now, now))
+                if selected:
+                    changed_fields = {
+                        "number": number, "document_date": document_date.isoformat(),
+                        "loading_date": loading_date.isoformat(), "departure": departure.strip(),
+                        "destination": destination.strip(), "carrier": carrier.strip(),
+                        "truck_plate": truck_plate.strip(), "station_signature": station_signature.strip(),
+                        "driver_signature": driver_signature.strip(), "delivery_signature": delivery_signature.strip(),
+                    }
+                    changed = any((selected[key] or "") != new_value for key, new_value in changed_fields.items())
+                    changed = changed or json.loads(selected["vehicles_json"] or "[]") != vehicles
+                    if changed:
+                        with db() as conn:
+                            conn.execute("DELETE FROM document_assets WHERE document_id = ? AND kind != 'stamp'", (selected["id"],))
+                            conn.execute("DELETE FROM document_sign_requests WHERE document_id = ?", (selected["id"],))
+                        st.warning("Il contenuto è cambiato: le firme precedenti e i link di firma sono stati annullati.")
                 st.success(f"DDT {number} salvato.")
                 st.rerun()
             except sqlite3.IntegrityError:
                 st.error(f"Il numero {number} è già assegnato a un altro DDT.")
     if selected:
-        st.download_button("Scarica DDT in PDF", ddt_pdf(selected),
+        with st.expander("Elimina questo DDT"):
+            confirm = st.checkbox(f"Confermo l'eliminazione definitiva del DDT {selected['number']}", key=f"delete_ddt_{selected['id']}")
+            if st.button("Elimina DDT e relative firme", disabled=not confirm, type="secondary"):
+                with db() as conn:
+                    conn.execute("DELETE FROM document_sign_requests WHERE document_id = ?", (selected["id"],))
+                    conn.execute("DELETE FROM document_assets WHERE document_id = ?", (selected["id"],))
+                    conn.execute("DELETE FROM transport_documents WHERE id = ?", (selected["id"],))
+                st.session_state.ddt_selected_id = None
+                st.session_state.ddt_sign_link = ""
+                st.success("DDT eliminato.")
+                st.rerun()
+        st.subheader("Timbro e firme")
+        assets = ddt_assets(selected["id"])
+        kind = st.selectbox("Elemento da aggiungere", list(DDT_ASSET_KINDS),
+                            format_func=lambda key: DDT_ASSET_KINDS[key])
+        image_file = st.file_uploader("Carica timbro o firma in PNG", type=["png"], key=f"asset_{selected['id']}_{kind}")
+        signer_name = st.text_input("Nome firmatario", key=f"signer_{selected['id']}_{kind}") if kind != "stamp" else ""
+        if st.button("Salva immagine nel DDT"):
+            if not image_file:
+                st.error("Carica prima un'immagine PNG.")
+            else:
+                try:
+                    image_bytes = validate_ddt_image(image_file.getvalue())
+                    with db() as conn:
+                        conn.execute("""INSERT INTO document_assets(document_id,kind,image_data,signer_name,signed_at)
+                                        VALUES(?,?,?,?,?) ON CONFLICT(document_id,kind) DO UPDATE SET
+                                        image_data=excluded.image_data,signer_name=excluded.signer_name,signed_at=excluded.signed_at""",
+                                     (selected["id"], kind, image_bytes, signer_name.strip(),
+                                      datetime.now().isoformat(timespec="seconds") if kind != "stamp" else None))
+                    st.success("Immagine salvata nel DDT.")
+                    st.rerun()
+                except (ValueError, OSError) as exc:
+                    st.error(str(exc))
+        if kind in assets:
+            st.image(assets[kind]["image_data"], width=200)
+            if st.button(f"Rimuovi {DDT_ASSET_KINDS[kind].lower()}"):
+                with db() as conn:
+                    conn.execute("DELETE FROM document_assets WHERE document_id = ? AND kind = ?", (selected["id"],kind))
+                st.rerun()
+        st.subheader("Invio per la firma su telefono o tablet")
+        with db() as conn:
+            url_row = conn.execute("SELECT value FROM app_meta WHERE key = 'ddt_public_url'").fetchone()
+        public_url = st.text_input("URL pubblico del gestionale (HTTPS)", value=url_row["value"] if url_row else "",
+                                   help="Inserisci l'indirizzo HTTPS con cui il destinatario apre questa app.")
+        if st.button("Salva URL pubblico"):
+            if not re.fullmatch(r"https://[^/\s?#]+(?:/[^?#]*)?/?", public_url.strip()):
+                st.error("Inserisci un URL HTTPS valido senza parametri.")
+            else:
+                with db() as conn:
+                    conn.execute("INSERT INTO app_meta(key,value) VALUES('ddt_public_url',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (public_url.strip().rstrip("/"),))
+                st.success("URL salvato.")
+                st.rerun()
+        role = st.selectbox("Chi deve firmare", list(DDT_SIGNATURE_ROLES), format_func=lambda key: DDT_SIGNATURE_ROLES[key])
+        if st.button("Genera link di firma (valido 7 giorni)"):
+            if not url_row:
+                st.error("Salva prima l'URL pubblico del gestionale.")
+            else:
+                token = secrets.token_hex(32)
+                with db() as conn:
+                    conn.execute("DELETE FROM document_sign_requests WHERE document_id = ? AND role = ? AND signed_at IS NULL", (selected["id"], role))
+                    conn.execute("INSERT INTO document_sign_requests VALUES (?,?,?,?,NULL)",
+                                 (hashlib.sha256(token.encode()).hexdigest(), selected["id"], role,
+                                  (datetime.now()+timedelta(days=7)).isoformat(timespec="seconds")))
+                st.session_state.ddt_sign_link = f"{url_row['value'].rstrip('/')}?ddt_sign={token}"
+                st.session_state.ddt_sign_document_id = selected["id"]
+        if st.session_state.get("ddt_sign_link") and st.session_state.get("ddt_sign_document_id") == selected["id"]:
+            st.code(st.session_state.ddt_sign_link, language=None)
+            mailto = f"mailto:?subject={quote('Firma DDT '+selected['number'])}&body={quote('Apri il link per firmare il DDT: '+st.session_state.ddt_sign_link)}"
+            st.link_button("Prepara email con il link", mailto)
+            st.caption("Copia il link per inviarlo anche tramite messaggio. Generandone un altro, il precedente non sarà più utilizzabile.")
+        st.subheader("Esporta e stampa")
+        pdf_bytes = ddt_pdf(selected)
+        st.download_button("Scarica DDT in Excel", ddt_excel(selected),
+                           f"DDT_{re.sub(r'[^A-Za-z0-9_-]', '_', selected['number'])}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("Scarica DDT in PDF", pdf_bytes,
                            f"DDT_{re.sub(r'[^A-Za-z0-9_-]', '_', selected['number'])}.pdf",
                            mime="application/pdf", use_container_width=True)
+        encoded = base64.b64encode(pdf_bytes).decode("ascii")
+        st.components.v1.html(f"""<button onclick="let data=atob('{encoded}');let bytes=new Uint8Array(data.length);
+            for(let i=0;i<data.length;i++)bytes[i]=data.charCodeAt(i);
+            let url=URL.createObjectURL(new Blob([bytes],{{type:'application/pdf'}}));
+            window.open(url,'_blank');" style="font-size:16px;padding:10px 16px;cursor:pointer">
+            Apri PDF per stampare</button>""", height=55)
     if docs:
         st.subheader("Archivio DDT")
         st.dataframe(pd.DataFrame([{"Numero":r["number"],"Data":r["document_date"],
@@ -2908,6 +3159,9 @@ def login():
 
 
 init_db()
+if st.query_params.get("ddt_sign"):
+    signing_page(st.query_params.get("ddt_sign"))
+    st.stop()
 if not login():
     st.stop()
 
