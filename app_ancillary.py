@@ -1062,17 +1062,36 @@ def ddt_pdf(row):
                                          ("VALIGN",(0,0),(-1,-1),"TOP"),
                                          ("PADDING",(0,0),(-1,-1),5)]))
     story += [vehicles_table, Spacer(1, 9*mm)]
-    if "stamp" in assets:
-        story.extend([para("Timbro"), image_for_pdf(assets["stamp"]["image_data"], 55*mm, 27*mm), Spacer(1, 4*mm)])
-    for kind, label in DDT_SIGNATURE_ROLES.items():
+    def signature_content(kind, label, width=62*mm):
         asset = assets.get(kind)
-        signature = [para(label)]
+        content = [Paragraph(f"<b>{escape(label)}</b>", styles["Normal"]), Spacer(1, 3*mm)]
         if asset:
-            signature += [image_for_pdf(asset["image_data"], 75*mm, 23*mm),
-                          para(f"{asset['signer_name'] or ''} · {asset['signed_at'] or ''}")]
+            content.append(image_for_pdf(asset["image_data"], width, 18*mm))
+            content.append(para(f"{asset['signer_name'] or ''} · {asset['signed_at'] or ''}"))
         else:
-            signature.append(para(row[f"{kind if kind != 'driver' else 'driver'}_signature"] or "________________________________________"))
-        story.extend([KeepTogether(signature), Spacer(1, 4*mm)])
+            name = row[f"{kind}_signature"]
+            content.append(para(name or "________________________________"))
+        return content
+
+    # Schema del modello: operatore di partenza e timbro a sinistra;
+    # autista in alto a destra, operatore di consegna in basso a destra.
+    station_block = [Paragraph("<b>Timbro e firma operatore stazione</b>", styles["Normal"]), Spacer(1, 4*mm)]
+    if "stamp" in assets:
+        station_block += [image_for_pdf(assets["stamp"]["image_data"], 65*mm, 28*mm), Spacer(1, 3*mm)]
+    else:
+        station_block += [para("Timbro: ______________________________"), Spacer(1, 5*mm)]
+    station_block += signature_content("station", "Firma operatore stazione", 65*mm)[2:]
+    signatures = Table([[station_block, signature_content("driver", "Firma autista")],
+                        ["", signature_content("delivery", "Firma operatore stazione consegna / piazzale")]],
+                       colWidths=[91*mm, 91*mm], rowHeights=[39*mm, 39*mm], hAlign="LEFT")
+    signatures.setStyle(TableStyle([("SPAN", (0, 0), (0, 1)),
+                                    ("BOX", (0, 0), (0, 1), 0.7, colors.grey),
+                                    ("BOX", (1, 0), (1, 0), 0.7, colors.grey),
+                                    ("BOX", (1, 1), (1, 1), 0.7, colors.grey),
+                                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                                    ("TOPPADDING", (0, 0), (-1, -1), 7)]))
+    story.append(KeepTogether(signatures))
     doc.build(story)
     return output.getvalue()
 
