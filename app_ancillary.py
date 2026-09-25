@@ -28,11 +28,13 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ancillary.db"
+NOLEGGIARE_LOGO = APP_DIR / "noleggiare_logo.png"
 SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
 DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
+COMMISSION_SEED_PATH = APP_DIR / "commissioni_iniziali.json"
 ANCILLARY_START_DATE = date(2026, 10, 1)
-PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "AMMINISTRAZIONE"]
+PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "COMMISSIONI", "AMMINISTRAZIONE"]
 CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
 CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
 
@@ -341,6 +343,23 @@ def init_db():
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )"""
         )
+        conn.execute("""CREATE TABLE IF NOT EXISTS commission_documents (
+            invoice_id TEXT PRIMARY KEY, report_period TEXT, import_file TEXT,
+            document_type TEXT, invoice_number TEXT, invoice_date TEXT,
+            contract_date TEXT, closure_date TEXT, ra TEXT, operator TEXT,
+            vehicle_group TEXT, rental_days REAL, taxable_total REAL,
+            vat_total REAL, invoice_total REAL, commissionable_total REAL,
+            base_commission REAL, total_commission REAL, items_json TEXT NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_commission_ra_date ON commission_documents(ra,contract_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_commission_period ON commission_documents(report_period)")
+        if conn.execute("SELECT COUNT(*) FROM commission_documents").fetchone()[0] == 0 and COMMISSION_SEED_PATH.exists():
+            seed_rows = json.loads(COMMISSION_SEED_PATH.read_text(encoding="utf-8"))
+            conn.executemany("""INSERT OR IGNORE INTO commission_documents VALUES
+                (:invoice_id,:report_period,:import_file,:document_type,:invoice_number,
+                 :invoice_date,:contract_date,:closure_date,:ra,:operator,:vehicle_group,
+                 :rental_days,:taxable_total,:vat_total,:invoice_total,
+                 :commissionable_total,:base_commission,:total_commission,:items_json)""", seed_rows)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_transport_documents_date ON transport_documents(document_date)")
         conn.execute("""CREATE TABLE IF NOT EXISTS document_assets (
             document_id TEXT NOT NULL, kind TEXT NOT NULL, image_data BLOB NOT NULL,
@@ -824,6 +843,9 @@ def detect_excel_type(file_bytes):
         raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=25, dtype=object)
         if _find_header_row(raw) is not None:
             return "CONTRATTI_RA"
+        if any({"id fattura", "contratto", "imponibile commissionabile"}.issubset(
+                {commission_column(v) for v in values if pd.notna(v)}) for _, values in raw.iterrows()):
+            return "COMMISSIONI"
     first = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, nrows=5, dtype=object)
     damage_columns = {
         "Informazioni cronologiche", "Numero RA (Rental Agreement)",
@@ -834,6 +856,138 @@ def detect_excel_type(file_bytes):
     if {"RA (Rental Agreement)", "DATA INIZIO NOLEGGIO", "GIORNI NOLEGGIO", "FONTE"}.issubset(first.columns):
         return "ANCILLARY"
     return "SCONOSCIUTO"
+
+
+COMMISSION_CORE = {
+    "id fattura", "tipo documento", "fattura", "data fattura", "data chiusura",
+    "contratto", "data contratto", "data inizio contratto", "data fine contratto",
+    "giorni", "gruppo", "operatore fattura", "totale imponibile", "totale iva",
+    "totale fattura", "imponibile commissionabile", "provvigione base",
+    "provvigione totale", "fonte", "ragione sociale",
+}
+COMMISSION_BASE_ITEMS = {"tempo km", "tempo extra", "road tax", "oneri", "sconto"}
+COMMISSION_ADJUSTMENTS = {"km eccedenti", "altre penalità", "lavaggio speciale",
+    "refuelling service", "addebito multe", "fee multe", "addebito danni", "fee danni",
+    "addebito furto", "carburante", "rimborso ricarica"}
+
+
+def commission_column(value):
+    return " ".join(str(value or "").split()).casefold()
+
+
+def commission_family(label):
+    key = commission_column(label)
+    if key in COMMISSION_BASE_ITEMS:
+        return "Canone e voci base"
+    if key in COMMISSION_ADJUSTMENTS:
+        return "Addebiti e rettifiche"
+    if key in {"assicurazioni", "cdw tlw"}:
+        return "Coperture"
+    return "Servizi aggiuntivi"
+
+
+def parse_commission_workbook(file_bytes, file_name):
+    book = pd.ExcelFile(io.BytesIO(file_bytes))
+    results = []
+    periods = []
+    for sheet in book.sheet_names:
+        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=15, dtype=object)
+        required = {"id fattura", "contratto", "imponibile commissionabile"}
+        header_row = next((i for i, values in raw.iterrows()
+                           if required.issubset({commission_column(v) for v in values if pd.notna(v)})), None)
+        if header_row is None:
+            continue
+        heading = " ".join(str(v) for v in raw.iloc[:header_row].values.ravel() if pd.notna(v))
+        months = {"gennaio":1,"febbraio":2,"marzo":3,"aprile":4,"maggio":5,"giugno":6,
+                  "luglio":7,"agosto":8,"settembre":9,"ottobre":10,"novembre":11,"dicembre":12}
+        period_match = re.search(r"\b(" + "|".join(months) + r")\s+(20\d{2})\b", heading.casefold())
+        period = (f"{period_match.group(2)}-{months[period_match.group(1)]:02d}" if period_match else "")
+        frame = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=header_row, dtype=object)
+        names = {commission_column(col): col for col in frame.columns if not str(col).startswith("Unnamed:")}
+        if not required.issubset(names):
+            continue
+        def field(row, key):
+            value = row.get(names.get(key)) if key in names else None
+            return None if value is None or pd.isna(value) else value
+        def numeric(value):
+            number = pd.to_numeric(value, errors="coerce")
+            return 0.0 if pd.isna(number) else float(number)
+        def date_text(value):
+            parsed = pd.to_datetime(value, errors="coerce")
+            return "" if pd.isna(parsed) else parsed.date().isoformat()
+        product_columns = [(col, commission_column(col)) for col in frame.columns
+                           if not str(col).startswith("Unnamed:") and commission_column(col) not in COMMISSION_CORE]
+        for _, row in frame.iterrows():
+            inv = field(row, "id fattura")
+            if inv is None or pd.isna(pd.to_numeric(inv, errors="coerce")):
+                continue
+            invoice_id = str(int(float(inv)))
+            items = {label: numeric(row[col]) for col, label in product_columns
+                     if numeric(row[col]) != 0}
+            invoice_date = date_text(field(row, "data fattura"))
+            results.append({
+                "invoice_id": invoice_id,
+                "report_period": period or invoice_date[:7], "import_file": file_name,
+                "document_type": str(field(row, "tipo documento") or "").strip(),
+                "invoice_number": str(field(row, "fattura") or "").strip(),
+                "invoice_date": invoice_date,
+                "contract_date": date_text(field(row, "data contratto")),
+                "closure_date": date_text(field(row, "data chiusura")),
+                "ra": normalize_ra(field(row, "contratto")),
+                "operator": str(field(row, "operatore fattura") or "").strip(),
+                "vehicle_group": str(field(row, "gruppo") or "").strip(),
+                "rental_days": numeric(field(row, "giorni")),
+                "taxable_total": numeric(field(row, "totale imponibile")),
+                "vat_total": numeric(field(row, "totale iva")),
+                "invoice_total": numeric(field(row, "totale fattura")),
+                "commissionable_total": numeric(field(row, "imponibile commissionabile")),
+                "base_commission": numeric(field(row, "provvigione base")),
+                "total_commission": numeric(field(row, "provvigione totale")),
+                "items_json": json.dumps(items, ensure_ascii=False),
+            })
+        periods.append(period)
+    if not results:
+        raise ValueError("Nessun foglio Commissioni riconosciuto: servono ID Fattura, Contratto e Imponibile Commissionabile.")
+    return results, sorted(set(periods))
+
+
+def import_commission_workbook(file_bytes, file_name):
+    rows, periods = parse_commission_workbook(file_bytes, file_name)
+    with db() as conn:
+        conn.executemany("""INSERT INTO commission_documents VALUES
+            (:invoice_id,:report_period,:import_file,:document_type,:invoice_number,
+             :invoice_date,:contract_date,:closure_date,:ra,:operator,:vehicle_group,
+             :rental_days,:taxable_total,:vat_total,:invoice_total,
+             :commissionable_total,:base_commission,:total_commission,:items_json)
+            ON CONFLICT(invoice_id) DO UPDATE SET
+            report_period=excluded.report_period,import_file=excluded.import_file,
+            document_type=excluded.document_type,invoice_number=excluded.invoice_number,
+            invoice_date=excluded.invoice_date,contract_date=excluded.contract_date,
+            closure_date=excluded.closure_date,ra=excluded.ra,operator=excluded.operator,
+            vehicle_group=excluded.vehicle_group,rental_days=excluded.rental_days,
+            taxable_total=excluded.taxable_total,vat_total=excluded.vat_total,
+            invoice_total=excluded.invoice_total,commissionable_total=excluded.commissionable_total,
+            base_commission=excluded.base_commission,total_commission=excluded.total_commission,
+            items_json=excluded.items_json""", rows)
+    return len(rows), periods
+
+
+def load_commissions():
+    with db() as conn:
+        return pd.read_sql_query("SELECT * FROM commission_documents ORDER BY invoice_date DESC, invoice_id DESC", conn)
+
+
+def commission_items(frame):
+    items = []
+    for row in frame.itertuples(index=False):
+        for label, amount in json.loads(row.items_json or "{}").items():
+            items.append({"invoice_id": row.invoice_id, "ra": row.ra,
+                          "contract_date": row.contract_date, "invoice_date": row.invoice_date,
+                          "report_period": row.report_period, "operator": row.operator,
+                          "document_type": row.document_type, "voce": label,
+                          "famiglia": commission_family(label), "importo": float(amount)})
+    return pd.DataFrame(items, columns=["invoice_id", "ra", "contract_date", "invoice_date",
+                        "report_period", "operator", "document_type", "voce", "famiglia", "importo"])
 
 
 def import_contract_workbook(file_bytes, file_name):
@@ -1039,7 +1193,13 @@ def ddt_pdf(row):
         return Paragraph(escape(str(value or "")), styles["Normal"])
     def field(label, value):
         return [para(label), para(value)]
-    story = [Paragraph("DOCUMENTO DI TRASPORTO", styles["Title"]), Spacer(1, 5*mm),
+    header = Table([[PdfImage(str(NOLEGGIARE_LOGO), width=50*mm, height=15*mm),
+                     Paragraph("DOCUMENTO DI TRASPORTO", styles["Heading1"])]],
+                   colWidths=[62*mm, 120*mm], hAlign="LEFT")
+    header.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    story = [header, Spacer(1, 5*mm),
              para(f"Bolla n° {row['number']}    ·    Data {row['document_date']}"), Spacer(1, 5*mm)]
     details = [field("Data carico", row["loading_date"]), field("Stazione di partenza", row["departure"]),
                field("Destinazione", row["destination"]), field("Vettore / Autisti", row["carrier"]),
@@ -1118,6 +1278,10 @@ def ddt_excel(row):
         from openpyxl.drawing.image import Image as ExcelImage
         from openpyxl.utils import get_column_letter
         sheet = writer.sheets["DDT"]
+        logo = ExcelImage(str(NOLEGGIARE_LOGO))
+        logo.width, logo.height = 168, 50
+        sheet.add_image(logo, "D1")
+        sheet.column_dimensions["D"].width = 27
         sheet.column_dimensions["A"].width = 25
         sheet.column_dimensions["B"].width = 55
         for index, (kind, label) in enumerate(DDT_ASSET_KINDS.items(), start=12):
@@ -1174,15 +1338,23 @@ def signing_page(token):
     canvas = st_canvas(fill_color="rgba(255, 255, 255, 0)", stroke_width=3,
                        stroke_color="#12233c", background_color="#ffffff",
                        height=170, width=320, drawing_mode="freedraw", update_streamlit=True,
-                       key=f"sign_{token_hash}")
+                       return_image_data=True, key=f"sign_{token_hash}")
     consent = st.checkbox("Confermo di aver letto il DDT e autorizzo l'apposizione della mia firma al documento.")
     if st.button("Firma il DDT", type="primary", disabled=not consent):
         if not signer.strip():
             st.error("Inserisci nome e cognome.")
-        elif not canvas.json_data or not canvas.json_data.get("objects") or canvas.image_data is None:
+        elif not canvas.json_data or not canvas.json_data.get("objects"):
             st.error("Traccia la firma prima di confermare.")
         else:
-            image = Image.fromarray(canvas.image_data.astype("uint8"), "RGBA")
+            try:
+                drawing = canvas.image_data
+            except RuntimeError:
+                st.warning("La firma si sta preparando. Attendi un momento e premi di nuovo «Firma il DDT».")
+                return
+            if drawing is None:
+                st.warning("La firma si sta preparando. Attendi un momento e premi di nuovo «Firma il DDT».")
+                return
+            image = Image.fromarray(drawing.astype("uint8"), "RGBA")
             buffer = io.BytesIO()
             image.save(buffer, format="PNG")
             now = datetime.now().isoformat(timespec="seconds")
@@ -1340,27 +1512,23 @@ def documents_page():
             url_row = conn.execute("SELECT value FROM app_meta WHERE key = 'ddt_public_url'").fetchone()
         public_url = st.text_input("URL pubblico del gestionale (HTTPS)", value=url_row["value"] if url_row else "",
                                    help="Inserisci l'indirizzo HTTPS con cui il destinatario apre questa app.")
-        if st.button("Salva URL pubblico"):
-            if not re.fullmatch(r"https://[^/\s?#]+(?:/[^?#]*)?/?", public_url.strip()):
-                st.error("Inserisci un URL HTTPS valido senza parametri.")
-            else:
-                with db() as conn:
-                    conn.execute("INSERT INTO app_meta(key,value) VALUES('ddt_public_url',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (public_url.strip().rstrip("/"),))
-                st.success("URL salvato.")
-                st.rerun()
+        st.caption("L'indirizzo viene salvato automaticamente quando generi il link.")
         role = st.selectbox("Chi deve firmare", list(DDT_SIGNATURE_ROLES), format_func=lambda key: DDT_SIGNATURE_ROLES[key])
         if st.button("Genera link di firma (valido 7 giorni)"):
-            if not url_row:
-                st.error("Salva prima l'URL pubblico del gestionale.")
+            base_url = public_url.strip().rstrip("/")
+            if not re.fullmatch(r"https://[^/\s?#]+(?:/[^?#]*)?", base_url):
+                st.error("Inserisci l'URL HTTPS del gestionale nel campo qui sopra.")
             else:
                 token = secrets.token_hex(32)
                 with db() as conn:
+                    conn.execute("INSERT INTO app_meta(key,value) VALUES('ddt_public_url',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (base_url,))
                     conn.execute("DELETE FROM document_sign_requests WHERE document_id = ? AND role = ? AND signed_at IS NULL", (selected["id"], role))
                     conn.execute("INSERT INTO document_sign_requests VALUES (?,?,?,?,NULL)",
                                  (hashlib.sha256(token.encode()).hexdigest(), selected["id"], role,
                                   (datetime.now()+timedelta(days=7)).isoformat(timespec="seconds")))
-                st.session_state.ddt_sign_link = f"{url_row['value'].rstrip('/')}?ddt_sign={token}"
+                st.session_state.ddt_sign_link = f"{base_url}?ddt_sign={token}"
                 st.session_state.ddt_sign_document_id = selected["id"]
+                st.success("Link pronto: puoi copiarlo o preparare l'email qui sotto.")
         if st.session_state.get("ddt_sign_link") and st.session_state.get("ddt_sign_document_id") == selected["id"]:
             st.code(st.session_state.ddt_sign_link, language=None)
             mailto = f"mailto:?subject={quote('Firma DDT '+selected['number'])}&body={quote('Apri il link per firmare il DDT: '+st.session_state.ddt_sign_link)}"
@@ -1790,12 +1958,198 @@ def contracts_dashboard(frame):
     st.dataframe(by_operator.sort_values("valore", ascending=False), use_container_width=True, hide_index=True)
 
 
+def commissions_page(contracts):
+    st.header("Commissioni")
+    st.caption("Fatture, note di credito, provvigioni e voci di addebito dal report Commissioni. "
+               "Il periodo del report può differire dal mese della fattura e dalla data del contratto.")
+    upload = st.file_uploader("Importa report Commissioni Excel", type=["xlsx"], key="commission_upload")
+    if st.button("Importa o aggiorna Commissioni", disabled=upload is None, type="primary"):
+        try:
+            count, periods = import_commission_workbook(upload.getvalue(), upload.name)
+        except (ValueError, KeyError, OSError) as exc:
+            st.error(f"Importazione non riuscita: {exc}")
+        else:
+            st.success(f"Importate o aggiornate {count} fatture. Periodi: {', '.join(periods)}.")
+            st.rerun()
+    docs = load_commissions()
+    if docs.empty:
+        st.info("Importa un file Commissioni per visualizzare l'analisi.")
+        return
+    docs["Mese fattura"] = docs["invoice_date"].str[:7]
+    if not contracts.empty:
+        linked = contracts[["ra","contract_date","rental_channel","rental_term","contract_vehicle"]].copy()
+        linked["contract_date"] = linked["contract_date"].dt.strftime("%Y-%m-%d")
+        docs = docs.merge(linked.drop_duplicates(["ra","contract_date"]),
+                          on=["ra","contract_date"], how="left")
+    else:
+        for name in ["rental_channel","rental_term","contract_vehicle"]:
+            docs[name] = None
+    docs["rental_channel"] = docs["rental_channel"].fillna("RA NON IMPORTATO")
+    docs["rental_term"] = docs["rental_term"].fillna("NON DISPONIBILE")
+    c1, c2, c3 = st.columns(3)
+    periods = sorted(docs["report_period"].dropna().unique(), reverse=True)
+    selected_periods = c1.multiselect("Periodo report", periods, default=periods, key="comm_period")
+    selected_months = c2.multiselect("Mese fattura", sorted(docs["Mese fattura"].dropna().unique(), reverse=True), key="comm_month")
+    selected_types = c3.multiselect("Tipo documento", sorted(docs["document_type"].dropna().unique()), key="comm_document_type")
+    c4, c5, c6 = st.columns(3)
+    selected_operators = c4.multiselect("Operatore fattura", sorted(docs["operator"].dropna().unique()), key="comm_operator")
+    selected_groups = c5.multiselect("Gruppo veicolo", sorted(docs["vehicle_group"].dropna().unique()), key="comm_group")
+    search_ra = c6.text_input("Cerca RA", key="comm_ra").strip()
+    c7, c8 = st.columns(2)
+    selected_channels = c7.multiselect("Tipo noleggio RA", sorted(docs["rental_channel"].unique()), key="comm_channel")
+    selected_terms = c8.multiselect("Durata RA", sorted(docs["rental_term"].unique()), key="comm_term")
+    for column, chosen in [("rental_channel",selected_channels),("rental_term",selected_terms),
+                            ("report_period",selected_periods),("Mese fattura",selected_months),
+                            ("document_type",selected_types),("operator",selected_operators),
+                            ("vehicle_group",selected_groups)]:
+        if chosen:
+            docs = docs[docs[column].isin(chosen)]
+    if search_ra:
+        docs = docs[docs["ra"].str.contains(search_ra,case=False,regex=False,na=False)]
+    if docs.empty:
+        st.info("Nessuna fattura corrisponde ai filtri.")
+        return
+    columns = st.columns(5)
+    for column, label, monetary in [("invoice_id","Documenti",False),
+                                   ("invoice_total","Totale fatture €",True),
+                                   ("commissionable_total","Imponibile commissionabile €",True),
+                                   ("base_commission","Provvigione base €",True),
+                                   ("total_commission","Provvigione totale €",True)]:
+        value = docs[column].sum() if monetary else len(docs)
+        columns[["invoice_id","invoice_total","commissionable_total","base_commission","total_commission"].index(column)].metric(
+            label, f"€ {value:,.2f}" if monetary else str(value))
+    items = commission_items(docs)
+    if items.empty:
+        st.info("Nessuna voce fattura presente.")
+        return
+    c9, c10 = st.columns(2)
+    families = c9.multiselect("Famiglia voci", sorted(items["famiglia"].unique()),
+                              default=[v for v in ["Coperture","Servizi aggiuntivi"] if v in set(items["famiglia"])],
+                              key="comm_family")
+    if families:
+        items = items[items["famiglia"].isin(families)]
+    selected_items = c10.multiselect("Voce fattura (es. Assicurazioni, Upgrade)",
+                                    sorted(items["voce"].unique()), key="comm_item")
+    if selected_items:
+        items = items[items["voce"].isin(selected_items)]
+    st.caption("Le metriche in alto sommano i documenti filtrati. I grafici qui sotto sommano solo le voci "
+               "selezionate, con note di credito e rettifiche mantenute con il loro segno.")
+    if items.empty:
+        st.info("Nessuna voce corrisponde ai filtri.")
+        return
+    by_item = items.groupby(["famiglia","voce"],as_index=False).agg(
+        importo=("importo","sum"), documenti=("invoice_id","nunique"))
+    by_family = items.groupby("famiglia",as_index=False).agg(importo=("importo","sum"))
+    c9, c10 = st.columns(2)
+    c9.plotly_chart(px.bar(by_item.sort_values("importo",ascending=False),x="voce",y="importo",
+                           color="famiglia",title="Voci fatturate per tipologia (netto)"),use_container_width=True)
+    c10.plotly_chart(px.bar(by_family,x="famiglia",y="importo",title="Voci fatturate per famiglia (netto)"),
+                     use_container_width=True)
+    st.subheader("Dettaglio voci")
+    st.dataframe(by_item.sort_values("importo",ascending=False),hide_index=True,use_container_width=True)
+    st.download_button("Esporta voci filtrate in Excel",table_to_excel(items,"Voci commissioni"),
+                       "commissioni_voci.xlsx",use_container_width=True)
+    with st.expander("Documenti del report"):
+        st.dataframe(docs[["invoice_id","invoice_number","document_type","invoice_date","ra",
+                           "operator","vehicle_group","invoice_total","commissionable_total","total_commission"]],
+                     hide_index=True,use_container_width=True)
+        st.download_button("Esporta fatture filtrate in Excel",table_to_excel(docs.drop(columns=["items_json"]),"Commissioni"),
+                           "commissioni_fatture.xlsx")
+    matches = docs[docs["rental_channel"] != "RA NON IMPORTATO"]
+    st.caption(f"Collegamenti agli RA importati nel perimetro filtrato: "
+               f"{matches['ra'].nunique()} contratti distinti, {len(matches)} documenti. "
+               "Un RA può avere più fatture o note di credito.")
+
+
+def commission_ra_detail(frame):
+    st.divider()
+    st.subheader("Voci Commissioni collegate agli RA selezionati")
+    invoices = load_commissions()
+    if invoices.empty:
+        st.info("Importa il report Commissioni per vedere le voci associate agli RA.")
+        return
+    selected_ra = frame[["ra","contract_date","ancillary_value","rental_channel","rental_term"]].copy()
+    selected_ra["contract_date"] = selected_ra["contract_date"].dt.strftime("%Y-%m-%d")
+    matching = invoices.merge(selected_ra,on=["ra","contract_date"],how="inner")
+    if matching.empty:
+        st.info("Nessuna fattura Commissioni corrisponde agli RA e alle date selezionate.")
+        return
+    st.caption(f"{matching['ra'].nunique()} RA distinti collegati a {len(matching)} fatture o note di credito. "
+               "Le voci fatturate possono differire dal valore ancillary riportato nel report RA.")
+    items = commission_items(matching)
+    choices = [v for v in ["Coperture","Servizi aggiuntivi"] if v in set(items["famiglia"])]
+    selected_families = st.multiselect("Famiglia delle voci fatturate", sorted(items["famiglia"].unique()),
+                                       default=choices, key="comm_ra_family")
+    if selected_families:
+        items = items[items["famiglia"].isin(selected_families)]
+    selected_products = st.multiselect("Voce Commissioni",sorted(items["voce"].unique()),key="comm_ra_product")
+    if selected_products:
+        items = items[items["voce"].isin(selected_products)]
+    if items.empty:
+        st.info("Nessuna voce corrisponde ai filtri.")
+        return
+    grouped = items.groupby("voce",as_index=False).agg(importo=("importo","sum"),fatture=("invoice_id","nunique"))
+    c1,c2 = st.columns(2)
+    c1.plotly_chart(px.bar(grouped.sort_values("importo",ascending=False),x="voce",y="importo",
+                           title="Voci fatturate degli RA selezionati"),use_container_width=True)
+    mix = items.merge(selected_ra[["ra","contract_date","rental_channel","rental_term"]],
+                      on=["ra","contract_date"],how="left")
+    breakdown = mix.groupby(["rental_channel","rental_term","voce"],as_index=False).agg(importo=("importo","sum"))
+    breakdown["Segmento"] = breakdown["rental_channel"]+" · "+breakdown["rental_term"]
+    c2.plotly_chart(px.bar(breakdown,x="Segmento",y="importo",color="voce",barmode="stack",
+                           title="Voci per tipo e durata noleggio"),use_container_width=True)
+    st.dataframe(grouped.sort_values("importo",ascending=False),hide_index=True,use_container_width=True)
+    st.download_button("Esporta scorporo Commissioni degli RA",table_to_excel(breakdown,"Commissioni RA"),
+                       "scorporo_commissioni_RA.xlsx",use_container_width=True)
+
+
+def ra_ancillary_breakdown(frame):
+    st.divider()
+    st.subheader("Scorporo ancillary dai report RA")
+    st.caption("Tutti i conteggi e i valori qui sotto provengono esclusivamente dai contratti RA "
+               "dopo i filtri selezionati in alto. I report importati indicano il totale ancillary "
+               "per RA, senza il nome del singolo prodotto.")
+    dimensions = {"Tipo noleggio": "rental_channel", "Durata noleggio": "rental_term",
+                  "Tipo veicolo": "contract_vehicle", "Fonte RA": "source_base",
+                  "Gruppo assegnato": "assigned_group", "Operatore": "operator"}
+    selected_dimension = st.selectbox("Raggruppa l'ancillary per", list(dimensions), key="ra_ancillary_group_by")
+    column = dimensions[selected_dimension]
+    view = frame.copy()
+    view["Segmento"] = view[column].fillna("").astype(str).str.strip().replace("", "NON INDICATO")
+    summary = view.groupby("Segmento", as_index=False).agg(
+        contratti=("id", "count"), contratti_con_ancillary=("has_ancillary_ra", "sum"),
+        giorni=("duration_days", "sum"), valore_ancillary=("ancillary_value", "sum"))
+    summary["penetrazione"] = summary["contratti_con_ancillary"].div(summary["contratti"].replace(0, pd.NA))
+    summary["rpd_ancillary"] = summary["valore_ancillary"].div(summary["giorni"].replace(0, pd.NA))
+    summary["ticket_medio"] = summary["valore_ancillary"].div(summary["contratti_con_ancillary"].replace(0, pd.NA))
+    summary = summary.sort_values("valore_ancillary", ascending=False)
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(px.bar(summary, x="Segmento", y="valore_ancillary",
+                           title=f"Valore ancillary per {selected_dimension.lower()}"), use_container_width=True)
+    c2.plotly_chart(px.bar(summary, x="Segmento", y=["contratti", "contratti_con_ancillary"],
+                           barmode="group", title=f"Contratti con ancillary per {selected_dimension.lower()}"),
+                    use_container_width=True)
+    c3, c4 = st.columns(2)
+    c3.plotly_chart(px.bar(summary, x="Segmento", y="penetrazione",
+                           title="Penetrazione ancillary per segmento"), use_container_width=True)
+    c4.plotly_chart(px.bar(summary, x="Segmento", y="rpd_ancillary",
+                           title="RPD ancillary per segmento"), use_container_width=True)
+    st.dataframe(summary.rename(columns={
+        "contratti": "Contratti", "contratti_con_ancillary": "Con ancillary",
+        "giorni": "Giorni", "valore_ancillary": "Valore ancillary €",
+        "penetrazione": "Penetrazione", "rpd_ancillary": "RPD ancillary €",
+        "ticket_medio": "Ticket medio €"}), hide_index=True, use_container_width=True)
+    st.download_button("Esporta scorporo RA in Excel",
+                       table_to_excel(summary, "Scorporo ancillary RA"),
+                       "scorporo_ancillary_RA.xlsx", use_container_width=True)
+
+
 def ancillary_ra_dashboard(frame):
     st.header("Analisi ancillary RA")
     st.caption("Tutti i valori provengono dai report Analisi contratti e seguono i filtri selezionati, incluso il gruppo assegnato.")
     frame = contract_filters(frame)
     if frame.empty:
-        st.info("Nessun dato ancillary disponibile per i filtri selezionati.")
+        st.info("Nessun dato ancillary RA disponibile per i filtri selezionati.")
         return
 
     contracts = len(frame)
@@ -1862,6 +2216,8 @@ def ancillary_ra_dashboard(frame):
     st.dataframe(by_group.sort_values("valore_ancillary", ascending=False), use_container_width=True, hide_index=True)
     st.subheader("Statistiche ancillary per operatore")
     st.dataframe(by_operator.sort_values("valore_ancillary", ascending=False), use_container_width=True, hide_index=True)
+    ra_ancillary_breakdown(frame)
+    commission_ra_detail(frame)
 
 
 def contracts_archive(frame):
@@ -2913,14 +3269,15 @@ def import_backup():
         st.download_button("Scarica database", DB_PATH.read_bytes(), "ancillary_backup.db", mime="application/octet-stream", use_container_width=True)
     st.caption("Conserva periodicamente il file di backup in una posizione sicura.")
     st.subheader("Importazione intelligente da Excel")
-    st.caption("Il gestionale riconosce automaticamente riepiloghi ancillary, report Analisi Contratti RA e file Addebito Danni.")
+    st.caption("Il gestionale riconosce riepiloghi ancillary, report Contratti RA, Commissioni e Addebito Danni.")
     upload = st.file_uploader("Carica un file Excel", type=["xlsx"])
     if upload:
         file_bytes = upload.getvalue()
         detected = detect_excel_type(file_bytes)
         labels = {
             "ANCILLARY": "Riepilogo ancillary", "CONTRATTI_RA": "Analisi Contratti RA",
-            "ADDEBITO_DANNI": "Riepilogo addebito danni", "SCONOSCIUTO": "Formato non riconosciuto",
+            "ADDEBITO_DANNI": "Riepilogo addebito danni", "COMMISSIONI": "Report Commissioni",
+            "SCONOSCIUTO": "Formato non riconosciuto",
         }
         st.info(f"Formato rilevato: **{labels[detected]}**")
         if st.button("Importa, scorpora e analizza", type="primary", disabled=detected == "SCONOSCIUTO", use_container_width=True):
@@ -2928,6 +3285,15 @@ def import_backup():
                 added, main_sheet, period = import_contract_workbook(file_bytes, upload.name)
                 st.success(f"Importati o aggiornati {added} contratti del periodo {period}. Foglio principale: {main_sheet}.")
                 st.rerun()
+            if detected == "COMMISSIONI":
+                try:
+                    added, periods = import_commission_workbook(file_bytes, upload.name)
+                except (ValueError, KeyError, OSError) as exc:
+                    st.error(f"Importazione Commissioni non riuscita: {exc}")
+                else:
+                    st.success(f"Importate o aggiornate {added} fatture Commissioni: {', '.join(periods)}.")
+                    st.rerun()
+                return
             if detected == "ADDEBITO_DANNI":
                 added, skipped = import_damage_workbook(file_bytes, upload.name)
                 st.success(f"Importate o aggiornate {added} segnalazioni danni.")
@@ -3240,6 +3606,7 @@ navigation = {
         ("🗂️ Archivio eventi", "Archivio eventi speciali"),
     ],
     "DOCUMENTI": [("📄 Documenti di trasporto", "Documenti di trasporto")],
+    "COMMISSIONI": [("📊 Analisi commissioni", "Analisi commissioni")],
     "AMMINISTRAZIONE": [
         ("🔐 Utenti e autorizzazioni", "Utenti e autorizzazioni"),
         ("👥 Configurazione operatori", "Configurazione operatori"),
@@ -3338,6 +3705,8 @@ elif page == "Inserimento ancillary":
     record_form(all_data)
 elif page == "Documenti di trasporto":
     documents_page()
+elif page == "Analisi commissioni":
+    commissions_page(all_contracts)
 elif page == "Configurazione operatori":
     operator_settings()
 elif page == "Utenti e autorizzazioni":
