@@ -561,8 +561,6 @@ def save_record(record):
 def load_data():
     with db() as conn:
         frame = pd.read_sql_query("SELECT * FROM rentals ORDER BY start_date DESC, created_at DESC", conn)
-    if frame.empty:
-        return frame
     frame["start_date"] = pd.to_datetime(frame["start_date"], errors="coerce")
     frame["rental_days"] = pd.to_numeric(frame["rental_days"], errors="coerce").fillna(0).astype(int)
     frame["ancillary_cost"] = pd.to_numeric(frame["ancillary_cost"], errors="coerce")
