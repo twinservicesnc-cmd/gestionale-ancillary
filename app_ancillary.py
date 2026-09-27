@@ -2009,22 +2009,67 @@ def commissions_page(contracts):
     if docs.empty:
         st.info("Nessuna fattura corrisponde ai filtri.")
         return
-    columns = st.columns(5)
-    for column, label, monetary in [("invoice_id","Documenti",False),
-                                   ("invoice_total","Totale fatture €",True),
-                                   ("commissionable_total","Imponibile commissionabile €",True),
-                                   ("base_commission","Provvigione base €",True),
-                                   ("total_commission","Provvigione totale €",True)]:
-        value = docs[column].sum() if monetary else len(docs)
-        columns[["invoice_id","invoice_total","commissionable_total","base_commission","total_commission"].index(column)].metric(
-            label, f"€ {value:,.2f}" if monetary else str(value))
+    st.subheader("Quadro economico del report")
+    metrics = [("Documenti", len(docs)), ("RA distinti", docs["ra"].nunique()),
+               ("Imponibile fatture €", docs["taxable_total"].sum()),
+               ("IVA €", docs["vat_total"].sum()),
+               ("Totale documenti €", docs["invoice_total"].sum()),
+               ("Imponibile commissionabile €", docs["commissionable_total"].sum()),
+               ("Provvigione base €", docs["base_commission"].sum()),
+               ("Provvigione totale €", docs["total_commission"].sum())]
+    for start in range(0, len(metrics), 4):
+        for card, (label, value) in zip(st.columns(4), metrics[start:start+4]):
+            card.metric(label, f"€ {value:,.2f}" if label.endswith("€") else str(value))
+
+    measures = {"Numero documenti": "documenti", "RA distinti": "ra_distinti",
+                "Giorni noleggio": "giorni", "Imponibile fatture €": "imponibile",
+                "IVA €": "iva", "Totale documenti €": "totale",
+                "Imponibile commissionabile €": "commissionabile",
+                "Provvigione base €": "provvigione_base",
+                "Provvigione totale €": "provvigione_totale"}
+    dimensions = {"Periodo report": "report_period", "Mese fattura": "Mese fattura",
+                  "Tipo documento": "document_type", "Operatore": "operator",
+                  "Gruppo veicolo": "vehicle_group", "Tipo noleggio RA": "rental_channel",
+                  "Durata RA": "rental_term", "Veicolo RA": "contract_vehicle",
+                  "RA": "ra"}
+    st.subheader("Scorporo dei documenti")
+    a, b = st.columns(2)
+    dimension = a.selectbox("Raggruppa per", list(dimensions), key="comm_dimension")
+    measure = b.selectbox("Misura", list(measures), index=5, key="comm_measure")
+    group = docs.copy()
+    group["Segmento"] = group[dimensions[dimension]].fillna("NON INDICATO").astype(str).replace("", "NON INDICATO")
+    summary = group.groupby("Segmento", as_index=False).agg(
+        documenti=("invoice_id", "nunique"), ra_distinti=("ra", "nunique"),
+        giorni=("rental_days", "sum"), imponibile=("taxable_total", "sum"),
+        iva=("vat_total", "sum"), totale=("invoice_total", "sum"),
+        commissionabile=("commissionable_total", "sum"),
+        provvigione_base=("base_commission", "sum"),
+        provvigione_totale=("total_commission", "sum"))
+    summary["provvigione_aggiuntiva"] = summary["provvigione_totale"] - summary["provvigione_base"]
+    summary["incidenza_provvigione"] = summary["provvigione_totale"].div(summary["commissionabile"].replace(0, float("nan")))
+    summary = summary.sort_values(measures[measure], ascending=False)
+    st.plotly_chart(px.bar(summary, x="Segmento", y=measures[measure],
+                           title=f"{measure} per {dimension.lower()}"), use_container_width=True)
+    st.dataframe(summary, hide_index=True, use_container_width=True)
+    st.download_button("Esporta scorporo documenti in Excel", table_to_excel(summary, "Scorporo documenti"),
+                       "commissioni_scorporo_documenti.xlsx", use_container_width=True)
+
+    monthly = docs.groupby("Mese fattura", as_index=False).agg(
+        documenti=("invoice_id", "nunique"), totale=("invoice_total", "sum"),
+        commissionabile=("commissionable_total", "sum"), provvigione=("total_commission", "sum"))
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(px.bar(monthly.sort_values("Mese fattura"), x="Mese fattura", y="totale",
+                           title="Totale documenti per mese fattura"), use_container_width=True)
+    c2.plotly_chart(px.bar(monthly.sort_values("Mese fattura"), x="Mese fattura", y="provvigione",
+                           title="Provvigioni per mese fattura"), use_container_width=True)
+
     items = commission_items(docs)
     if items.empty:
         st.info("Nessuna voce fattura presente.")
         return
     c9, c10 = st.columns(2)
     families = c9.multiselect("Famiglia voci", sorted(items["famiglia"].unique()),
-                              default=[v for v in ["Coperture","Servizi aggiuntivi"] if v in set(items["famiglia"])],
+                              default=sorted(items["famiglia"].unique()),
                               key="comm_family")
     if families:
         items = items[items["famiglia"].isin(families)]
@@ -2032,19 +2077,42 @@ def commissions_page(contracts):
                                     sorted(items["voce"].unique()), key="comm_item")
     if selected_items:
         items = items[items["voce"].isin(selected_items)]
-    st.caption("Le metriche in alto sommano i documenti filtrati. I grafici qui sotto sommano solo le voci "
-               "selezionate, con note di credito e rettifiche mantenute con il loro segno.")
+    st.caption("I totali documento seguono i filtri in alto; i grafici delle voci seguono anche i filtri famiglia e voce. "
+               "Gli importi delle note di credito e delle rettifiche mantengono il segno originale. "
+               "La somma delle voci non coincide necessariamente con il totale fattura o con l'ancillary RA.")
     if items.empty:
         st.info("Nessuna voce corrisponde ai filtri.")
         return
     by_item = items.groupby(["famiglia","voce"],as_index=False).agg(
         importo=("importo","sum"), documenti=("invoice_id","nunique"))
-    by_family = items.groupby("famiglia",as_index=False).agg(importo=("importo","sum"))
+    by_family = items.groupby("famiglia",as_index=False).agg(importo=("importo","sum"),
+                                                          documenti=("invoice_id","nunique"))
     c9, c10 = st.columns(2)
     c9.plotly_chart(px.bar(by_item.sort_values("importo",ascending=False),x="voce",y="importo",
                            color="famiglia",title="Voci fatturate per tipologia (netto)"),use_container_width=True)
     c10.plotly_chart(px.bar(by_family,x="famiglia",y="importo",title="Voci fatturate per famiglia (netto)"),
                      use_container_width=True)
+    st.subheader("Scorporo di tutte le voci fattura")
+    item_dimensions = {"Mese fattura": "Mese fattura", "Periodo report": "report_period",
+                       "Tipo documento": "document_type", "Operatore": "operator",
+                       "Gruppo veicolo": "vehicle_group", "Tipo noleggio RA": "rental_channel",
+                       "Durata RA": "rental_term", "Famiglia": "famiglia", "Voce": "voce"}
+    items = items.merge(docs[["invoice_id", "Mese fattura", "vehicle_group", "rental_channel", "rental_term"]],
+                        on="invoice_id", how="left", validate="many_to_one")
+    i1, i2 = st.columns(2)
+    item_dimension = i1.selectbox("Raggruppa le voci per", list(item_dimensions), key="comm_item_dimension")
+    item_measure = i2.selectbox("Misura delle voci", ["Importo netto €", "Documenti con voce", "Occorrenze"],
+                                key="comm_item_measure")
+    items["Segmento"] = items[item_dimensions[item_dimension]].fillna("NON INDICATO").astype(str).replace("", "NON INDICATO")
+    item_summary = items.groupby("Segmento", as_index=False).agg(
+        importo=("importo", "sum"), documenti=("invoice_id", "nunique"), occorrenze=("importo", "size"))
+    item_col = {"Importo netto €": "importo", "Documenti con voce": "documenti", "Occorrenze": "occorrenze"}[item_measure]
+    item_summary = item_summary.sort_values(item_col, ascending=False)
+    st.plotly_chart(px.bar(item_summary, x="Segmento", y=item_col,
+                           title=f"{item_measure} per {item_dimension.lower()}"), use_container_width=True)
+    st.dataframe(item_summary, hide_index=True, use_container_width=True)
+    st.download_button("Esporta scorporo voci in Excel", table_to_excel(item_summary, "Scorporo voci"),
+                       "commissioni_scorporo_voci.xlsx", use_container_width=True)
     st.subheader("Dettaglio voci")
     st.dataframe(by_item.sort_values("importo",ascending=False),hide_index=True,use_container_width=True)
     st.download_button("Esporta voci filtrate in Excel",table_to_excel(items,"Voci commissioni"),
@@ -2077,7 +2145,7 @@ def commission_ra_detail(frame):
     st.caption(f"{matching['ra'].nunique()} RA distinti collegati a {len(matching)} fatture o note di credito. "
                "Le voci fatturate possono differire dal valore ancillary riportato nel report RA.")
     items = commission_items(matching)
-    choices = [v for v in ["Coperture","Servizi aggiuntivi"] if v in set(items["famiglia"])]
+    choices = sorted(items["famiglia"].unique())
     selected_families = st.multiselect("Famiglia delle voci fatturate", sorted(items["famiglia"].unique()),
                                        default=choices, key="comm_ra_family")
     if selected_families:
