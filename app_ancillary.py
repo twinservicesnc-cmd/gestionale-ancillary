@@ -1817,7 +1817,9 @@ def record_form(frame):
 
 # Area Vetture: schede e fotografie salvate insieme nel database del gestionale.
 VEHICLE_CHECKLIST = ['Calze da neve', 'Libretto', 'Assicurazione', 'Seconda chiave',
-                     'Triangolo', 'Giubbotto riflettente', 'Kit riparazione / ruota di scorta']
+                     'Triangolo', 'Giubbotto riflettente', 'Kit gonfiaggio',
+                     'Cavo elettrico domestico', 'Cavo elettrico per colonnina',
+                     'Libretto uso e manutenzione', 'Modulo CAI', 'Dichiarazione incidente']
 
 
 def vehicle_tables():
@@ -1883,6 +1885,57 @@ def save_vehicle_check(payload, photos, check_id=None, removed_photos=None):
     return identifier
 
 
+def vehicle_ready(payload):
+    tires = payload.get('tires') or [{}]
+    return (payload.get('damage_status') == 'Senza danni'
+            and bool(payload.get('tires_ok'))
+            and all(str(tires[0].get(field, '')).strip() for field in ['Marca', 'Modello', 'Tipo', 'Misura', 'Stato / note'])
+            and bool(payload.get('checklist'))
+            and all(row.get('Presente') or row.get('Non previsto') for row in payload['checklist']))
+
+
+def vehicle_notify(identifier, payload):
+    if not vehicle_ready(payload):
+        return 'Mail ATP non inviata: la vettura non risulta ancora completamente OK.'
+    with db() as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS vehicle_email_log (check_id TEXT PRIMARY KEY, sent_at TEXT, recipient TEXT)')
+        if conn.execute('SELECT 1 FROM vehicle_email_log WHERE check_id=?', (identifier,)).fetchone():
+            return 'Mail ATP già inviata per questa scheda.'
+    try:
+        config = dict(st.secrets.get('vehicle_email', {}))
+    except Exception:
+        config = {}
+    if not all(config.get(key) for key in ['host', 'sender', 'recipient']):
+        return 'Vettura OK. Mail ATP in attesa: configurare destinatario e servizio email.'
+    import smtplib
+    from email.message import EmailMessage
+    message = EmailMessage()
+    message['Subject'] = f"ATP 2026 - {payload['plate']}"
+    message['From'] = config['sender']
+    message['To'] = config['recipient']
+    tire = payload['tires'][0]
+    message.set_content(f"Vettura OK: {payload['plate']}\nMarca/modello: {payload['brand']} {payload['model']}\n"
+                        f"Controllo: {payload['checked_at']} - Operatore: {payload['operator']}\n"
+                        f"Km: {payload['km']}\nSenza danni. Dotazioni complete per la vettura. Pneumatici OK.\n"
+                        f"Pneumatici: {tire['Marca']} {tire['Modello']} - {tire['Tipo']} - {tire['Misura']} - {tire['Stato / note']}\n\n"
+                        + '\n'.join(f"{row['Voce']}: {'presente' if row.get('Presente') else 'non previsto'}" for row in payload['checklist']))
+    try:
+        port = int(config.get('port', 587))
+        factory = smtplib.SMTP_SSL if port == 465 else smtplib.SMTP
+        with factory(config['host'], port, timeout=20) as server:
+            if port != 465:
+                server.starttls()
+            if config.get('username'):
+                server.login(config['username'], config.get('password', ''))
+            server.send_message(message)
+        with db() as conn:
+            conn.execute('INSERT OR REPLACE INTO vehicle_email_log VALUES (?,?,?)',
+                         (identifier, datetime.now().isoformat(timespec='seconds'), config['recipient']))
+        return 'Mail ATP inviata.'
+    except Exception:
+        return 'Scheda salvata; invio email non riuscito. Verifica la configurazione e riprova dall’archivio.'
+
+
 def vehicle_check_form(current=None):
     current = current or {}
     data = json.loads(current.get('payload', '{}'))
@@ -1928,18 +1981,32 @@ def vehicle_check_form(current=None):
         checked_date = st.date_input('Data controllo', value=date.fromisoformat(data.get('checked_at', date.today().isoformat())[:10]))
         operator = st.selectbox('Operatore *', operators, index=operators.index(operator_value), disabled=bool(linked))
         st.subheader('Documenti e dotazioni')
-        checklist = data.get('checklist') or [{'Voce': label, 'Presente': False} for label in VEHICLE_CHECKLIST]
+        checklist = list(data.get('checklist') or [])
+        for label in VEHICLE_CHECKLIST:
+            if not any(row.get('Voce') == label for row in checklist):
+                checklist.append({'Voce': label, 'Presente': False, 'Non previsto': False})
+        for row in checklist:
+            row.setdefault('Non previsto', False)
         check_table = st.data_editor(pd.DataFrame(checklist), num_rows='dynamic', hide_index=True,
                                      use_container_width=True, key=prefix + '_checklist',
-                                     column_config={'Presente': st.column_config.CheckboxColumn('Presente')})
-        st.caption('Puoi aggiungere altre voci nella tabella e spuntare quelle presenti.')
+                                     column_config={'Presente': st.column_config.CheckboxColumn('Presente'),
+                                                    'Non previsto': st.column_config.CheckboxColumn('Non previsto')})
+        st.caption('Spunta le dotazioni presenti. Per quelle non previste sulla vettura (ad esempio i cavi elettrici) spunta Non previsto. Puoi aggiungere voci.')
         st.subheader('Pneumatici')
-        tires = data.get('tires') or [{'Posizione': pos, 'Marca': '', 'Modello': '', 'Tipo': '',
-                                      'Misura': '', 'Stato / note': ''}
-                                     for pos in ['Anteriore sinistro', 'Anteriore destro', 'Posteriore sinistro', 'Posteriore destro']]
-        tire_table = st.data_editor(pd.DataFrame(tires), num_rows='dynamic', hide_index=True,
+        tire = (data.get('tires') or [{}])[0]
+        tires = [{field: tire.get(field, '') for field in ['Marca', 'Modello', 'Tipo', 'Misura', 'Stato / note']}]
+        tire_table = st.data_editor(pd.DataFrame(tires), num_rows='fixed', hide_index=True,
                                     use_container_width=True, key=prefix + '_tires',
                                     column_config={'Tipo': st.column_config.SelectboxColumn('Tipo', options=['', 'Estivi', 'Invernali', '4 stagioni'])})
+        tires_ok = st.checkbox('Confermo pneumatici OK', value=bool(data.get('tires_ok', False)))
+        st.subheader('Danni vettura')
+        damage_options = ['Da verificare', 'Senza danni', 'Con danni']
+        damage_status = st.selectbox('Stato danni', damage_options,
+                                    index=damage_options.index(data.get('damage_status', 'Da verificare')))
+        damage_notes = st.text_area('Descrizione e posizione dei danni', value=data.get('damage_notes', ''))
+        damage_uploads = st.file_uploader('Fotografie dei danni', type=['jpg', 'jpeg', 'png', 'webp'],
+                                          accept_multiple_files=True, key=prefix + '_damage_uploads')
+        st.caption('Mail automatica ATP quando: senza danni, dotazioni presenti o non previste e pneumatici compilati e confermati OK.')
         notes = st.text_area('Note vettura', value=data.get('notes', ''))
         uploads = st.file_uploader('Carica fotografie (anche più immagini)', type=['jpg', 'jpeg', 'png', 'webp'],
                                     accept_multiple_files=True, key=prefix + '_uploads')
@@ -1949,18 +2016,26 @@ def vehicle_check_form(current=None):
     if submitted:
         payload = {'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
                    'km': km, 'fuel': fuel, 'operator': operator, 'checked_at': checked_date.isoformat(),
-                   'notes': notes, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
-                       'Presente': bool(row.get('Presente', False)) if pd.notna(row.get('Presente')) else False}
+                   'notes': notes, 'damage_status': damage_status, 'damage_notes': damage_notes, 'tires_ok': tires_ok, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
+                       'Presente': bool(row.get('Presente', False)) if pd.notna(row.get('Presente')) else False,
+                       'Non previsto': bool(row.get('Non previsto', False)) if pd.notna(row.get('Non previsto')) else False}
                        for row in check_table.to_dict('records') if pd.notna(row.get('Voce')) and str(row.get('Voce')).strip()],
                    'tires': tire_table.fillna('').to_dict('records')}
         try:
-            save_vehicle_check(payload, list(uploads or []) + st.session_state[pending_key], current.get('id'), removed)
+            if damage_status == 'Con danni' and not damage_notes.strip():
+                raise ValueError('Descrivi i danni rilevati.')
+            for damage_photo in damage_uploads or []:
+                if not damage_photo.name.startswith('DANNO_'):
+                    damage_photo.name = 'DANNO_' + damage_photo.name
+            identifier = save_vehicle_check(payload, list(uploads or []) + list(damage_uploads or []) + st.session_state[pending_key], current.get('id'), removed)
+            payload['plate'] = re.sub(r'[^A-Z0-9]', '', upper(plate))
+            mail_status = vehicle_notify(identifier, payload)
         except (ValueError, sqlite3.Error) as exc:
             st.error(f'Salvataggio non riuscito: {exc}')
         else:
             st.session_state.pop(pending_key, None)
             st.session_state['vehicle_form_nonce'] = nonce + 1
-            st.session_state['vehicle_saved_message'] = f"Scheda {upper(plate)} salvata con fotografie e checklist."
+            st.session_state['vehicle_saved_message'] = f"Scheda {upper(plate)} salvata. {mail_status}"
             st.rerun()
 
 
@@ -2000,6 +2075,10 @@ def vehicle_page(archive=False):
             history = pd.read_sql_query('SELECT action, username, changed_at, payload FROM vehicle_check_history WHERE check_id=? ORDER BY changed_at DESC', conn, params=(selected,))
         st.dataframe(history[['action', 'username', 'changed_at']], hide_index=True, use_container_width=True)
         st.download_button('Scarica storico completo', history.to_json(orient='records', force_ascii=False), 'storico_vettura.json', mime='application/json')
+    payload = json.loads(current['payload'])
+    st.info('Vettura OK' if vehicle_ready(payload) else 'Vettura da verificare / non completamente OK')
+    if vehicle_ready(payload) and st.button('Invia / riprova mail ATP', key='vehicle_retry_mail'):
+        st.info(vehicle_notify(selected, payload))
     vehicle_check_form(current)
 
 
