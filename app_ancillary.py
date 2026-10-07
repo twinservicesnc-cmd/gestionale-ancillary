@@ -2178,6 +2178,95 @@ def vehicle_summary_exports(stored, latest_checks, title, event_id):
     st.caption('Visualizzazione, Excel e PDF includono solo le vetture e le informazioni della sezione selezionata.')
 
 
+def vehicle_document_tables():
+    vehicle_tables()
+    with db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS vehicle_documents (
+            id TEXT PRIMARY KEY, plate TEXT NOT NULL, category TEXT NOT NULL,
+            file_name TEXT NOT NULL, mime_type TEXT, file_data BLOB NOT NULL,
+            created_at TEXT NOT NULL, username TEXT)''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_vehicle_documents_plate ON vehicle_documents(plate)')
+        conn.execute('CREATE TABLE IF NOT EXISTS event_file_plates (file_id TEXT PRIMARY KEY, plate TEXT NOT NULL)')
+
+
+def vehicle_plate_assets(plate):
+    vehicle_document_tables()
+    plate = re.sub(r'[^A-Z0-9]', '', upper(plate))
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        photos = [dict(row) for row in conn.execute('''SELECT p.id,p.file_name,p.mime_type,p.file_data,c.checked_at AS created_at,
+                    c.operator AS username,c.payload FROM vehicle_check_photos p JOIN vehicle_checks c ON p.check_id=c.id WHERE c.plate=?''', (plate,))]
+        docs = [dict(row) for row in conn.execute('SELECT * FROM vehicle_documents WHERE plate=?', (plate,))]
+        event_files = [dict(row) for row in conn.execute('''SELECT f.*,s.title FROM event_files f JOIN event_file_plates a ON a.file_id=f.id
+                     LEFT JOIN special_events s ON s.id=f.event_id WHERE a.plate=?''', (plate,))]
+    for photo in photos:
+        photo.update(category='Foto danni' if photo['file_name'].startswith('DANNO_') else 'Foto check-in',
+                     origin='Check-in', event_title=json.loads(photo.pop('payload')).get('event_title', ''))
+    for doc in docs:
+        doc.update(origin='Archivio targa', event_title='')
+    for file in event_files:
+        file.update(category='Documenti / foto evento', origin='Evento', event_title=file.get('title') or '')
+    return sorted(photos + docs + event_files, key=lambda row: row['created_at'], reverse=True)
+
+
+def vehicle_plate_zip(plate, assets):
+    from zipfile import ZipFile, ZIP_DEFLATED
+    output = io.BytesIO()
+    safe_plate = re.sub(r'[^A-Z0-9]', '', upper(plate))
+    with ZipFile(output, 'w', ZIP_DEFLATED) as archive:
+        for asset in assets:
+            category = re.sub(r'[^A-Za-z0-9_-]', '_', asset['category'])
+            name = re.sub(r'[^A-Za-z0-9_.-]', '_', Path(asset['file_name']).name) or 'allegato'
+            archive.writestr(f"{safe_plate}/{category}/{asset['created_at'][:10]}_{asset['id'][:8]}_{name}", asset['file_data'])
+        index = pd.DataFrame([{key: value for key,value in asset.items() if key not in ['file_data']} for asset in assets])
+        archive.writestr(f'{safe_plate}/indice_allegati.csv', index.to_csv(index=False).encode('utf-8-sig'))
+    return output.getvalue()
+
+
+def vehicle_documents_page():
+    vehicle_document_tables()
+    st.header('Archivio foto e documenti per targa')
+    st.caption('Le fotografie dei check-in sono raccolte automaticamente per targa, anche se appartengono a eventi diversi.')
+    with db() as conn:
+        plates = sorted({re.sub(r'[^A-Z0-9]', '', upper(row[0])) for row in conn.execute(
+            'SELECT plate FROM vehicle_checks UNION SELECT plate FROM vehicle_documents UNION SELECT plate FROM event_vehicles UNION SELECT plate FROM event_file_plates') if row[0]})
+    selected = st.selectbox('Cartella vettura', [''] + plates, format_func=lambda value:value or 'Seleziona una targa')
+    new_plate = st.text_input('Oppure inserisci una nuova targa')
+    plate = re.sub(r'[^A-Z0-9]', '', upper(new_plate or selected))
+    if not plate:
+        st.info('Seleziona o inserisci una targa per aprire la cartella.')
+        return
+    st.subheader(f'Cartella {plate}')
+    category = st.selectbox('Categoria dei nuovi allegati', ['Documenti vettura', 'Foto vettura', 'Foto danni', 'Manutenzione / officina', 'Assicurazione', 'Altro'])
+    uploads = st.file_uploader('Aggiungi documenti o fotografie', accept_multiple_files=True,
+                               type=['pdf','jpg','jpeg','png','webp','docx','xlsx','txt'], key='plate_upload_'+plate)
+    if st.button('Salva nella cartella della targa', disabled=not uploads, type='primary'):
+        oversized = [file.name for file in uploads if len(file.getvalue()) > 20*1024*1024]
+        if oversized:
+            st.error('Ogni allegato deve essere inferiore a 20 MB: ' + ', '.join(oversized))
+        else:
+            with db() as conn:
+                conn.executemany('INSERT INTO vehicle_documents VALUES (?,?,?,?,?,?,?,?)',
+                    [(str(uuid.uuid4()),plate,category,file.name,file.type or 'application/octet-stream',sqlite3.Binary(file.getvalue()),
+                      datetime.now().isoformat(timespec='seconds'),current_user().get('username','')) for file in uploads if file.getvalue()])
+            st.success('Allegati archiviati nella cartella della targa.')
+            st.rerun()
+    assets = vehicle_plate_assets(plate)
+    if not assets:
+        st.info('La cartella non contiene ancora fotografie o documenti.')
+        return
+    categories = st.multiselect('Filtra categorie', sorted({asset['category'] for asset in assets}))
+    filtered = [asset for asset in assets if not categories or asset['category'] in categories]
+    st.download_button('Scarica tutta la cartella della targa (ZIP)', vehicle_plate_zip(plate, assets), f'archivio_{plate}.zip', mime='application/zip')
+    st.caption(f'{len(assets)} allegati totali · {len(filtered)} visualizzati')
+    for asset in filtered:
+        with st.expander(f"{asset['created_at'][:10]} | {asset['category']} | {asset['file_name']}"):
+            st.caption(f"Origine: {asset['origin']} · Evento: {asset.get('event_title','')} · Operatore: {asset.get('username','')}")
+            if asset['mime_type'] and asset['mime_type'].startswith('image/'):
+                st.image(asset['file_data'], caption=asset['file_name'], width=350)
+            st.download_button('Apri / scarica allegato', asset['file_data'], asset['file_name'], mime=asset['mime_type'] or 'application/octet-stream', key='plate_asset_'+asset['origin']+asset['id'])
+
+
 def vehicle_check_form(current=None):
     current = current or {}
     data = json.loads(current.get('payload', '{}'))
@@ -3671,11 +3760,18 @@ def event_files_page(frame):
         st.info("Crea prima un evento.")
         return
     event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: event_label(records[item_id]))
+    vehicle_document_tables()
+    with db() as conn:
+        event_plates = sorted({row[0] for row in conn.execute('SELECT plate FROM event_vehicles WHERE event_id=?', (event_id,)) if row[0]})
+    asset_plate = st.selectbox('Associa allegati alla targa (facoltativo)', [''] + event_plates,
+                               format_func=lambda value:value or 'Documenti generali dell’evento', key='event_asset_plate_'+event_id)
     uploads = st.file_uploader("Carica documenti o fotografie", accept_multiple_files=True, key=f"event_upload_{event_id}")
     if st.button("Archivia allegati", type="primary", disabled=not uploads, use_container_width=True):
         rows = [(str(uuid.uuid4()), event_id, clean(file.name), clean(file.type), sqlite3.Binary(file.getvalue()), datetime.now().isoformat(timespec="seconds")) for file in uploads if file.getvalue()]
         with db() as conn:
             conn.executemany("INSERT INTO event_files VALUES (?, ?, ?, ?, ?, ?)", rows)
+            if asset_plate:
+                conn.executemany('INSERT INTO event_file_plates VALUES (?,?)', [(row[0], re.sub(r'[^A-Z0-9]', '', upper(asset_plate))) for row in rows])
         st.success(f"Allegati archiviati: {len(rows)}.")
         st.rerun()
     with db() as conn:
@@ -4267,7 +4363,8 @@ all_special_events = load_special_events()
 
 navigation = {
     "VETTURE": [("📱 Inserimento rapido vettura", "Inserimento rapido vettura"),
-                ("🚗 Archivio vetture", "Archivio vetture")],
+                ("🚗 Archivio vetture", "Archivio vetture"),
+                ("📁 Foto e documenti per targa", "Foto e documenti per targa")],
     "ANCILLARY": [
         ("📊 Dashboard ancillary", "Dashboard ancillary"),
         ("📈 Analisi ancillary RA", "Analisi ancillary RA"),
@@ -4395,6 +4492,8 @@ elif page == "Archivio eventi speciali":
     events_archive(all_special_events)
 elif page == "Inserimento rapido vettura":
     vehicle_page()
+elif page == "Foto e documenti per targa":
+    vehicle_documents_page()
 elif page == "Archivio vetture":
     vehicle_page(archive=True)
 elif page == "Archivio ancillary":
