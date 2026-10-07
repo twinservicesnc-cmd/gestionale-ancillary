@@ -34,7 +34,7 @@ CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
 DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 COMMISSION_SEED_PATH = APP_DIR / "commissioni_iniziali.json"
 ANCILLARY_START_DATE = date(2026, 10, 1)
-PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "COMMISSIONI", "AMMINISTRAZIONE"]
+PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "COMMISSIONI", "VETTURE", "AMMINISTRAZIONE"]
 CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
 CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
 
@@ -1813,6 +1813,194 @@ def record_form(frame):
                 conn.execute("DELETE FROM rentals WHERE id = ?", (current["id"],))
             st.success("Record eliminato.")
             st.rerun()
+
+
+# Area Vetture: schede e fotografie salvate insieme nel database del gestionale.
+VEHICLE_CHECKLIST = ['Calze da neve', 'Libretto', 'Assicurazione', 'Seconda chiave',
+                     'Triangolo', 'Giubbotto riflettente', 'Kit riparazione / ruota di scorta']
+
+
+def vehicle_tables():
+    with db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS vehicle_checks (
+            id TEXT PRIMARY KEY, plate TEXT NOT NULL, checked_at TEXT NOT NULL,
+            operator TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS vehicle_check_photos (
+            id TEXT PRIMARY KEY, check_id TEXT NOT NULL, file_name TEXT NOT NULL,
+            mime_type TEXT NOT NULL, file_data BLOB NOT NULL)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS vehicle_check_history (
+            id TEXT PRIMARY KEY, check_id TEXT NOT NULL, action TEXT NOT NULL,
+            username TEXT, changed_at TEXT NOT NULL, payload TEXT NOT NULL)''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_vehicle_plate ON vehicle_checks(plate, checked_at)')
+
+
+def save_vehicle_check(payload, photos, check_id=None, removed_photos=None):
+    vehicle_tables()
+    plate = re.sub(r'[^A-Z0-9]', '', upper(payload.get('plate')))
+    if not plate:
+        raise ValueError('Inserisci la targa.')
+    if not clean(payload.get('operator')):
+        raise ValueError('Seleziona un operatore.')
+    payload = dict(payload, plate=plate)
+    validated = []
+    for uploaded in photos or []:
+        content = uploaded.getvalue()
+        if not content:
+            continue
+        if len(content) > 15 * 1024 * 1024:
+            raise ValueError('Ogni fotografia deve essere inferiore a 15 MB.')
+        try:
+            with Image.open(io.BytesIO(content)) as picture:
+                picture.verify()
+        except Exception as exc:
+            raise ValueError(f'Immagine non leggibile: {uploaded.name}. Usa JPG, PNG o WEBP.') from exc
+        validated.append((str(uuid.uuid4()), uploaded.name, uploaded.type or 'image/jpeg', content))
+    now = datetime.now().isoformat(timespec='seconds')
+    identifier = check_id or str(uuid.uuid4())
+    encoded = json.dumps(payload, ensure_ascii=False)
+    with db() as conn:
+        previous = conn.execute('SELECT payload FROM vehicle_checks WHERE id=?', (identifier,)).fetchone()
+        if check_id and previous is None:
+            raise ValueError('Scheda non trovata. Riapri l’archivio.')
+        if previous:
+            conn.execute('INSERT INTO vehicle_check_history VALUES (?,?,?,?,?,?)',
+                         (str(uuid.uuid4()), identifier, 'PRIMA DELLA MODIFICA',
+                          current_user().get('username', ''), now, previous[0]))
+            conn.execute('UPDATE vehicle_checks SET plate=?, checked_at=?, operator=?, payload=?, updated_at=? WHERE id=?',
+                         (plate, payload['checked_at'], payload['operator'], encoded, now, identifier))
+        else:
+            conn.execute('INSERT INTO vehicle_checks VALUES (?,?,?,?,?,?,?)',
+                         (identifier, plate, payload['checked_at'], payload['operator'], encoded, now, now))
+        for photo_id in removed_photos or []:
+            conn.execute('DELETE FROM vehicle_check_photos WHERE id=? AND check_id=?', (photo_id, identifier))
+        conn.executemany('INSERT INTO vehicle_check_photos VALUES (?,?,?,?,?)',
+                         [(photo_id, identifier, name, mime, sqlite3.Binary(data))
+                          for photo_id, name, mime, data in validated])
+        conn.execute('INSERT INTO vehicle_check_history VALUES (?,?,?,?,?,?)',
+                     (str(uuid.uuid4()), identifier, 'MODIFICA' if previous else 'INSERIMENTO',
+                      current_user().get('username', ''), now, encoded))
+    return identifier
+
+
+def vehicle_check_form(current=None):
+    current = current or {}
+    data = json.loads(current.get('payload', '{}'))
+    nonce = st.session_state.get('vehicle_form_nonce', 0)
+    prefix = f"vehicle_{current.get('id', 'new')}_{nonce}"
+    operators = [row['name'] for row in configured_operators()]
+    linked = current_operator()
+    operator_value = linked or data.get('operator', '')
+    operators = list(dict.fromkeys([''] + operators + ([operator_value] if operator_value else [])))
+    st.caption('Compila e premi Salva: scheda e fotografie vengono registrate nel gestionale e associate alla targa.')
+    pending_key = prefix + '_shots'
+    st.session_state.setdefault(pending_key, [])
+    with st.expander('Scatta fotografie dalla fotocamera'):
+        shot_index = st.session_state.get(prefix + '_shot_index', 0)
+        shot = st.camera_input('Fotocamera', key=f'{prefix}_camera_{shot_index}')
+        if st.button('Aggiungi scatto alla scheda', key=prefix + '_add_shot', disabled=shot is None):
+            st.session_state[pending_key].append(shot)
+            st.session_state[prefix + '_shot_index'] = shot_index + 1
+            st.rerun()
+        st.caption(f"Scatti pronti da salvare: {len(st.session_state[pending_key])}")
+        if st.session_state[pending_key] and st.button('Svuota scatti non salvati', key=prefix + '_clear_shots'):
+            st.session_state[pending_key] = []
+            st.rerun()
+    existing = []
+    if current:
+        with db() as conn:
+            conn.row_factory = sqlite3.Row
+            existing = [dict(row) for row in conn.execute('SELECT * FROM vehicle_check_photos WHERE check_id=?', (current['id'],))]
+        for photo in existing:
+            st.image(photo['file_data'], caption=photo['file_name'], width=250)
+            st.download_button('Scarica foto', photo['file_data'], photo['file_name'], mime=photo['mime_type'], key=prefix + photo['id'])
+    with st.form(prefix + '_form'):
+        plate = st.text_input('Targa *', value=data.get('plate', ''))
+        a, b = st.columns(2)
+        brand = a.text_input('Marca', value=data.get('brand', ''))
+        model = b.text_input('Modello', value=data.get('model', ''))
+        a, b = st.columns(2)
+        group = a.text_input('Gruppo vettura', value=data.get('group', ''))
+        ra = b.text_input('RA (facoltativo)', value=data.get('ra', ''))
+        a, b = st.columns(2)
+        km = a.number_input('Chilometri', min_value=0, step=1, value=int(data.get('km', 0)))
+        fuel = b.slider('Carburante / carica (%)', 0, 100, int(data.get('fuel', 100)))
+        checked_date = st.date_input('Data controllo', value=date.fromisoformat(data.get('checked_at', date.today().isoformat())[:10]))
+        operator = st.selectbox('Operatore *', operators, index=operators.index(operator_value), disabled=bool(linked))
+        st.subheader('Documenti e dotazioni')
+        checklist = data.get('checklist') or [{'Voce': label, 'Presente': False} for label in VEHICLE_CHECKLIST]
+        check_table = st.data_editor(pd.DataFrame(checklist), num_rows='dynamic', hide_index=True,
+                                     use_container_width=True, key=prefix + '_checklist',
+                                     column_config={'Presente': st.column_config.CheckboxColumn('Presente')})
+        st.caption('Puoi aggiungere altre voci nella tabella e spuntare quelle presenti.')
+        st.subheader('Pneumatici')
+        tires = data.get('tires') or [{'Posizione': pos, 'Marca': '', 'Modello': '', 'Tipo': '',
+                                      'Misura': '', 'Stato / note': ''}
+                                     for pos in ['Anteriore sinistro', 'Anteriore destro', 'Posteriore sinistro', 'Posteriore destro']]
+        tire_table = st.data_editor(pd.DataFrame(tires), num_rows='dynamic', hide_index=True,
+                                    use_container_width=True, key=prefix + '_tires',
+                                    column_config={'Tipo': st.column_config.SelectboxColumn('Tipo', options=['', 'Estivi', 'Invernali', '4 stagioni'])})
+        notes = st.text_area('Note vettura', value=data.get('notes', ''))
+        uploads = st.file_uploader('Carica fotografie (anche più immagini)', type=['jpg', 'jpeg', 'png', 'webp'],
+                                    accept_multiple_files=True, key=prefix + '_uploads')
+        removed = st.multiselect('Foto da eliminare dalla scheda', [p['id'] for p in existing],
+                                 format_func=lambda value: next(p['file_name'] for p in existing if p['id'] == value)) if existing else []
+        submitted = st.form_submit_button('Salva scheda vettura', type='primary', use_container_width=True)
+    if submitted:
+        payload = {'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
+                   'km': km, 'fuel': fuel, 'operator': operator, 'checked_at': checked_date.isoformat(),
+                   'notes': notes, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
+                       'Presente': bool(row.get('Presente', False)) if pd.notna(row.get('Presente')) else False}
+                       for row in check_table.to_dict('records') if pd.notna(row.get('Voce')) and str(row.get('Voce')).strip()],
+                   'tires': tire_table.fillna('').to_dict('records')}
+        try:
+            save_vehicle_check(payload, list(uploads or []) + st.session_state[pending_key], current.get('id'), removed)
+        except (ValueError, sqlite3.Error) as exc:
+            st.error(f'Salvataggio non riuscito: {exc}')
+        else:
+            st.session_state.pop(pending_key, None)
+            st.session_state['vehicle_form_nonce'] = nonce + 1
+            st.session_state['vehicle_saved_message'] = f"Scheda {upper(plate)} salvata con fotografie e checklist."
+            st.rerun()
+
+
+def vehicle_page(archive=False):
+    vehicle_tables()
+    st.header('Archivio vetture' if archive else 'Inserimento rapido vettura')
+    message = st.session_state.pop('vehicle_saved_message', None)
+    if message:
+        st.success(message)
+    if not archive:
+        vehicle_check_form()
+        return
+    with db() as conn:
+        frame = pd.read_sql_query('SELECT * FROM vehicle_checks ORDER BY checked_at DESC, created_at DESC', conn)
+    if frame.empty:
+        st.info('Nessuna scheda vettura salvata. Apri Inserimento rapido vettura per aggiungerne una.')
+        return
+    search = re.sub(r'[^A-Z0-9]', '', upper(st.text_input('Cerca targa')))
+    if search:
+        frame = frame[frame['plate'].str.contains(search, regex=False)]
+    if frame.empty:
+        st.info('Nessuna vettura corrisponde alla ricerca.')
+        return
+    summary = pd.DataFrame([dict(json.loads(row.payload), id=row.id) for row in frame.itertuples()])
+    st.dataframe(summary[['plate', 'brand', 'model', 'group', 'checked_at', 'operator', 'km', 'fuel', 'ra']].rename(
+        columns={'plate': 'Targa', 'brand': 'Marca', 'model': 'Modello', 'group': 'Gruppo', 'checked_at': 'Data controllo',
+                 'operator': 'Operatore', 'km': 'Km', 'fuel': 'Carburante / carica %', 'ra': 'RA'}), hide_index=True, use_container_width=True)
+    export = summary.copy()
+    for column in ['checklist', 'tires']:
+        export[column] = export[column].map(lambda value: json.dumps(value, ensure_ascii=False))
+    st.download_button('Esporta archivio vetture in Excel', table_to_excel(export, 'Vetture'), 'archivio_vetture.xlsx')
+    selected = st.selectbox('Apri o modifica una scheda', frame['id'].tolist(),
+                            format_func=lambda value: f"{frame.loc[frame['id'].eq(value), 'plate'].iloc[0]} · {frame.loc[frame['id'].eq(value), 'checked_at'].iloc[0]} · {value[:8]}")
+    current = frame.loc[frame['id'].eq(selected)].iloc[0].to_dict()
+    with st.expander('Storico modifiche della scheda'):
+        with db() as conn:
+            history = pd.read_sql_query('SELECT action, username, changed_at, payload FROM vehicle_check_history WHERE check_id=? ORDER BY changed_at DESC', conn, params=(selected,))
+        st.dataframe(history[['action', 'username', 'changed_at']], hide_index=True, use_container_width=True)
+        st.download_button('Scarica storico completo', history.to_json(orient='records', force_ascii=False), 'storico_vettura.json', mime='application/json')
+    vehicle_check_form(current)
 
 
 def archive(frame):
@@ -3638,6 +3826,8 @@ all_cash_movements = load_cash_movements()
 all_special_events = load_special_events()
 
 navigation = {
+    "VETTURE": [("📱 Inserimento rapido vettura", "Inserimento rapido vettura"),
+                ("🚗 Archivio vetture", "Archivio vetture")],
     "ANCILLARY": [
         ("📊 Dashboard ancillary", "Dashboard ancillary"),
         ("📈 Analisi ancillary RA", "Analisi ancillary RA"),
@@ -3763,6 +3953,10 @@ elif page == "Allegati eventi speciali":
     event_files_page(all_special_events)
 elif page == "Archivio eventi speciali":
     events_archive(all_special_events)
+elif page == "Inserimento rapido vettura":
+    vehicle_page()
+elif page == "Archivio vetture":
+    vehicle_page(archive=True)
 elif page == "Archivio ancillary":
     archive(filtered)
 elif page == "Archivio contratti RA":
