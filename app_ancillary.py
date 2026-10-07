@@ -796,6 +796,12 @@ def load_special_events():
     return frame
 
 
+def event_label(record):
+    start = pd.to_datetime(record.start_date, errors='coerce')
+    formatted = start.strftime('%d/%m/%Y') if pd.notna(start) else 'data non indicata'
+    return f"{record.title} | Inizio {formatted} | {str(record.id)[:8]}"
+
+
 def event_options(frame):
     if frame.empty:
         return {}, []
@@ -1959,12 +1965,13 @@ def vehicle_check_form(current=None):
     prefix = f"vehicle_{current.get('id', 'new')}_{nonce}"
     events = load_special_events()
     event_map = {row.id: row.title for row in events.itertuples()} if not events.empty else {}
+    event_labels = {row.id: event_label(row) for row in events.itertuples()} if not events.empty else {}
     event_choices = [''] + list(event_map)
     previous_event = data.get('event_id', '')
     st.subheader('Evento del check-in')
     event_id = st.selectbox('Scegli prima l’evento', event_choices,
                             index=event_choices.index(previous_event) if previous_event in event_choices else 0,
-                            format_func=lambda value: event_map.get(value, 'Nessun evento — scheda generale'),
+                            format_func=lambda value: event_labels.get(value, 'Nessun evento — scheda generale'),
                             key=prefix + '_event')
     if event_id:
         st.info(f"La vettura verrà inserita nell’evento: {event_map[event_id]}")
@@ -3250,11 +3257,11 @@ def special_events_dashboard(frame):
 
 
 def special_event_form(frame):
-    st.header("Crea o modifica evento")
+    st.header("Crea, modifica o elimina evento")
     records, record_ids = event_options(frame)
     selected = st.selectbox(
         "Evento da modificare (lascia vuoto per crearne uno nuovo)", [""] + record_ids,
-        format_func=lambda item_id: "" if not item_id else f"{records[item_id].start_date.date()} | {records[item_id].title}",
+        format_func=lambda item_id: "" if not item_id else event_label(records[item_id]),
     )
     current = frame[frame["id"].eq(selected)].iloc[0].to_dict() if selected else {}
     prefix = current.get("id", "new_special_event")
@@ -3295,6 +3302,12 @@ def special_event_form(frame):
             st.error("Compila nome, tipologia, data iniziale e luogo.")
         elif end_date < start_date:
             st.error("La data finale non può precedere quella iniziale.")
+        elif not current and not frame.empty and (
+            frame['title'].fillna('').str.strip().str.upper().eq(upper(title))
+            & frame['start_date'].dt.date.eq(start_date)
+            & frame['location'].fillna('').str.strip().str.upper().eq(upper(location))
+        ).any():
+            st.error('Esiste già un evento con questo nome, data iniziale e luogo. Selezionalo nella tendina per modificarlo.')
         else:
             save_special_event({
                 "id": current.get("id"), "title": title, "event_type": event_type,
@@ -3308,9 +3321,19 @@ def special_event_form(frame):
             st.success("Evento salvato.")
             st.rerun()
     if current:
+        st.caption(f"Evento selezionato: {event_label(records[selected])}. Veicoli assegnati: {int(current.get('assigned_vehicles', 0))}; partecipanti: {int(current.get('participants', 0))}; allegati: {int(current.get('files', 0))}.")
         confirm = st.checkbox("Confermo l’eliminazione definitiva dell’evento e dei relativi allegati")
         if st.button("Elimina evento", disabled=not confirm, use_container_width=True):
+            vehicle_tables()
             with db() as conn:
+                checks = conn.execute('SELECT id, payload FROM vehicle_checks').fetchall()
+                for check in checks:
+                    payload = json.loads(check['payload'])
+                    if payload.get('event_id') == current['id']:
+                        payload['event_id'] = ''
+                        payload['event_title'] = ''
+                        payload.pop('event_vehicle_id', None)
+                        conn.execute('UPDATE vehicle_checks SET payload=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), check['id']))
                 conn.execute("DELETE FROM event_participants WHERE event_id = ?", (current["id"],))
                 conn.execute("DELETE FROM event_files WHERE event_id = ?", (current["id"],))
                 conn.execute("DELETE FROM event_vehicles WHERE event_id = ?", (current["id"],))
@@ -3330,7 +3353,12 @@ def events_calendar(frame):
     result["Mese"] = result["start_date"].dt.strftime("%Y-%m")
     display = result[["start_date", "end_date", "title", "event_type", "location", "start_time", "end_time", "responsible", "status"]].copy()
     display.columns = ["Data inizio", "Data fine", "Evento", "Tipologia", "Luogo", "Ora inizio", "Ora fine", "Responsabile", "Stato"]
-    st.dataframe(display.sort_values("Data inizio"), use_container_width=True, hide_index=True)
+    display['Data inizio'] = display['Data inizio'].dt.strftime('%d/%m/%Y')
+    display['Data fine'] = display['Data fine'].dt.strftime('%d/%m/%Y')
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.divider()
+    st.caption('Seleziona qui sotto l’evento da modificare o eliminare. I codici brevi distinguono gli eventi con lo stesso nome.')
+    special_event_form(result)
 
 
 def events_archive(frame):
@@ -3362,7 +3390,7 @@ def event_participants_page(frame):
     if not record_ids:
         st.info("Crea prima un evento.")
         return
-    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}")
+    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: event_label(records[item_id]))
     with st.form("add_event_participant", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         name = c1.text_input("Nome *")
@@ -3396,7 +3424,7 @@ def event_files_page(frame):
     if not record_ids:
         st.info("Crea prima un evento.")
         return
-    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}")
+    event_id = st.selectbox("Evento", record_ids, format_func=lambda item_id: event_label(records[item_id]))
     uploads = st.file_uploader("Carica documenti o fotografie", accept_multiple_files=True, key=f"event_upload_{event_id}")
     if st.button("Archivia allegati", type="primary", disabled=not uploads, use_container_width=True):
         rows = [(str(uuid.uuid4()), event_id, clean(file.name), clean(file.type), sqlite3.Binary(file.getvalue()), datetime.now().isoformat(timespec="seconds")) for file in uploads if file.getvalue()]
@@ -3432,7 +3460,7 @@ def event_vehicles_page(frame):
     event_id = st.selectbox(
         "Evento",
         record_ids,
-        format_func=lambda item_id: f"{records[item_id].start_date.date()} | {records[item_id].title}",
+        format_func=lambda item_id: event_label(records[item_id]),
         key="event_vehicle_event",
     )
     with db() as conn:
@@ -3985,7 +4013,7 @@ navigation = {
     ],
     "EVENTI SPECIALI": [
         ("📊 Dashboard eventi", "Dashboard eventi speciali"),
-        ("➕ Crea evento", "Crea evento speciale"),
+        ("✏️ Crea / modifica / elimina evento", "Crea evento speciale"),
         ("📅 Calendario eventi", "Calendario eventi speciali"),
         ("🚗 Veicoli evento", "Veicoli eventi speciali"),
         ("👥 Partecipanti e personale", "Partecipanti eventi speciali"),
