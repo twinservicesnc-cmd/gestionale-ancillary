@@ -1860,8 +1860,24 @@ def save_vehicle_check(payload, photos, check_id=None, removed_photos=None):
         validated.append((str(uuid.uuid4()), uploaded.name, uploaded.type or 'image/jpeg', content))
     now = datetime.now().isoformat(timespec='seconds')
     identifier = check_id or str(uuid.uuid4())
-    encoded = json.dumps(payload, ensure_ascii=False)
     with db() as conn:
+        event_id = payload.get('event_id', '')
+        if event_id:
+            event = conn.execute('SELECT title FROM special_events WHERE id=?', (event_id,)).fetchone()
+            if event is None:
+                raise ValueError('Evento non trovato. Seleziona un evento esistente.')
+            payload['event_title'] = event[0]
+            vehicles = conn.execute('SELECT id, plate FROM event_vehicles WHERE event_id=?', (event_id,)).fetchall()
+            existing_vehicle = next((row[0] for row in vehicles if re.sub(r'[^A-Z0-9]', '', upper(row[1])) == plate), None)
+            vehicle_id = existing_vehicle or str(uuid.uuid4())
+            if existing_vehicle:
+                conn.execute('UPDATE event_vehicles SET vehicle_group=?, plate=?, brand=?, model=?, ra=?, updated_at=? WHERE id=?',
+                             (payload.get('group', ''), plate, payload.get('brand', ''), payload.get('model', ''), payload.get('ra', ''), now, vehicle_id))
+            else:
+                conn.execute('INSERT INTO event_vehicles (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                             (vehicle_id, event_id, payload.get('group', ''), plate, payload.get('brand', ''), payload.get('model', ''), '', payload.get('ra', ''), '', '', now))
+            payload['event_vehicle_id'] = vehicle_id
+        encoded = json.dumps(payload, ensure_ascii=False)
         previous = conn.execute('SELECT payload FROM vehicle_checks WHERE id=?', (identifier,)).fetchone()
         if check_id and previous is None:
             raise ValueError('Scheda non trovata. Riapri l’archivio.')
@@ -1941,6 +1957,17 @@ def vehicle_check_form(current=None):
     data = json.loads(current.get('payload', '{}'))
     nonce = st.session_state.get('vehicle_form_nonce', 0)
     prefix = f"vehicle_{current.get('id', 'new')}_{nonce}"
+    events = load_special_events()
+    event_map = {row.id: row.title for row in events.itertuples()} if not events.empty else {}
+    event_choices = [''] + list(event_map)
+    previous_event = data.get('event_id', '')
+    st.subheader('Evento del check-in')
+    event_id = st.selectbox('Scegli prima l’evento', event_choices,
+                            index=event_choices.index(previous_event) if previous_event in event_choices else 0,
+                            format_func=lambda value: event_map.get(value, 'Nessun evento — scheda generale'),
+                            key=prefix + '_event')
+    if event_id:
+        st.info(f"La vettura verrà inserita nell’evento: {event_map[event_id]}")
     operators = [row['name'] for row in configured_operators()]
     linked = current_operator()
     operator_value = linked or data.get('operator', '')
@@ -2014,7 +2041,7 @@ def vehicle_check_form(current=None):
                                  format_func=lambda value: next(p['file_name'] for p in existing if p['id'] == value)) if existing else []
         submitted = st.form_submit_button('Salva scheda vettura', type='primary', use_container_width=True)
     if submitted:
-        payload = {'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
+        payload = {'event_id': event_id, 'event_title': event_map.get(event_id, ''), 'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
                    'km': km, 'fuel': fuel, 'operator': operator, 'checked_at': checked_date.isoformat(),
                    'notes': notes, 'damage_status': damage_status, 'damage_notes': damage_notes, 'tires_ok': tires_ok, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
                        'Presente': bool(row.get('Presente', False)) if pd.notna(row.get('Presente')) else False,
@@ -2060,8 +2087,9 @@ def vehicle_page(archive=False):
         st.info('Nessuna vettura corrisponde alla ricerca.')
         return
     summary = pd.DataFrame([dict(json.loads(row.payload), id=row.id) for row in frame.itertuples()])
-    st.dataframe(summary[['plate', 'brand', 'model', 'group', 'checked_at', 'operator', 'km', 'fuel', 'ra']].rename(
-        columns={'plate': 'Targa', 'brand': 'Marca', 'model': 'Modello', 'group': 'Gruppo', 'checked_at': 'Data controllo',
+    summary['event_title'] = summary.get('event_title', pd.Series('', index=summary.index)).fillna('')
+    st.dataframe(summary[['plate', 'brand', 'model', 'group', 'event_title', 'checked_at', 'operator', 'km', 'fuel', 'ra']].rename(
+        columns={'event_title': 'Evento', 'plate': 'Targa', 'brand': 'Marca', 'model': 'Modello', 'group': 'Gruppo', 'checked_at': 'Data controllo',
                  'operator': 'Operatore', 'km': 'Km', 'fuel': 'Carburante / carica %', 'ra': 'RA'}), hide_index=True, use_container_width=True)
     export = summary.copy()
     for column in ['checklist', 'tires']:
@@ -3419,6 +3447,30 @@ def event_vehicles_page(frame):
                 (event_id,),
             ).fetchall()
         ]
+    vehicle_tables()
+    with db() as conn:
+        checks = pd.read_sql_query('SELECT id, plate, payload, checked_at FROM vehicle_checks ORDER BY checked_at DESC, created_at DESC', conn)
+    linked_checks = [(row, json.loads(row.payload)) for row in checks.itertuples()
+                     if json.loads(row.payload).get('event_id') == event_id]
+    with st.expander(f"Check-in vetture dell’evento ({len(linked_checks)})"):
+        if not linked_checks:
+            st.info('Nessun check-in collegato. Seleziona questo evento in VETTURE → Inserimento rapido vettura.')
+        else:
+            options = {row.id: (row, payload) for row, payload in linked_checks}
+            selected_check = st.selectbox('Scheda check-in', list(options),
+                format_func=lambda value: f"{options[value][0].plate} · {options[value][0].checked_at}", key=f'event_check_{event_id}')
+            row, payload = options[selected_check]
+            st.write('Vettura OK' if vehicle_ready(payload) else 'Vettura da verificare / non completamente OK')
+            st.write(f"Operatore: {payload.get('operator', '')} — Km: {payload.get('km', '')}")
+            st.dataframe(pd.DataFrame(payload.get('checklist', [])), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(payload.get('tires', [])), hide_index=True, use_container_width=True)
+            st.write(f"Danni: {payload.get('damage_status', 'Da verificare')} — {payload.get('damage_notes', '')}")
+            with db() as conn:
+                conn.row_factory = sqlite3.Row
+                photos = [dict(photo) for photo in conn.execute('SELECT * FROM vehicle_check_photos WHERE check_id=?', (selected_check,))]
+            for photo in photos:
+                st.image(photo['file_data'], caption=photo['file_name'], width=250)
+            st.caption('Per modificare la scheda, apri VETTURE → Archivio vetture e seleziona questa targa.')
     st.subheader("Inserimento o modifica veicolo")
     vehicle_by_id = {item["id"]: item for item in stored}
     selected_vehicle_id = st.selectbox(
