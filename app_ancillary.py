@@ -1574,8 +1574,9 @@ def event_vehicles_to_pdf(frame, event_title):
     if "Stato" in export.columns:
         export["Stato"] = export["Data ritiro"].fillna("").astype(str).str.strip().map(lambda value: "RITIRATA" if value else "DA RITIRARE")
     export = export.fillna("").astype(str)
-    if "Approntamento" in export.columns:
-        export["Approntamento"] = export["Approntamento"].str.replace(r"^[🔴🟡🟢]\s*", "", regex=True)
+    for column in ["Approntamento", "Pulizia interna", "Pulizia esterna", "Manutenzione"]:
+        if column in export.columns:
+            export[column] = export[column].str.replace(r"^[🔴🟡🟢]\s*", "", regex=True)
     data = [list(export.columns)] + export.values.tolist()
     widths = [281 / max(len(export.columns), 1)] * len(export.columns)
     table = Table(data, repeatRows=1, colWidths=[width * mm for width in widths])
@@ -1843,6 +1844,9 @@ def vehicle_tables():
             id TEXT PRIMARY KEY, check_id TEXT NOT NULL, action TEXT NOT NULL,
             username TEXT, changed_at TEXT NOT NULL, payload TEXT NOT NULL)''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_vehicle_plate ON vehicle_checks(plate, checked_at)')
+        event_columns = {row[1] for row in conn.execute('PRAGMA table_info(event_vehicles)')}
+        if event_columns and 'park_number' not in event_columns:
+            conn.execute("ALTER TABLE event_vehicles ADD COLUMN park_number TEXT NOT NULL DEFAULT ''")
 
 
 def save_vehicle_check(payload, photos, check_id=None, removed_photos=None):
@@ -1884,6 +1888,7 @@ def save_vehicle_check(payload, photos, check_id=None, removed_photos=None):
             else:
                 conn.execute('INSERT INTO event_vehicles (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                              (vehicle_id, event_id, payload.get('group', ''), plate, payload.get('brand', ''), payload.get('model', ''), '', payload.get('ra', ''), '', '', now))
+            conn.execute('UPDATE event_vehicles SET park_number=? WHERE id=?', (payload.get('park_number', ''), vehicle_id))
             payload['event_vehicle_id'] = vehicle_id
         encoded = json.dumps(payload, ensure_ascii=False)
         previous = conn.execute('SELECT payload FROM vehicle_checks WHERE id=?', (identifier,)).fetchone()
@@ -1911,11 +1916,23 @@ def save_vehicle_check(payload, photos, check_id=None, removed_photos=None):
 
 def vehicle_ready(payload):
     tires = payload.get('tires') or [{}]
-    return (payload.get('damage_status') == 'Senza danni'
+    return (payload.get('cleaning_inside') == 'Pulita'
+            and payload.get('cleaning_outside') == 'Pulita'
+            and payload.get('maintenance', '').startswith('No')
+            and payload.get('damage_status') == 'Senza danni'
             and bool(payload.get('tires_ok'))
             and all(str(tires[0].get(field, '')).strip() for field in ['Marca', 'Modello', 'Tipo', 'Misura', 'Stato / note'])
             and bool(payload.get('checklist'))
             and all(row.get('Presente') or row.get('Non previsto') for row in payload['checklist']))
+
+
+CLEANING_OPTIONS = ['Da verificare', 'Pulita', 'Sporca']
+MAINTENANCE_OPTIONS = ['Da verificare', 'No — non necessaria', 'Sì — da effettuare', 'Sì — in manutenzione', 'No — rientrata / completata']
+
+
+def vehicle_service_label(value, maintenance=False):
+    ok = str(value).startswith('No') if maintenance else value == 'Pulita'
+    return ('🟢 ' if ok else '🔴 ') + (value or 'Da verificare')
 
 
 def vehicle_preparation(payload):
@@ -1967,6 +1984,79 @@ def vehicle_notify(identifier, payload):
         return 'Scheda salvata; invio email non riuscito. Verifica la configurazione e riprova dall’archivio.'
 
 
+def vehicle_sheet_pdf(payload, photos, works_only=False):
+    buffer = io.BytesIO()
+    styles = getSampleStyleSheet()
+    normal = styles['BodyText']
+    normal.fontSize = 9
+    normal.leading = 12
+    def paragraph(value):
+        return Paragraph(escape(str(value or '')).replace('\n', '<br/>'), normal)
+    plate = payload.get('plate', '')
+    title = 'Scheda danni e riparazioni' if works_only else 'Scheda vettura'
+    story = [Paragraph(f'{title} - {escape(plate)}', styles['Title']), Spacer(1, 4 * mm)]
+    def section(label, rows):
+        story.append(Paragraph(label, styles['Heading2']))
+        table = Table([[paragraph(key), paragraph(value)] for key, value in rows], colWidths=[48*mm, 132*mm])
+        table.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('GRID',(0,0),(-1,-1),0.4,colors.lightgrey),
+                                  ('BACKGROUND',(0,0),(0,-1),colors.HexColor('#EDF2F7')),
+                                  ('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),
+                                  ('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
+        story.extend([table, Spacer(1,3*mm)])
+    section('Identificazione', [('Targa',plate),('Vettura',f"{payload.get('brand','')} {payload.get('model','')}"),
+                               ('Evento',payload.get('event_title','')),('Park N°',payload.get('park_number','')),
+                               ('Data controllo',payload.get('checked_at','')),('Operatore',payload.get('operator','')),
+                               ('Chilometri',payload.get('km','')),('RA',payload.get('ra',''))])
+    section('Danni e manutenzione', [('Stato danni',payload.get('damage_status','Da verificare')),
+                                   ('Danni rilevati',payload.get('damage_notes','')),
+                                   ('Manutenzione',payload.get('maintenance','Da verificare')),
+                                   ('Riparazioni / lavori da eseguire',payload.get('repair_tasks','')),
+                                   ('Note manutenzione / pulizia',payload.get('maintenance_notes',''))])
+    if not works_only:
+        section('Pulizia e approntamento', [('Pulizia interna',payload.get('cleaning_inside','Da verificare')),
+                                         ('Pulizia esterna',payload.get('cleaning_outside','Da verificare')),
+                                         ('Approntamento',payload.get('preparation_status','Da verificare')),
+                                         ('Carburante / carica',f"{payload.get('fuel','')}%")])
+        section('Documenti e dotazioni',[(row.get('Voce',''), 'Presente' if row.get('Presente') else 'Non previsto' if row.get('Non previsto') else 'Mancante / da verificare') for row in payload.get('checklist', [])] or [('Dotazioni','Non compilate')])
+        section('Pneumatici',[(key,value) for row in payload.get('tires',[]) for key,value in row.items()] or [('Pneumatici','Non compilati')])
+        section('Note vettura',[('Note',payload.get('notes',''))])
+    selected_photos = [photo for photo in photos if not works_only or photo['file_name'].startswith('DANNO_')]
+    if selected_photos:
+        story.append(Paragraph('Fotografie dei danni' if works_only else 'Fotografie vettura e danni', styles['Heading2']))
+        for photo in selected_photos:
+            try:
+                picture = PdfImage(io.BytesIO(photo['file_data']))
+                factor = min(175*mm/picture.imageWidth, 95*mm/picture.imageHeight)
+                picture.drawWidth = picture.imageWidth * factor
+                picture.drawHeight = picture.imageHeight * factor
+                story.append(KeepTogether([paragraph(photo['file_name']),Spacer(1,2*mm),picture,Spacer(1,4*mm)]))
+            except Exception:
+                story.append(paragraph(f"Foto non stampabile: {photo['file_name']}"))
+    if works_only:
+        section('Compilazione officina', [('Interventi effettuati','\n\n\n'),('Data rientro / firma','\n\n')])
+    def footer(canvas, doc):
+        canvas.saveState();canvas.setFont('Helvetica',8)
+        canvas.drawString(15*mm,10*mm,f'{plate} - {title}')
+        canvas.drawRightString(195*mm,10*mm,f'Pagina {doc.page}')
+        canvas.restoreState()
+    SimpleDocTemplate(buffer,pagesize=A4,leftMargin=15*mm,rightMargin=15*mm,topMargin=12*mm,bottomMargin=18*mm).build(story,onFirstPage=footer,onLaterPages=footer)
+    return buffer.getvalue()
+
+
+def vehicle_print_buttons(payload, identifier, key_prefix):
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        photos = [dict(row) for row in conn.execute('SELECT * FROM vehicle_check_photos WHERE check_id=?', (identifier,))]
+    st.subheader('Stampa scheda vettura e lavori')
+    left, right = st.columns(2)
+    safe_plate = re.sub(r'[^A-Z0-9]', '', upper(payload.get('plate', ''))) or 'vettura'
+    left.download_button('PDF scheda vettura completa', vehicle_sheet_pdf(payload, photos),
+                         f'scheda_vettura_{safe_plate}.pdf', mime='application/pdf', key=key_prefix+'_full')
+    right.download_button('PDF danni e riparazioni da effettuare', vehicle_sheet_pdf(payload, photos, works_only=True),
+                          f'lavori_vettura_{safe_plate}.pdf', mime='application/pdf', key=key_prefix+'_works')
+    st.caption('Scarica e apri il PDF, poi usa Stampa. I PDF riportano gli ultimi dati salvati.')
+
+
 def vehicle_check_form(current=None):
     current = current or {}
     data = json.loads(current.get('payload', '{}'))
@@ -2012,6 +2102,7 @@ def vehicle_check_form(current=None):
             st.download_button('Scarica foto', photo['file_data'], photo['file_name'], mime=photo['mime_type'], key=prefix + photo['id'])
     with st.form(prefix + '_form'):
         plate = st.text_input('Targa *', value=data.get('plate', ''))
+        park_number = st.text_input('Park N°', value=data.get('park_number', ''))
         a, b = st.columns(2)
         brand = a.text_input('Marca', value=data.get('brand', ''))
         model = b.text_input('Modello', value=data.get('model', ''))
@@ -2050,6 +2141,14 @@ def vehicle_check_form(current=None):
         damage_uploads = st.file_uploader('Fotografie dei danni', type=['jpg', 'jpeg', 'png', 'webp'],
                                           accept_multiple_files=True, key=prefix + '_damage_uploads')
         st.caption('Mail automatica ATP quando: senza danni, dotazioni presenti o non previste e pneumatici compilati e confermati OK.')
+        st.subheader('Pulizia e manutenzione')
+        c_inside, c_outside = st.columns(2)
+        cleaning_inside = c_inside.selectbox('Pulizia interna', CLEANING_OPTIONS, index=CLEANING_OPTIONS.index(data.get('cleaning_inside', 'Da verificare')))
+        cleaning_outside = c_outside.selectbox('Pulizia esterna', CLEANING_OPTIONS, index=CLEANING_OPTIONS.index(data.get('cleaning_outside', 'Da verificare')))
+        maintenance = st.selectbox('Manutenzione', MAINTENANCE_OPTIONS, index=MAINTENANCE_OPTIONS.index(data.get('maintenance', 'Da verificare')))
+        repair_tasks = st.text_area('Riparazioni / lavori da eseguire', value=data.get('repair_tasks', ''), help='Indica gli interventi da riportare nella scheda stampata per l’officina.')
+        maintenance_notes = st.text_area('Note manutenzione / pulizia', value=data.get('maintenance_notes', ''))
+        st.caption('🟢 pulita / manutenzione non necessaria o completata; 🔴 sporca / manutenzione da effettuare o in corso. Ogni salvataggio conserva lo storico.')
         preparation_options = ['Da completare', 'Da verificare', 'Pronta']
         preparation_status = st.selectbox('Approntamento — conferma operatore', preparation_options,
             index=preparation_options.index(data.get('preparation_status', 'Da completare')))
@@ -2061,7 +2160,7 @@ def vehicle_check_form(current=None):
                                  format_func=lambda value: next(p['file_name'] for p in existing if p['id'] == value)) if existing else []
         submitted = st.form_submit_button('Salva scheda vettura', type='primary', use_container_width=True)
     if submitted:
-        payload = {'event_id': event_id, 'event_title': event_map.get(event_id, ''), 'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
+        payload = {'repair_tasks': repair_tasks, 'park_number': park_number, 'cleaning_inside': cleaning_inside, 'cleaning_outside': cleaning_outside, 'maintenance': maintenance, 'maintenance_notes': maintenance_notes, 'event_id': event_id, 'event_title': event_map.get(event_id, ''), 'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
                    'km': km, 'fuel': fuel, 'operator': operator, 'checked_at': checked_date.isoformat(),
                    'preparation_status': preparation_status, 'preparation_operator': operator, 'notes': notes, 'damage_status': damage_status, 'damage_notes': damage_notes, 'tires_ok': tires_ok, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
                        'Presente': bool(row.get('Presente', False)) if pd.notna(row.get('Presente')) else False,
@@ -2127,6 +2226,7 @@ def vehicle_page(archive=False):
     st.info('Vettura OK' if vehicle_ready(payload) else 'Vettura da verificare / non completamente OK')
     if vehicle_ready(payload) and st.button('Invia / riprova mail ATP', key='vehicle_retry_mail'):
         st.info(vehicle_notify(selected, payload))
+    vehicle_print_buttons(payload, selected, 'archive_'+selected)
     vehicle_check_form(current)
 
 
@@ -3461,6 +3561,7 @@ def event_files_page(frame):
 
 
 def event_vehicles_page(frame):
+    vehicle_tables()
     st.header("Veicoli assegnati all’evento")
     st.caption(
         "Inserisci o incolla l’elenco direttamente nella tabella. Le righe vengono ordinate per gruppo, "
@@ -3506,12 +3607,20 @@ def event_vehicles_page(frame):
             previous_prep = payload.get('preparation_status', 'Pronta' if vehicle_ready(payload) else 'Da verificare')
             chosen_prep = st.selectbox('Approntamento — scelta operatore', prep_options,
                                       index=prep_options.index(previous_prep), key=f'prep_{selected_check}')
-            if st.button('Conferma stato approntamento', key=f'prep_save_{selected_check}'):
+            quick_park = st.text_input('Park N°', value=payload.get('park_number', ''), key=f'park_{selected_check}')
+            quick_inside = st.selectbox('Pulizia interna', CLEANING_OPTIONS, index=CLEANING_OPTIONS.index(payload.get('cleaning_inside', 'Da verificare')), key=f'inside_{selected_check}')
+            quick_outside = st.selectbox('Pulizia esterna', CLEANING_OPTIONS, index=CLEANING_OPTIONS.index(payload.get('cleaning_outside', 'Da verificare')), key=f'outside_{selected_check}')
+            quick_maintenance = st.selectbox('Manutenzione', MAINTENANCE_OPTIONS, index=MAINTENANCE_OPTIONS.index(payload.get('maintenance', 'Da verificare')), key=f'maintenance_{selected_check}')
+            quick_repairs = st.text_area('Riparazioni / lavori da eseguire', value=payload.get('repair_tasks', ''), key=f'repairs_{selected_check}')
+            quick_notes = st.text_area('Note manutenzione / pulizia', value=payload.get('maintenance_notes', ''), key=f'maintnotes_{selected_check}')
+            if st.button('Salva approntamento, pulizia e manutenzione', key=f'prep_save_{selected_check}'):
+                payload.update(repair_tasks=quick_repairs, park_number=quick_park, cleaning_inside=quick_inside, cleaning_outside=quick_outside, maintenance=quick_maintenance, maintenance_notes=quick_notes)
                 payload['preparation_status'] = chosen_prep
                 payload['preparation_operator'] = current_operator() or current_user().get('display_name', '')
                 save_vehicle_check(payload, [], selected_check)
                 st.session_state['vehicle_saved_message'] = vehicle_notify(selected_check, payload)
                 st.rerun()
+            vehicle_print_buttons(payload, selected_check, 'event_'+selected_check)
             st.write(f"Operatore: {payload.get('operator', '')} — Km: {payload.get('km', '')}")
             st.dataframe(pd.DataFrame(payload.get('checklist', [])), hide_index=True, use_container_width=True)
             st.dataframe(pd.DataFrame(payload.get('tires', [])), hide_index=True, use_container_width=True)
@@ -3557,6 +3666,7 @@ def event_vehicles_page(frame):
         picked_up = c7.checkbox("Veicolo ritirato", value=bool(existing_pickup))
         c8, c9 = st.columns([1, 2])
         pickup_date = c8.date_input("Data ritiro", value=pickup_default, disabled=not picked_up)
+        park_number = st.text_input("Park N°", value=clean(selected_vehicle.get("park_number")), key=f"event_park_{event_id}_{form_key}")
         vehicle_notes = c9.text_input("Note", value=clean(selected_vehicle.get("notes")))
         save_vehicle = st.form_submit_button(
             "Aggiorna veicolo" if selected_vehicle_id else "Aggiungi veicolo alla tabella",
@@ -3584,6 +3694,7 @@ def event_vehicles_page(frame):
                         clean(vehicle_notes), datetime.now().isoformat(timespec="seconds"),
                     ),
                 )
+                conn.execute("UPDATE event_vehicles SET park_number=? WHERE id=?", (clean(park_number), vehicle_id))
             st.success("Veicolo aggiornato nella tabella." if selected_vehicle_id else "Veicolo aggiunto automaticamente alla tabella.")
             st.rerun()
     if selected_vehicle_id:
@@ -3601,7 +3712,7 @@ def event_vehicles_page(frame):
             st.rerun()
     st.divider()
     st.subheader("Elenco veicoli dell’evento")
-    columns = ["_id", "Approntamento", "Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Stato", "Note"]
+    columns = ["_id", "Approntamento", "Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Stato", "Park N°", "Pulizia interna", "Pulizia esterna", "Manutenzione", "Note"]
     latest_checks = {}
     for check, payload in linked_checks:
         normalized_plate = re.sub(r"[^A-Z0-9]", "", upper(check.plate))
@@ -3609,13 +3720,18 @@ def event_vehicles_page(frame):
     rows = []
     for item in stored:
         pickup = clean(item.get("pickup_date"))
+        check_payload = latest_checks.get(re.sub(r"[^A-Z0-9]", "", upper(item.get("plate"))), {})
         rows.append({
             "_id": item["id"], "Approntamento": vehicle_preparation(latest_checks[re.sub(r"[^A-Z0-9]", "", upper(item.get("plate")))]) if re.sub(r"[^A-Z0-9]", "", upper(item.get("plate"))) in latest_checks else "🔴 Da completare",
             "Stato": "🟢" if pickup else "🔴",
             "Gruppo": item.get("vehicle_group", ""), "Targa": item.get("plate", ""),
             "Marca": item.get("brand", ""), "Modello": item.get("model", ""),
             "Assegnata a": item.get("assigned_to", ""), "RA": item.get("ra", ""),
-            "Data ritiro": pickup, "Note": item.get("notes", ""),
+            "Data ritiro": pickup, "Park N°": item.get("park_number", ""),
+            "Pulizia interna": vehicle_service_label(check_payload.get("cleaning_inside")),
+            "Pulizia esterna": vehicle_service_label(check_payload.get("cleaning_outside")),
+            "Manutenzione": vehicle_service_label(check_payload.get("maintenance"), maintenance=True),
+            "Note": item.get("notes", ""),
         })
     source = pd.DataFrame(rows, columns=columns)
     if source.empty:
@@ -3643,9 +3759,10 @@ def event_vehicles_page(frame):
             "Assegnata a": st.column_config.TextColumn("Assegnata a", width="medium"),
             "RA": st.column_config.TextColumn("RA", width="small"),
             "Data ritiro": st.column_config.TextColumn("Data ritiro", help="Esempio: 25/09/2026", width="small"),
+            "Park N°": st.column_config.TextColumn("Park N°", width="small"),
             "Note": st.column_config.TextColumn("Note", width="large"),
         },
-        disabled=["Approntamento", "Stato"],
+        disabled=["Approntamento", "Stato", "Pulizia interna", "Pulizia esterna", "Manutenzione"],
     )
     st.caption("Puoi copiare più righe da Excel e incollarle nella prima cella. Usa il + in fondo per aggiungere una riga.")
     export = edited.copy()
@@ -3673,7 +3790,7 @@ def event_vehicles_page(frame):
         now = datetime.now().isoformat(timespec="seconds")
         with db() as conn:
             for _, row in edited.fillna("").iterrows():
-                values = {name: clean(row.get(name, "")) for name in ["Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Note"]}
+                values = {name: clean(row.get(name, "")) for name in ["Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Park N°", "Note"]}
                 if not any(values.values()):
                     continue
                 vehicle_id = clean(row.get("_id")) or str(uuid.uuid4())
@@ -3692,6 +3809,7 @@ def event_vehicles_page(frame):
                      values["Modello"], values["Assegnata a"], upper(values["RA"]),
                      values["Data ritiro"], values["Note"], now),
                 )
+                conn.execute("UPDATE event_vehicles SET park_number=? WHERE id=?", (values["Park N°"], vehicle_id))
             if saved_ids:
                 placeholders = ",".join("?" for _ in saved_ids)
                 conn.execute(
