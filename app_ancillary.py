@@ -1574,8 +1574,10 @@ def event_vehicles_to_pdf(frame, event_title):
     if "Stato" in export.columns:
         export["Stato"] = export["Data ritiro"].fillna("").astype(str).str.strip().map(lambda value: "RITIRATA" if value else "DA RITIRARE")
     export = export.fillna("").astype(str)
+    if "Approntamento" in export.columns:
+        export["Approntamento"] = export["Approntamento"].str.replace(r"^[🔴🟡🟢]\s*", "", regex=True)
     data = [list(export.columns)] + export.values.tolist()
-    widths = [23, 24, 23, 27, 30, 39, 25, 27, 39][:len(export.columns)]
+    widths = [281 / max(len(export.columns), 1)] * len(export.columns)
     table = Table(data, repeatRows=1, colWidths=[width * mm for width in widths])
     style = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DCE6F1")),
@@ -1916,8 +1918,15 @@ def vehicle_ready(payload):
             and all(row.get('Presente') or row.get('Non previsto') for row in payload['checklist']))
 
 
+def vehicle_preparation(payload):
+    status = payload.get('preparation_status')
+    if status not in ['Da completare', 'Da verificare', 'Pronta']:
+        status = 'Pronta' if vehicle_ready(payload) else 'Da verificare'
+    return {'Da completare': '🔴 Da completare', 'Da verificare': '🟡 Da verificare', 'Pronta': '🟢 Pronta'}[status]
+
+
 def vehicle_notify(identifier, payload):
-    if not vehicle_ready(payload):
+    if not vehicle_ready(payload) or payload.get('preparation_status', 'Pronta') != 'Pronta':
         return 'Mail ATP non inviata: la vettura non risulta ancora completamente OK.'
     with db() as conn:
         conn.execute('CREATE TABLE IF NOT EXISTS vehicle_email_log (check_id TEXT PRIMARY KEY, sent_at TEXT, recipient TEXT)')
@@ -2041,6 +2050,10 @@ def vehicle_check_form(current=None):
         damage_uploads = st.file_uploader('Fotografie dei danni', type=['jpg', 'jpeg', 'png', 'webp'],
                                           accept_multiple_files=True, key=prefix + '_damage_uploads')
         st.caption('Mail automatica ATP quando: senza danni, dotazioni presenti o non previste e pneumatici compilati e confermati OK.')
+        preparation_options = ['Da completare', 'Da verificare', 'Pronta']
+        preparation_status = st.selectbox('Approntamento — conferma operatore', preparation_options,
+            index=preparation_options.index(data.get('preparation_status', 'Da completare')))
+        st.caption('🔴 Da completare · 🟡 Da verificare · 🟢 Pronta. La scelta aggiorna automaticamente l’elenco veicoli dell’evento.')
         notes = st.text_area('Note vettura', value=data.get('notes', ''))
         uploads = st.file_uploader('Carica fotografie (anche più immagini)', type=['jpg', 'jpeg', 'png', 'webp'],
                                     accept_multiple_files=True, key=prefix + '_uploads')
@@ -2050,7 +2063,7 @@ def vehicle_check_form(current=None):
     if submitted:
         payload = {'event_id': event_id, 'event_title': event_map.get(event_id, ''), 'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
                    'km': km, 'fuel': fuel, 'operator': operator, 'checked_at': checked_date.isoformat(),
-                   'notes': notes, 'damage_status': damage_status, 'damage_notes': damage_notes, 'tires_ok': tires_ok, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
+                   'preparation_status': preparation_status, 'preparation_operator': operator, 'notes': notes, 'damage_status': damage_status, 'damage_notes': damage_notes, 'tires_ok': tires_ok, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
                        'Presente': bool(row.get('Presente', False)) if pd.notna(row.get('Presente')) else False,
                        'Non previsto': bool(row.get('Non previsto', False)) if pd.notna(row.get('Non previsto')) else False}
                        for row in check_table.to_dict('records') if pd.notna(row.get('Voce')) and str(row.get('Voce')).strip()],
@@ -3451,7 +3464,7 @@ def event_vehicles_page(frame):
     st.header("Veicoli assegnati all’evento")
     st.caption(
         "Inserisci o incolla l’elenco direttamente nella tabella. Le righe vengono ordinate per gruppo, "
-        "targa, marca e modello. Il pallino diventa verde quando è indicata la data di ritiro."
+        "targa, marca e modello. Approntamento e ritiro sono due stati distinti."
     )
     records, record_ids = event_options(frame)
     if not record_ids:
@@ -3488,7 +3501,17 @@ def event_vehicles_page(frame):
             selected_check = st.selectbox('Scheda check-in', list(options),
                 format_func=lambda value: f"{options[value][0].plate} · {options[value][0].checked_at}", key=f'event_check_{event_id}')
             row, payload = options[selected_check]
-            st.write('Vettura OK' if vehicle_ready(payload) else 'Vettura da verificare / non completamente OK')
+            st.write(vehicle_preparation(payload))
+            prep_options = ['Da completare', 'Da verificare', 'Pronta']
+            previous_prep = payload.get('preparation_status', 'Pronta' if vehicle_ready(payload) else 'Da verificare')
+            chosen_prep = st.selectbox('Approntamento — scelta operatore', prep_options,
+                                      index=prep_options.index(previous_prep), key=f'prep_{selected_check}')
+            if st.button('Conferma stato approntamento', key=f'prep_save_{selected_check}'):
+                payload['preparation_status'] = chosen_prep
+                payload['preparation_operator'] = current_operator() or current_user().get('display_name', '')
+                save_vehicle_check(payload, [], selected_check)
+                st.session_state['vehicle_saved_message'] = vehicle_notify(selected_check, payload)
+                st.rerun()
             st.write(f"Operatore: {payload.get('operator', '')} — Km: {payload.get('km', '')}")
             st.dataframe(pd.DataFrame(payload.get('checklist', [])), hide_index=True, use_container_width=True)
             st.dataframe(pd.DataFrame(payload.get('tires', [])), hide_index=True, use_container_width=True)
@@ -3578,12 +3601,17 @@ def event_vehicles_page(frame):
             st.rerun()
     st.divider()
     st.subheader("Elenco veicoli dell’evento")
-    columns = ["_id", "Stato", "Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Note"]
+    columns = ["_id", "Approntamento", "Gruppo", "Targa", "Marca", "Modello", "Assegnata a", "RA", "Data ritiro", "Stato", "Note"]
+    latest_checks = {}
+    for check, payload in linked_checks:
+        normalized_plate = re.sub(r"[^A-Z0-9]", "", upper(check.plate))
+        latest_checks.setdefault(normalized_plate, payload)
     rows = []
     for item in stored:
         pickup = clean(item.get("pickup_date"))
         rows.append({
-            "_id": item["id"], "Stato": "🟢" if pickup else "🔴",
+            "_id": item["id"], "Approntamento": vehicle_preparation(latest_checks[re.sub(r"[^A-Z0-9]", "", upper(item.get("plate")))]) if re.sub(r"[^A-Z0-9]", "", upper(item.get("plate"))) in latest_checks else "🔴 Da completare",
+            "Stato": "🟢" if pickup else "🔴",
             "Gruppo": item.get("vehicle_group", ""), "Targa": item.get("plate", ""),
             "Marca": item.get("brand", ""), "Modello": item.get("model", ""),
             "Assegnata a": item.get("assigned_to", ""), "RA": item.get("ra", ""),
@@ -3606,6 +3634,7 @@ def event_vehicles_page(frame):
         key=f"event_vehicle_editor_{event_id}",
         column_config={
             "_id": None,
+            "Approntamento": st.column_config.TextColumn("Approntamento", disabled=True, width="medium"),
             "Stato": st.column_config.TextColumn("Ritiro", disabled=True, width="small", help="🟢 ritirata; 🔴 non ancora ritirata"),
             "Gruppo": st.column_config.TextColumn("Gruppo", width="medium"),
             "Targa": st.column_config.TextColumn("Targa", width="small"),
@@ -3616,7 +3645,7 @@ def event_vehicles_page(frame):
             "Data ritiro": st.column_config.TextColumn("Data ritiro", help="Esempio: 25/09/2026", width="small"),
             "Note": st.column_config.TextColumn("Note", width="large"),
         },
-        disabled=["Stato"],
+        disabled=["Approntamento", "Stato"],
     )
     st.caption("Puoi copiare più righe da Excel e incollarle nella prima cella. Usa il + in fondo per aggiungere una riga.")
     export = edited.copy()
