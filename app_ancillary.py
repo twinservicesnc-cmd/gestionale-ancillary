@@ -2063,6 +2063,23 @@ def vehicle_item_status(row):
     return 'Presente' if row.get('Presente') else 'Non previsto' if row.get('Non previsto') else 'Non presente'
 
 
+def vehicle_accessory_style(frame):
+    def color(value):
+        text = str(value)
+        if text in ['Presente', '🟢 Presente']:
+            return 'background-color: #DCFCE7; color: #166534; font-weight: bold'
+        if text in ['Non presente', '🔴 Non presente']:
+            return 'background-color: #FEE2E2; color: #991B1B; font-weight: bold'
+        if text in ['Non previsto', '⚪ Non previsto']:
+            return 'background-color: #F1F5F9; color: #475569'
+        return ''
+    try:
+        styler = frame.style
+        return styler.map(color) if hasattr(styler, 'map') else styler.applymap(color)
+    except ImportError:
+        return frame.replace({'Presente': '🟢 Presente', 'Non presente': '🔴 Non presente', 'Non previsto': '⚪ Non previsto'})
+
+
 def vehicle_event_summary(stored, checks):
     rows = []
     for item in stored:
@@ -2092,13 +2109,14 @@ def vehicle_summary_pdf(frame, event_title, view_title):
     style = styles['BodyText']; style.fontSize = 7; style.leading = 9
     def p(value):
         return Paragraph(escape(str(value or '')).replace('\n', '<br/>'), style)
-    columns = ['Targa', 'Park N°', 'Approntamento', 'Manutenzione', 'Lavori da eseguire',
-               'Documenti / dotazioni mancanti', 'Pulizia interna', 'Pulizia esterna']
-    widths = [22, 14, 24, 35, 69, 65, 24, 24]
+    columns = list(frame.columns) if len(frame.columns) <= 9 else ['Targa', 'Park N°', 'Approntamento', 'Manutenzione', 'Lavori da eseguire', 'Documenti / dotazioni mancanti', 'Pulizia interna', 'Pulizia esterna']
+    weights = [3 if name in ['Descrizione danni', 'Lavori da eseguire', 'Note manutenzione', 'Documenti / dotazioni mancanti'] else 0.7 if name == 'Park N°' else 1.2 for name in columns]
+    widths = [277 * weight / sum(weights) for weight in weights]
     body = [[p(name) for name in columns]]
     for _, row in frame.fillna('').iterrows():
         values = dict(row)
-        values['Lavori da eseguire'] = '\n'.join(value for value in [values.get('Descrizione danni'), values.get('Lavori da eseguire'), values.get('Note manutenzione')] if value)
+        if len(frame.columns) > 9:
+            values['Lavori da eseguire'] = '\n'.join(value for value in [values.get('Descrizione danni'), values.get('Lavori da eseguire'), values.get('Note manutenzione')] if value)
         body.append([p(values.get(name, '')) for name in columns])
     table = Table(body, colWidths=[width*mm for width in widths], repeatRows=1)
     table.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.3,colors.lightgrey),
@@ -2117,9 +2135,13 @@ def vehicle_summary_exports(stored, latest_checks, title, event_id):
     if summary.empty:
         st.info('Nessuna vettura da esportare.')
         return
-    view = st.selectbox('Vetture da visualizzare / esportare', ['Tutte le vetture', 'Manutenzioni da effettuare / in corso',
+    view = st.selectbox('Vetture da visualizzare / esportare', ['Tutte le vetture', 'Da inviare in manutenzione', 'In manutenzione', 'Manutenzioni da effettuare / in corso',
         'Documenti / dotazioni mancanti', 'Pulizia da completare', 'Vetture pronte', 'Con danni', 'Senza check-in'], key='summary_view_'+event_id)
-    if view == 'Manutenzioni da effettuare / in corso':
+    if view == 'Da inviare in manutenzione':
+        summary = summary[summary['Manutenzione'].eq('Sì — da effettuare')]
+    elif view == 'In manutenzione':
+        summary = summary[summary['Manutenzione'].eq('Sì — in manutenzione')]
+    elif view == 'Manutenzioni da effettuare / in corso':
         summary = summary[summary['Manutenzione'].str.startswith('Sì')]
     elif view == 'Documenti / dotazioni mancanti':
         summary = summary[summary['Documenti / dotazioni mancanti'].ne('')]
@@ -2131,6 +2153,19 @@ def vehicle_summary_exports(stored, latest_checks, title, event_id):
         summary = summary[summary['Danni'].eq('Con danni')]
     elif view == 'Senza check-in':
         summary = summary[summary['Check-in'].eq('Non compilato')]
+    base_columns = ['Targa', 'Marca', 'Modello', 'Park N°']
+    if view in ['Da inviare in manutenzione', 'In manutenzione', 'Manutenzioni da effettuare / in corso']:
+        summary = summary[base_columns + ['Manutenzione', 'Descrizione danni', 'Lavori da eseguire', 'Note manutenzione']]
+    elif view == 'Documenti / dotazioni mancanti':
+        summary = summary[base_columns + ['Documenti / dotazioni mancanti', 'Operatore']]
+    elif view == 'Pulizia da completare':
+        summary = summary[base_columns + ['Pulizia interna', 'Pulizia esterna', 'Note manutenzione']]
+    elif view == 'Con danni':
+        summary = summary[base_columns + ['Danni', 'Descrizione danni', 'Lavori da eseguire', 'Manutenzione']]
+    elif view == 'Vetture pronte':
+        summary = summary[base_columns + ['Approntamento', 'Data ritiro']]
+    elif view == 'Senza check-in':
+        summary = summary[base_columns + ['Check-in']]
     st.dataframe(summary, hide_index=True, use_container_width=True)
     if summary.empty:
         st.info('Nessuna vettura corrisponde al filtro.')
@@ -2140,7 +2175,7 @@ def vehicle_summary_exports(stored, latest_checks, title, event_id):
                       'riepilogo_vetture.xlsx',key='summary_xlsx_'+event_id)
     b.download_button('PDF riepilogo filtrato / stampa',vehicle_summary_pdf(summary,title,view),
                       'riepilogo_vetture.pdf',mime='application/pdf',key='summary_pdf_'+event_id)
-    st.caption('Gli export includono solo il filtro selezionato. Le vetture senza check-in sono indicate separatamente.')
+    st.caption('Visualizzazione, Excel e PDF includono solo le vetture e le informazioni della sezione selezionata.')
 
 
 def vehicle_check_form(current=None):
@@ -2209,11 +2244,13 @@ def vehicle_check_form(current=None):
                       'Presente': vehicle_item_status(row) == 'Presente',
                       'Non presente': vehicle_item_status(row) == 'Non presente',
                       'Non previsto': vehicle_item_status(row) == 'Non previsto'} for row in checklist]
-        check_table = st.data_editor(pd.DataFrame(checklist), num_rows='dynamic', hide_index=True,
+        checklist_frame = pd.DataFrame(checklist)
+        checklist_frame['Esito'] = [({'Presente': '🟢 Presente', 'Non presente': '🔴 Non presente', 'Non previsto': '⚪ Non previsto'})[vehicle_item_status(row)] for row in checklist]
+        check_table = st.data_editor(vehicle_accessory_style(checklist_frame), num_rows='dynamic', hide_index=True,
                                      use_container_width=True, key=prefix + '_checklist',
                                      column_config={name: st.column_config.CheckboxColumn(name)
-                                                    for name in ['Presente', 'Non presente', 'Non previsto']})
-        st.caption('Spunta una sola casella per ogni voce: Presente, Non presente oppure Non previsto.')
+                                                    for name in ['Presente', 'Non presente', 'Non previsto']}, disabled=['Esito'])
+        st.caption('Spunta una sola casella per ogni voce. Esito: verde presente, rosso non presente, grigio non previsto. Il colore si aggiorna dopo il salvataggio.')
         st.subheader('Pneumatici')
         tire = (data.get('tires') or [{}])[0]
         tires = [{field: tire.get(field, '') for field in ['Marca', 'Modello', 'Tipo', 'Misura', 'Stato / note']}]
@@ -3718,7 +3755,7 @@ def event_vehicles_page(frame):
                 st.rerun()
             vehicle_print_buttons(payload, selected_check, 'event_'+selected_check)
             st.write(f"Operatore: {payload.get('operator', '')} — Km: {payload.get('km', '')}")
-            st.dataframe(pd.DataFrame([{'Voce': item.get('Voce', ''), 'Stato': vehicle_item_status(item)} for item in payload.get('checklist', [])]), hide_index=True, use_container_width=True)
+            st.dataframe(vehicle_accessory_style(pd.DataFrame([{'Voce': item.get('Voce', ''), 'Stato': vehicle_item_status(item)} for item in payload.get('checklist', [])])), hide_index=True, use_container_width=True)
             st.dataframe(pd.DataFrame(payload.get('tires', [])), hide_index=True, use_container_width=True)
             st.write(f"Danni: {payload.get('damage_status', 'Da verificare')} — {payload.get('damage_notes', '')}")
             with db() as conn:
