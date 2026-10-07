@@ -2205,12 +2205,15 @@ def vehicle_check_form(current=None):
         for label in VEHICLE_CHECKLIST:
             if not any(row.get('Voce') == label for row in checklist):
                 checklist.append({'Voce': label, 'Presente': False, 'Non previsto': False})
-        checklist = [{'Voce': row.get('Voce', ''), 'Stato': vehicle_item_status(row)} for row in checklist]
+        checklist = [{'Voce': row.get('Voce', ''),
+                      'Presente': vehicle_item_status(row) == 'Presente',
+                      'Non presente': vehicle_item_status(row) == 'Non presente',
+                      'Non previsto': vehicle_item_status(row) == 'Non previsto'} for row in checklist]
         check_table = st.data_editor(pd.DataFrame(checklist), num_rows='dynamic', hide_index=True,
                                      use_container_width=True, key=prefix + '_checklist',
-                                     column_config={'Stato': st.column_config.SelectboxColumn('Stato',
-                                         options=['Presente', 'Non presente', 'Non previsto'], required=True)})
-        st.caption('Scegli un solo stato per ogni voce: Presente, Non presente o Non previsto. Puoi aggiungere altre voci.')
+                                     column_config={name: st.column_config.CheckboxColumn(name)
+                                                    for name in ['Presente', 'Non presente', 'Non previsto']})
+        st.caption('Spunta una sola casella per ogni voce: Presente, Non presente oppure Non previsto.')
         st.subheader('Pneumatici')
         tire = (data.get('tires') or [{}])[0]
         tires = [{field: tire.get(field, '') for field in ['Marca', 'Modello', 'Tipo', 'Misura', 'Stato / note']}]
@@ -2245,6 +2248,14 @@ def vehicle_check_form(current=None):
                                  format_func=lambda value: next(p['file_name'] for p in existing if p['id'] == value)) if existing else []
         submitted = st.form_submit_button('Salva scheda vettura', type='primary', use_container_width=True)
     if submitted:
+        invalid = []
+        for row in check_table.fillna(False).to_dict('records'):
+            if str(row.get('Voce', '')).strip() and row.get('Voce') is not False:
+                if sum(bool(row.get(name, False)) for name in ['Presente', 'Non presente', 'Non previsto']) != 1:
+                    invalid.append(str(row['Voce']))
+        if invalid:
+            st.error('Spunta una sola casella per queste voci: ' + ', '.join(invalid))
+            return
         payload = {'repair_tasks': repair_tasks, 'park_number': park_number, 'cleaning_inside': cleaning_inside, 'cleaning_outside': cleaning_outside, 'maintenance': maintenance, 'maintenance_notes': maintenance_notes, 'event_id': event_id, 'event_title': event_map.get(event_id, ''), 'plate': plate, 'brand': brand, 'model': model, 'group': group, 'ra': ra,
                    'km': km, 'fuel': fuel, 'operator': operator, 'checked_at': checked_date.isoformat(),
                    'preparation_status': preparation_status, 'preparation_operator': operator, 'notes': notes, 'damage_status': damage_status, 'damage_notes': damage_notes, 'tires_ok': tires_ok, 'checklist': [{'Voce': str(row.get('Voce', '')).strip(),
