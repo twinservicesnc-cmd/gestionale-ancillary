@@ -1826,7 +1826,7 @@ def record_form(frame):
 
 # Area Vetture: schede e fotografie salvate insieme nel database del gestionale.
 VEHICLE_CHECKLIST = ['Calze da neve', 'Libretto', 'Assicurazione', 'Seconda chiave',
-                     'Triangolo', 'Giubbotto riflettente', 'Kit gonfiaggio',
+                     'Triangolo', 'Giubbotto riflettente', 'Kit gonfiaggio', 'Cappelliera',
                      'Cavo elettrico domestico', 'Cavo elettrico per colonnina',
                      'Libretto uso e manutenzione', 'Modulo CAI', 'Dichiarazione incidente']
 
@@ -1942,6 +1942,52 @@ def vehicle_preparation(payload):
     return {'Da completare': '🔴 Da completare', 'Da verificare': '🟡 Da verificare', 'Pronta': '🟢 Pronta'}[status]
 
 
+def vehicle_manual_email(subject, body, attachments=()):
+    import smtplib
+    from email.message import EmailMessage
+    try:
+        config = dict(st.secrets.get('vehicle_email', {}))
+        if not all(config.get(key) for key in ['host', 'sender', 'recipient']):
+            st.error('Configura prima vehicle_email nei Secrets.')
+            return
+        message = EmailMessage()
+        message['Subject'] = subject
+        message['From'] = config['sender']
+        message['To'] = config['recipient']
+        message.set_content(body)
+        for filename, data, mime in attachments:
+            main, sub = mime.split('/', 1)
+            message.add_attachment(data, maintype=main, subtype=sub, filename=filename)
+        port = int(config.get('port', 587))
+        factory = smtplib.SMTP_SSL if port == 465 else smtplib.SMTP
+        with factory(config['host'], port, timeout=20) as server:
+            if port != 465:
+                server.starttls()
+            if config.get('username'):
+                server.login(config['username'], config.get('password', ''))
+            server.send_message(message)
+        st.success('Email inviata a ' + config['recipient'])
+    except Exception:
+        st.error('Invio email non riuscito. Verifica i Secrets e riprova.')
+
+
+def vehicle_email_description(payload):
+    missing = [row.get('Voce', '') for row in payload.get('checklist', []) if vehicle_item_status(row) == 'Non presente']
+    lines = [f"Targa: {payload.get('plate', '')}",
+             f"Marca / modello: {payload.get('brand', '')} {payload.get('model', '')}",
+             f"Approntamento: {vehicle_preparation(payload)}",
+             f"Danni: {payload.get('damage_status', 'Da verificare')}",
+             f"Descrizione danni: {payload.get('damage_notes', '') or '—'}",
+             f"Manutenzione: {payload.get('maintenance', 'Da verificare')}",
+             f"Lavori da eseguire: {payload.get('repair_tasks', '') or '—'}",
+             f"Note manutenzione: {payload.get('maintenance_notes', '') or '—'}",
+             f"Documenti / accessori mancanti: {'; '.join(missing) or 'Nessuno segnalato'}"]
+    if 'Calze da neve' in missing:
+        sizes = '; '.join(str(t.get('Misura', '')).strip() for t in payload.get('tires', []) if str(t.get('Misura', '')).strip())
+        lines.append('Calze da neve mancanti — misura pneumatici: ' + (sizes or 'Non indicata'))
+    return '\n'.join(lines)
+
+
 def vehicle_notify(identifier, payload):
     if not vehicle_ready(payload) or payload.get('preparation_status', 'Pronta') != 'Pronta':
         return 'Mail ATP non inviata: la vettura non risulta ancora completamente OK.'
@@ -2055,6 +2101,9 @@ def vehicle_print_buttons(payload, identifier, key_prefix):
     right.download_button('PDF danni e riparazioni da effettuare', vehicle_sheet_pdf(payload, photos, works_only=True),
                           f'lavori_vettura_{safe_plate}.pdf', mime='application/pdf', key=key_prefix+'_works')
     st.caption('Scarica e apri il PDF, poi usa Stampa. I PDF riportano gli ultimi dati salvati.')
+    if st.button('Invia scheda via email — anche se non pronta', key=key_prefix+'_email'):
+        vehicle_manual_email('ATP 2026 - ' + payload.get('plate', ''), vehicle_email_description(payload),
+                             [('scheda_vettura_'+safe_plate+'.pdf', vehicle_sheet_pdf(payload, photos), 'application/pdf')])
 
 
 def vehicle_item_status(row):
@@ -2097,6 +2146,7 @@ def vehicle_event_summary(stored, checks):
                      'Pulizia interna': payload.get('cleaning_inside', 'Da verificare'),
                      'Pulizia esterna': payload.get('cleaning_outside', 'Da verificare'),
                      'Documenti / dotazioni mancanti': '; '.join(missing),
+                     'Misura gomme se calze mancanti': ('; '.join(str(t.get('Misura', '')).strip() for t in payload.get('tires', []) if str(t.get('Misura', '')).strip()) or 'Non indicata') if 'Calze da neve' in missing else '',
                      'Check-in': 'Compilato' if payload else 'Non compilato',
                      'Data controllo': payload.get('checked_at', ''), 'Operatore': payload.get('operator', ''),
                      'Data ritiro': item.get('pickup_date', '')})
@@ -2109,7 +2159,7 @@ def vehicle_summary_pdf(frame, event_title, view_title):
     style = styles['BodyText']; style.fontSize = 7; style.leading = 9
     def p(value):
         return Paragraph(escape(str(value or '')).replace('\n', '<br/>'), style)
-    columns = list(frame.columns) if len(frame.columns) <= 9 else ['Targa', 'Park N°', 'Approntamento', 'Manutenzione', 'Lavori da eseguire', 'Documenti / dotazioni mancanti', 'Pulizia interna', 'Pulizia esterna']
+    columns = list(frame.columns) if len(frame.columns) <= 9 else ['Targa', 'Park N°', 'Approntamento', 'Manutenzione', 'Lavori da eseguire', 'Documenti / dotazioni mancanti', 'Misura gomme se calze mancanti', 'Pulizia interna', 'Pulizia esterna']
     weights = [3 if name in ['Descrizione danni', 'Lavori da eseguire', 'Note manutenzione', 'Documenti / dotazioni mancanti'] else 0.7 if name == 'Park N°' else 1.2 for name in columns]
     widths = [277 * weight / sum(weights) for weight in weights]
     body = [[p(name) for name in columns]]
@@ -2135,6 +2185,17 @@ def vehicle_summary_exports(stored, latest_checks, title, event_id):
     if summary.empty:
         st.info('Nessuna vettura da esportare.')
         return
+    st.caption('La mail riepilogativa include tutte le vetture dell’evento, anche quelle non pronte o senza check-in.')
+    if st.button('Invia riepilogo completo dell’evento via email', key='event_email_'+event_id):
+        sections = []
+        for item in stored:
+            plate = re.sub(r'[^A-Z0-9]', '', upper(item.get('plate')))
+            payload = latest_checks.get(plate)
+            sections.append(vehicle_email_description(payload) if payload else
+                            f"Targa: {item.get('plate', '')} — {item.get('brand', '')} {item.get('model', '')}\nCheck-in non compilato: danni e dotazioni da verificare.")
+        vehicle_manual_email(title + ' - Riepilogo vetture', title + '\n\n' + '\n\n'.join(sections),
+            [('riepilogo_vetture.xlsx', table_to_excel(summary, 'Riepilogo vetture'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+             ('riepilogo_vetture.pdf', vehicle_summary_pdf(summary, title, 'Tutte le vetture'), 'application/pdf')])
     view = st.selectbox('Vetture da visualizzare / esportare', ['Tutte le vetture', 'Da inviare in manutenzione', 'In manutenzione', 'Manutenzioni da effettuare / in corso',
         'Documenti / dotazioni mancanti', 'Pulizia da completare', 'Vetture pronte', 'Con danni', 'Senza check-in'], key='summary_view_'+event_id)
     if view == 'Da inviare in manutenzione':
@@ -2157,7 +2218,7 @@ def vehicle_summary_exports(stored, latest_checks, title, event_id):
     if view in ['Da inviare in manutenzione', 'In manutenzione', 'Manutenzioni da effettuare / in corso']:
         summary = summary[base_columns + ['Manutenzione', 'Descrizione danni', 'Lavori da eseguire', 'Note manutenzione']]
     elif view == 'Documenti / dotazioni mancanti':
-        summary = summary[base_columns + ['Documenti / dotazioni mancanti', 'Operatore']]
+        summary = summary[base_columns + ['Documenti / dotazioni mancanti', 'Misura gomme se calze mancanti', 'Operatore']]
     elif view == 'Pulizia da completare':
         summary = summary[base_columns + ['Pulizia interna', 'Pulizia esterna', 'Note manutenzione']]
     elif view == 'Con danni':
@@ -2328,13 +2389,13 @@ def vehicle_check_form(current=None):
         checklist = list(data.get('checklist') or [])
         for label in VEHICLE_CHECKLIST:
             if not any(row.get('Voce') == label for row in checklist):
-                checklist.append({'Voce': label, 'Presente': False, 'Non previsto': False})
+                checklist.append({'Voce': label, '_nuova_voce': True})
         checklist = [{'Voce': row.get('Voce', ''),
-                      'Presente': vehicle_item_status(row) == 'Presente',
-                      'Non presente': vehicle_item_status(row) == 'Non presente',
-                      'Non previsto': vehicle_item_status(row) == 'Non previsto'} for row in checklist]
+                      'Presente': not row.get('_nuova_voce') and vehicle_item_status(row) == 'Presente',
+                      'Non presente': not row.get('_nuova_voce') and vehicle_item_status(row) == 'Non presente',
+                      'Non previsto': not row.get('_nuova_voce') and vehicle_item_status(row) == 'Non previsto'} for row in checklist]
         checklist_frame = pd.DataFrame(checklist)
-        checklist_frame['Esito'] = [({'Presente': '🟢 Presente', 'Non presente': '🔴 Non presente', 'Non previsto': '⚪ Non previsto'})[vehicle_item_status(row)] for row in checklist]
+        checklist_frame['Esito'] = [({'Presente': '🟢 Presente', 'Non presente': '🔴 Non presente', 'Non previsto': '⚪ Non previsto'})[vehicle_item_status(row)] if any(row.get(name) for name in ['Presente', 'Non presente', 'Non previsto']) else '⚪ Da selezionare' for row in checklist]
         check_table = st.data_editor(vehicle_accessory_style(checklist_frame), num_rows='dynamic', hide_index=True,
                                      use_container_width=True, key=prefix + '_checklist',
                                      column_config={name: st.column_config.CheckboxColumn(name)
