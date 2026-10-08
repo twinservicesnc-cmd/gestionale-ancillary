@@ -1153,6 +1153,30 @@ def table_to_excel(frame, sheet_name="Dati"):
             export[column] = export[column].dt.date
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        import textwrap
+        sheet = writer.sheets[sheet_name[:31]]
+        widths = []
+        for index, column in enumerate(export.columns, 1):
+            texts = [str(column)] + [str(value) if pd.notna(value) else '' for value in export[column]]
+            longest = max((len(line) for value in texts for line in value.split('\n')), default=0)
+            width = min(60, max(14, longest + 3))
+            widths.append(width)
+            sheet.column_dimensions[get_column_letter(index)].width = width
+        for row in sheet.iter_rows():
+            line_count = 1
+            for cell, width in zip(row, widths):
+                cell.alignment = Alignment(wrap_text=True, vertical='top')
+                count = sum(max(1, len(textwrap.wrap(line, width=max(1, int((width-3)*0.85)), break_long_words=True)))
+                            for line in str(cell.value if cell.value is not None else '').split('\n'))
+                line_count = max(line_count, count)
+                if cell.row == 1:
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    cell.fill = PatternFill('solid', fgColor='24476A')
+            sheet.row_dimensions[row[0].row].height = min(409, max(24, line_count * 16 + 8))
+        sheet.freeze_panes = 'A2'
+        sheet.auto_filter.ref = sheet.dimensions
     return output.getvalue()
 
 
@@ -1965,8 +1989,12 @@ def vehicle_manual_email(subject, body, attachments=()):
                 server.starttls()
             if config.get('username'):
                 server.login(config['username'], config.get('password', ''))
-            server.send_message(message)
-        st.success('Email inviata a ' + config['recipient'])
+            refused = server.send_message(message)
+        if refused:
+            st.warning('Il server ha rifiutato questi destinatari: ' + ', '.join(refused) + '. Gli altri destinatari sono stati accettati.')
+        else:
+            st.success('Email accettata dal server per: ' + config['recipient'])
+            st.caption('Se non arriva, controlla Spam e la casella del mittente per eventuali avvisi di mancata consegna.')
     except Exception:
         st.error('Invio email non riuscito. Verifica i Secrets e riprova.')
 
