@@ -49,6 +49,69 @@ st.set_page_config(
 )
 
 
+def public_legal_page(page):
+    """Informazioni pubbliche necessarie anche quando l'area operativa è bloccata."""
+    st.title("Gestionale Ancillary")
+    st.caption("Informazioni legali e protezione dei dati")
+    if page == "privacy":
+        st.header("Informativa privacy")
+        st.markdown(
+            """
+**Titolare del trattamento**  
+Twinservice S.n.c. — contatto: **twinservice.snc@gmail.com**
+
+**Finalità e dati trattati**  
+Il Gestionale Ancillary è uno strumento ad accesso riservato utilizzato per la gestione
+operativa di noleggi, veicoli, controlli, eventi, documenti, fotografie, contratti,
+servizi ancillary e segnalazioni di danni. Possono essere trattati dati identificativi
+degli operatori e dei soggetti collegati alle pratiche, targhe, numeri di contratto o RA,
+date, annotazioni operative, immagini e documenti necessari all'attività.
+
+**Base del trattamento e accesso**  
+I dati sono trattati per l'esecuzione delle attività operative e degli obblighi
+contrattuali e di legge. L'accesso è limitato agli utenti autorizzati mediante credenziali.
+
+**Archiviazione e Google Drive**  
+Il sistema utilizza Google Drive esclusivamente per salvare e recuperare il database,
+i backup e i file creati dal gestionale. L'autorizzazione `drive.file` limita l'accesso
+ai file creati o gestiti dall'applicazione. I dati non sono venduti né usati per finalità
+pubblicitarie.
+
+**Conservazione e sicurezza**  
+I dati sono conservati per il tempo necessario alle finalità operative e agli obblighi
+amministrativi o di legge. Sono previste copie di sicurezza, controllo degli accessi e
+procedure di ripristino. Gli utenti devono proteggere le proprie credenziali.
+
+**Diritti e contatti**  
+Per richiedere accesso, rettifica, cancellazione, limitazione o informazioni sul
+trattamento, scrivere a **twinservice.snc@gmail.com**. Le richieste saranno valutate
+nel rispetto degli obblighi di conservazione applicabili.
+
+Ultimo aggiornamento: 9 ottobre 2026.
+"""
+        )
+    else:
+        st.header("Condizioni d'uso")
+        st.markdown(
+            """
+Il Gestionale Ancillary è destinato esclusivamente agli utenti autorizzati da
+Twinservice S.n.c. Le credenziali sono personali e non devono essere condivise.
+
+Gli utenti sono responsabili della correttezza dei dati e dei documenti inseriti e
+devono utilizzare il servizio soltanto per le attività lavorative autorizzate. È vietato
+tentare di accedere a dati o funzioni non assegnati al proprio profilo, alterare il
+sistema o esportare informazioni per finalità estranee al servizio.
+
+Il gestionale crea copie di sicurezza su Google Drive; eventuali anomalie devono essere
+segnalate tempestivamente a **twinservice.snc@gmail.com**. Twinservice S.n.c. può
+sospendere gli accessi in caso di uso improprio o per esigenze di sicurezza e manutenzione.
+
+Ultimo aggiornamento: 9 ottobre 2026.
+"""
+        )
+    st.info("Questa pagina è pubblica. L'area gestionale e i dati operativi restano protetti da accesso riservato.")
+
+
 def _drive_settings():
     """Configurazione OAuth dell'account Google Drive che possiede lo spazio."""
     for section in ("ancillary_drive", "google_drive_oauth", "gdrive_oauth"):
@@ -4790,6 +4853,11 @@ def login():
             st.warning("Configura ADMIN_PASSWORD nei Secrets per attivare il primo accesso amministratore.")
     return False
 
+
+_public_page = str(st.query_params.get("page", "")).strip().lower()
+if _public_page in {"privacy", "terms"}:
+    public_legal_page(_public_page)
+    st.stop()
 
 PERSISTENCE_BOOT_STATUS = _restore_database_at_startup()
 init_db()
