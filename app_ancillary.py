@@ -7,8 +7,11 @@ from html import escape
 import hashlib
 import hmac
 import json
+import os
 import re
+import shutil
 import sqlite3
+import tempfile
 import uuid
 from datetime import date, datetime
 from pathlib import Path
@@ -33,6 +36,7 @@ SEED_PATH = APP_DIR / "dati_iniziali.json"
 CONTRACT_SEED_PATH = APP_DIR / "contratti_iniziali.json"
 DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 COMMISSION_SEED_PATH = APP_DIR / "commissioni_iniziali.json"
+USE_SEED_DATA = False  # I file storici contengono soltanto dati di prova.
 ANCILLARY_START_DATE = date(2026, 10, 1)
 PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "COMMISSIONI", "VETTURE", "AMMINISTRAZIONE"]
 CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
@@ -45,8 +49,198 @@ st.set_page_config(
 )
 
 
+def _drive_settings():
+    """Configurazione OAuth dell'account Google Drive che possiede lo spazio."""
+    for section in ("ancillary_drive", "google_drive_oauth", "gdrive_oauth"):
+        try:
+            cfg = dict(st.secrets.get(section, {}))
+        except Exception:
+            cfg = {}
+        if cfg.get("folder_id") and cfg.get("client_id") and cfg.get("client_secret") and cfg.get("refresh_token"):
+            cfg.setdefault("file_name", "ancillary_live.db")
+            return cfg
+    return {}
+
+
+@st.cache_resource(show_spinner=False)
+def _drive_service():
+    cfg = _drive_settings()
+    if not cfg:
+        return None
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    credentials = Credentials(
+        token=None,
+        refresh_token=cfg["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=cfg["client_id"],
+        client_secret=cfg["client_secret"],
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def _drive_file(service, name):
+    cfg = _drive_settings()
+    escaped_name = str(name).replace("'", "\\'")
+    query = f"name='{escaped_name}' and '{cfg['folder_id']}' in parents and trashed=false"
+    result = service.files().list(
+        q=query, fields="files(id,name,modifiedTime,size)", pageSize=10,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    files = result.get("files", [])
+    return sorted(files, key=lambda row: row.get("modifiedTime", ""), reverse=True)[0] if files else None
+
+
+def _drive_folder(service, parent_id, name):
+    escaped_name = str(name).replace("'", "\\'")
+    query = (f"name='{escaped_name}' and '{parent_id}' in parents and "
+             "mimeType='application/vnd.google-apps.folder' and trashed=false")
+    result = service.files().list(
+        q=query, fields="files(id,name)", pageSize=10,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    if result.get("files"):
+        return result["files"][0]["id"]
+    created = service.files().create(
+        body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
+        fields="id", supportsAllDrives=True,
+    ).execute()
+    return created["id"]
+
+
+def _archive_vehicle_photos_on_drive(plate, photos):
+    """Seconda copia indipendente delle foto, organizzata per targa."""
+    if not photos or not _drive_settings():
+        return
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        cfg = _drive_settings()
+        service = _drive_service()
+        root = _drive_folder(service, cfg["folder_id"], "FOTO_VETTURE")
+        plate_folder = _drive_folder(service, root, plate)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for photo_id, original_name, mime, data in photos:
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", original_name or "foto.jpg")
+            name = f"{stamp}_{photo_id[:8]}_{safe_name}"
+            media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime or "image/jpeg", resumable=False)
+            service.files().create(
+                body={"name": name, "parents": [plate_folder]}, media_body=media,
+                fields="id", supportsAllDrives=True,
+            ).execute()
+    except Exception as exc:
+        st.session_state["drive_photo_status"] = f"ERRORE FOTO · {type(exc).__name__}: {exc}"
+
+
+def _valid_database(path):
+    try:
+        with sqlite3.connect(path) as connection:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        return integrity == "ok" and bool(tables & {"vehicle_checks", "special_events", "rentals"})
+    except (sqlite3.Error, OSError):
+        return False
+
+
+def _database_snapshot():
+    if not DB_PATH.exists():
+        return None
+    handle, temporary_name = tempfile.mkstemp(prefix="ancillary_snapshot_", suffix=".db")
+    os.close(handle)
+    try:
+        with sqlite3.connect(DB_PATH) as source, sqlite3.connect(temporary_name) as destination:
+            source.backup(destination)
+        return Path(temporary_name)
+    except Exception:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def _upload_database_to_drive(reason="salvataggio automatico"):
+    cfg = _drive_settings()
+    if not cfg or not DB_PATH.exists():
+        st.session_state["drive_backup_status"] = "NON CONFIGURATO"
+        return False
+    snapshot = None
+    try:
+        service = _drive_service()
+        from googleapiclient.http import MediaFileUpload
+        snapshot = _database_snapshot()
+        live_name = cfg.get("file_name", "ancillary_live.db")
+        media = MediaFileUpload(str(snapshot), mimetype="application/x-sqlite3", resumable=False)
+        current = _drive_file(service, live_name)
+        if current:
+            service.files().update(fileId=current["id"], media_body=media, supportsAllDrives=True).execute()
+        else:
+            service.files().create(
+                body={"name": live_name, "parents": [cfg["folder_id"]]}, media_body=media,
+                fields="id", supportsAllDrives=True,
+            ).execute()
+        daily_name = f"ancillary_backup_{date.today().isoformat()}.db"
+        daily = _drive_file(service, daily_name)
+        daily_media = MediaFileUpload(str(snapshot), mimetype="application/x-sqlite3", resumable=False)
+        if daily:
+            service.files().update(fileId=daily["id"], media_body=daily_media, supportsAllDrives=True).execute()
+        else:
+            service.files().create(
+                body={"name": daily_name, "parents": [cfg["folder_id"]]}, media_body=daily_media,
+                fields="id", supportsAllDrives=True,
+            ).execute()
+        st.session_state["drive_backup_status"] = f"OK · {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} · {reason}"
+        return True
+    except Exception as exc:
+        st.session_state["drive_backup_status"] = f"ERRORE · {type(exc).__name__}: {exc}"
+        return False
+    finally:
+        if snapshot:
+            snapshot.unlink(missing_ok=True)
+
+
+@st.cache_resource(show_spinner=False)
+def _restore_database_at_startup():
+    cfg = _drive_settings()
+    if not cfg:
+        return {"configured": False, "restored": False, "message": "Backup Google Drive non configurato"}
+    try:
+        service = _drive_service()
+        remote = _drive_file(service, cfg.get("file_name", "ancillary_live.db"))
+        if not remote:
+            return {"configured": True, "restored": False, "message": "Nessun database principale trovato su Drive"}
+        from googleapiclient.http import MediaIoBaseDownload
+        handle, temporary_name = tempfile.mkstemp(prefix="ancillary_restore_", suffix=".db")
+        os.close(handle)
+        temporary = Path(temporary_name)
+        try:
+            with temporary.open("wb") as stream:
+                request = service.files().get_media(fileId=remote["id"], supportsAllDrives=True)
+                downloader = MediaIoBaseDownload(stream, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            if not _valid_database(temporary):
+                return {"configured": True, "restored": False, "message": "Il database su Drive non supera il controllo di integrità"}
+            shutil.copy2(temporary, DB_PATH)
+            return {"configured": True, "restored": True, "message": f"Database recuperato da Drive ({remote.get('modifiedTime', '')})"}
+        finally:
+            temporary.unlink(missing_ok=True)
+    except Exception as exc:
+        return {"configured": True, "restored": False, "message": f"Ripristino Drive non riuscito: {type(exc).__name__}: {exc}"}
+
+
+class ProtectedConnection(sqlite3.Connection):
+    def __enter__(self):
+        self._changes_on_enter = self.total_changes
+        return super().__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        result = super().__exit__(exc_type, exc_value, traceback)
+        if exc_type is None and self.total_changes > getattr(self, "_changes_on_enter", self.total_changes):
+            _upload_database_to_drive("modifica dati")
+        return result
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, factory=ProtectedConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -76,7 +270,7 @@ def init_db():
             """
         )
         count = conn.execute("SELECT COUNT(*) FROM rentals").fetchone()[0]
-        if count == 0 and SEED_PATH.exists():
+        if USE_SEED_DATA and count == 0 and SEED_PATH.exists():
             rows = json.loads(SEED_PATH.read_text(encoding="utf-8"))
             conn.executemany(
                 """
@@ -143,7 +337,7 @@ def init_db():
             conn.execute("INSERT INTO contracts SELECT * FROM contracts_legacy_ra_unique")
             conn.execute("DROP TABLE contracts_legacy_ra_unique")
         contracts_count = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
-        if contracts_count == 0 and CONTRACT_SEED_PATH.exists():
+        if USE_SEED_DATA and contracts_count == 0 and CONTRACT_SEED_PATH.exists():
             contracts = json.loads(CONTRACT_SEED_PATH.read_text(encoding="utf-8"))
             conn.executemany(
                 """
@@ -198,7 +392,7 @@ def init_db():
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_damage_photos_damage_id ON damage_photos(damage_id)")
         damage_count = conn.execute("SELECT COUNT(*) FROM damage_charges").fetchone()[0]
-        if damage_count == 0 and DAMAGE_SEED_PATH.exists():
+        if USE_SEED_DATA and damage_count == 0 and DAMAGE_SEED_PATH.exists():
             damages = json.loads(DAMAGE_SEED_PATH.read_text(encoding="utf-8"))
             conn.executemany(
                 """
@@ -353,7 +547,7 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_commission_ra_date ON commission_documents(ra,contract_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_commission_period ON commission_documents(report_period)")
-        if conn.execute("SELECT COUNT(*) FROM commission_documents").fetchone()[0] == 0 and COMMISSION_SEED_PATH.exists():
+        if USE_SEED_DATA and conn.execute("SELECT COUNT(*) FROM commission_documents").fetchone()[0] == 0 and COMMISSION_SEED_PATH.exists():
             seed_rows = json.loads(COMMISSION_SEED_PATH.read_text(encoding="utf-8"))
             conn.executemany("""INSERT OR IGNORE INTO commission_documents VALUES
                 (:invoice_id,:report_period,:import_file,:document_type,:invoice_number,
@@ -1935,6 +2129,7 @@ def save_vehicle_check(payload, photos, check_id=None, removed_photos=None):
         conn.execute('INSERT INTO vehicle_check_history VALUES (?,?,?,?,?,?)',
                      (str(uuid.uuid4()), identifier, 'MODIFICA' if previous else 'INSERIMENTO',
                       current_user().get('username', ''), now, encoded))
+    _archive_vehicle_photos_on_drive(plate, validated)
     return identifier
 
 
@@ -4141,12 +4336,173 @@ def event_vehicles_page(frame):
         st.rerun()
 
 
+def _safe_excel_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def import_vehicle_recovery_excel(file_bytes, event_id=""):
+    frame = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, dtype=object)
+    required = {"Targa", "Marca", "Modello", "Gruppo", "Check-in", "Data controllo", "Operatore"}
+    missing_columns = sorted(required - set(frame.columns))
+    if missing_columns:
+        raise ValueError("Colonne mancanti: " + ", ".join(missing_columns))
+    vehicle_tables()
+    event_title = ""
+    if event_id:
+        with db() as connection:
+            event = connection.execute("SELECT title FROM special_events WHERE id=?", (event_id,)).fetchone()
+        if not event:
+            raise ValueError("L'evento selezionato non esiste più.")
+        event_title = event[0]
+    imported = 0
+    skipped = 0
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as connection:
+        for _, row in frame.iterrows():
+            plate = re.sub(r"[^A-Z0-9]", "", upper(_safe_excel_text(row.get("Targa"))))
+            if not plate:
+                skipped += 1
+                continue
+            checked_raw = row.get("Data controllo")
+            try:
+                checked_at = pd.to_datetime(checked_raw).date().isoformat()
+            except Exception:
+                checked_at = date.today().isoformat()
+            missing_items = {
+                clean(item) for item in re.split(r"[;,]", _safe_excel_text(row.get("Documenti / dotazioni mancanti")))
+                if clean(item)
+            }
+            checklist = []
+            for label in VEHICLE_CHECKLIST:
+                state = "Non presente" if label in missing_items else "Non previsto"
+                checklist.append({"Voce": label, "Stato": state, "Presente": False, "Non previsto": state == "Non previsto"})
+            tire_size = _safe_excel_text(row.get("Misura gomme se calze mancanti"))
+            damage_status = _safe_excel_text(row.get("Danni")) or "Da verificare"
+            payload = {
+                "event_id": event_id, "event_title": event_title,
+                "plate": plate, "brand": _safe_excel_text(row.get("Marca")),
+                "model": _safe_excel_text(row.get("Modello")), "group": _safe_excel_text(row.get("Gruppo")),
+                "park_number": _safe_excel_text(row.get("Park N°")), "ra": "", "km": 0, "fuel": 100,
+                "operator": _safe_excel_text(row.get("Operatore")) or "SERGIO", "checked_at": checked_at,
+                "preparation_status": _safe_excel_text(row.get("Approntamento")) or "Da completare",
+                "preparation_operator": _safe_excel_text(row.get("Operatore")) or "SERGIO",
+                "notes": "Recuperato dal riepilogo Excel dopo perdita del database.",
+                "damage_status": damage_status, "damage_notes": _safe_excel_text(row.get("Descrizione danni")),
+                "maintenance": _safe_excel_text(row.get("Manutenzione")) or "Da verificare",
+                "repair_tasks": _safe_excel_text(row.get("Lavori da eseguire")),
+                "maintenance_notes": _safe_excel_text(row.get("Note manutenzione")),
+                "cleaning_inside": _safe_excel_text(row.get("Pulizia interna")) or "Da verificare",
+                "cleaning_outside": _safe_excel_text(row.get("Pulizia esterna")) or "Da verificare",
+                "tires_ok": False, "checklist": checklist,
+                "tires": [{"Marca": "", "Modello": "", "Tipo": "", "Misura": tire_size, "Stato / note": "Da verificare"}],
+            }
+            existing = connection.execute(
+                "SELECT id FROM vehicle_checks WHERE plate=? AND substr(checked_at,1,10)=? ORDER BY updated_at DESC LIMIT 1",
+                (plate, checked_at),
+            ).fetchone()
+            identifier = existing[0] if existing else str(uuid.uuid4())
+            encoded = json.dumps(payload, ensure_ascii=False)
+            if existing:
+                connection.execute(
+                    "UPDATE vehicle_checks SET operator=?,payload=?,updated_at=? WHERE id=?",
+                    (payload["operator"], encoded, now, identifier),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO vehicle_checks VALUES (?,?,?,?,?,?,?)",
+                    (identifier, plate, checked_at, payload["operator"], encoded, now, now),
+                )
+            if event_id:
+                event_vehicle = connection.execute(
+                    "SELECT id FROM event_vehicles WHERE event_id=? AND replace(replace(upper(plate),' ',''),'-','')=?",
+                    (event_id, plate),
+                ).fetchone()
+                if event_vehicle:
+                    connection.execute(
+                        "UPDATE event_vehicles SET vehicle_group=?,brand=?,model=?,park_number=?,updated_at=? WHERE id=?",
+                        (payload["group"], payload["brand"], payload["model"], payload["park_number"], now, event_vehicle[0]),
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO event_vehicles (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at,park_number) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (str(uuid.uuid4()), event_id, payload["group"], plate, payload["brand"], payload["model"], "", "", "", "Recuperato da Excel", now, payload["park_number"]),
+                    )
+            connection.execute(
+                "INSERT INTO vehicle_check_history VALUES (?,?,?,?,?,?)",
+                (str(uuid.uuid4()), identifier, "RECUPERO DA EXCEL", current_user().get("username", ""), now, encoded),
+            )
+            imported += 1
+    return imported, skipped
+
+
+def _restore_uploaded_database(uploaded):
+    handle, temporary_name = tempfile.mkstemp(prefix="ancillary_manual_restore_", suffix=".db")
+    os.close(handle)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_bytes(uploaded.getvalue())
+        if not _valid_database(temporary):
+            raise ValueError("Il file non è un database Ancillary valido o è danneggiato.")
+        safety = _database_snapshot()
+        try:
+            if safety:
+                shutil.copy2(safety, APP_DIR / f"ancillary_prima_del_ripristino_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+        finally:
+            if safety:
+                safety.unlink(missing_ok=True)
+        shutil.copy2(temporary, DB_PATH)
+        _upload_database_to_drive("ripristino manuale")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def import_backup():
     st.header("Importazione e backup")
     st.subheader("Backup completo")
     if DB_PATH.exists():
         st.download_button("Scarica database", DB_PATH.read_bytes(), "ancillary_backup.db", mime="application/octet-stream", use_container_width=True)
-    st.caption("Conserva periodicamente il file di backup in una posizione sicura.")
+    drive_status = st.session_state.get("drive_backup_status", PERSISTENCE_BOOT_STATUS.get("message", ""))
+    st.info("Stato protezione Google Drive: " + str(drive_status))
+    c_sync, c_restore = st.columns(2)
+    if c_sync.button("Salva ora su Google Drive", use_container_width=True):
+        if _upload_database_to_drive("backup manuale"):
+            st.success("Database salvato su Google Drive.")
+        else:
+            st.error("Salvataggio Drive non riuscito. Controlla configurazione e stato mostrato sopra.")
+    restore_upload = c_restore.file_uploader("Ripristina database (.db)", type=["db", "sqlite", "sqlite3"], key="manual_db_restore")
+    confirm_restore = st.checkbox("Confermo di sostituire il database corrente con il file selezionato", key="confirm_manual_restore")
+    if st.button("Ripristina database selezionato", disabled=restore_upload is None or not confirm_restore, use_container_width=True):
+        try:
+            _restore_uploaded_database(restore_upload)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            st.error(f"Ripristino non riuscito: {exc}")
+        else:
+            st.success("Database ripristinato e copiato su Google Drive.")
+            st.cache_data.clear()
+            st.rerun()
+    st.caption("Il database viene salvato automaticamente su Google Drive dopo ogni modifica e in una copia giornaliera.")
+
+    st.subheader("Recupero check-in vetture da Excel")
+    st.caption("Importa il riepilogo recuperato senza reinserire manualmente targhe, danni, manutenzioni e dotazioni mancanti.")
+    recovery_upload = st.file_uploader("File riepilogo vetture", type=["xlsx"], key="vehicle_recovery_excel")
+    recovery_events = load_special_events()
+    recovery_options = [""] + (recovery_events["id"].tolist() if not recovery_events.empty else [])
+    recovery_event = st.selectbox(
+        "Associa a un evento (facoltativo)", recovery_options,
+        format_func=lambda value: "Nessun evento - archivio generale" if not value else event_label(recovery_events.loc[recovery_events["id"].eq(value)].iloc[0]),
+        key="vehicle_recovery_event",
+    )
+    confirm_recovery = st.checkbox("Confermo l'importazione dei check-in recuperati", key="confirm_vehicle_recovery")
+    if st.button("Importa check-in recuperati", disabled=recovery_upload is None or not confirm_recovery, use_container_width=True):
+        try:
+            imported, skipped = import_vehicle_recovery_excel(recovery_upload.getvalue(), recovery_event)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            st.error(f"Importazione non riuscita: {exc}")
+        else:
+            st.success(f"Check-in recuperati: {imported}. Righe escluse: {skipped}.")
+            st.rerun()
     st.subheader("Importazione intelligente da Excel")
     st.caption("Il gestionale riconosce riepiloghi ancillary, report Contratti RA, Commissioni e Addebito Danni.")
     upload = st.file_uploader("Carica un file Excel", type=["xlsx"])
@@ -4435,6 +4791,7 @@ def login():
     return False
 
 
+PERSISTENCE_BOOT_STATUS = _restore_database_at_startup()
 init_db()
 if st.query_params.get("ddt_sign"):
     signing_page(st.query_params.get("ddt_sign"))
@@ -4444,6 +4801,14 @@ if not login():
 
 st.title("Gestionale Noleggi, Ancillary e Danni")
 st.caption("Importazione automatica dei report, archivio contratti, statistiche, ancillary e addebito danni")
+if not PERSISTENCE_BOOT_STATUS.get("configured"):
+    st.error("PROTEZIONE DATI NON ATTIVA: configura Google Drive prima di inserire dati reali.")
+    st.info("L'accesso operativo è bloccato per evitare nuovi inserimenti non protetti. Configura la sezione ancillary_drive nei Secrets e riavvia l'app.")
+    st.stop()
+elif not PERSISTENCE_BOOT_STATUS.get("restored"):
+    st.warning("Google Drive è configurato, ma all'avvio non è stato recuperato un database: " + PERSISTENCE_BOOT_STATUS.get("message", ""))
+else:
+    st.success("Protezione dati attiva. " + PERSISTENCE_BOOT_STATUS.get("message", ""))
 all_data = load_data()
 all_contracts = load_contracts()
 all_damages = load_damages()
