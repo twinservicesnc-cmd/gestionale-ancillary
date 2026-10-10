@@ -2797,6 +2797,26 @@ def vehicle_page(archive=False):
         st.info(vehicle_notify(selected, payload))
     vehicle_print_buttons(payload, selected, 'archive_'+selected)
     vehicle_check_form(current)
+    st.divider()
+    st.subheader('Eliminazione scheda')
+    st.warning('Questa operazione elimina soltanto la scheda selezionata, le fotografie contenute nel database e il relativo storico.')
+    selected_plate = upper(current.get('plate'))
+    confirm_delete = st.checkbox(
+        f"Confermo l’eliminazione definitiva della scheda {selected_plate}",
+        key=f'vehicle_check_delete_confirm_{selected}',
+    )
+    if st.button(
+        'Elimina scheda selezionata',
+        disabled=not confirm_delete,
+        key=f'vehicle_check_delete_{selected}',
+        use_container_width=True,
+    ):
+        with db() as conn:
+            conn.execute('DELETE FROM vehicle_check_photos WHERE check_id=?', (selected,))
+            conn.execute('DELETE FROM vehicle_check_history WHERE check_id=?', (selected,))
+            conn.execute('DELETE FROM vehicle_checks WHERE id=?', (selected,))
+        st.session_state['vehicle_saved_message'] = f'Scheda {selected_plate} eliminata e database aggiornato su Google Drive.'
+        st.rerun()
 
 
 def archive(frame):
