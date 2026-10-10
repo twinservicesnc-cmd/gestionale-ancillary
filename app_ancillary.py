@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from PIL import Image
+from delivery_collection import services_page
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Image as PdfImage, KeepTogether
 from reportlab.lib import colors
@@ -38,7 +39,7 @@ DAMAGE_SEED_PATH = APP_DIR / "danni_iniziali.json"
 COMMISSION_SEED_PATH = APP_DIR / "commissioni_iniziali.json"
 USE_SEED_DATA = False  # I file storici contengono soltanto dati di prova.
 ANCILLARY_START_DATE = date(2026, 10, 1)
-PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "COMMISSIONI", "VETTURE", "AMMINISTRAZIONE"]
+PERMISSION_AREAS = ["ANCILLARY", "CONTRATTI RA", "ADDEBITO DANNI", "CASSA", "EVENTI SPECIALI", "DOCUMENTI", "COMMISSIONI", "VETTURE", "DELIVERY / COLLECTION", "AMMINISTRAZIONE"]
 CASH_IN_TYPES = ["DEPOSITO", "INCASSO", "RETTIFICA POSITIVA"]
 CASH_OUT_TYPES = ["RIMBORSO", "RIMESSA", "PRELIEVO", "RETTIFICA NEGATIVA"]
 
@@ -5083,6 +5084,7 @@ navigation = {
         ("📎 Documenti e fotografie", "Allegati eventi speciali"),
         ("🗂️ Archivio eventi", "Archivio eventi speciali"),
     ],
+    "DELIVERY / COLLECTION": [("🚚 Servizi Delivery / Collection", "Delivery / Collection")],
     "DOCUMENTI": [("📄 Documenti di trasporto", "Documenti di trasporto")],
     "COMMISSIONI": [("📊 Analisi commissioni", "Analisi commissioni")],
     "AMMINISTRAZIONE": [
@@ -5187,6 +5189,8 @@ elif page == "Archivio contratti RA":
     contracts_archive(all_contracts)
 elif page == "Inserimento ancillary":
     record_form(all_data)
+elif page == "Delivery / Collection":
+    services_page(st, db, table_to_excel, current_user)
 elif page == "Documenti di trasporto":
     documents_page()
 elif page == "Analisi commissioni":
@@ -5197,3 +5201,4 @@ elif page == "Utenti e autorizzazioni":
     user_settings()
 else:
     import_backup()
+
