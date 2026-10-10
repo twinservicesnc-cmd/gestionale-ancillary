@@ -25,6 +25,11 @@ LABELS.update(dict(zip(EXTRA_FIELDS, ['Km', 'Carburante (€)', 'Spese extra (�
 LABELS.update(cost_per_km='Costo al km (€)', reference='Riferimento')
 SIMPLE_FIELDS = ['vehicle_type', 'plate', 'service_date', 'departure', 'destination',
                  'km', 'reference', 'requested_by', 'driver', 'cost_per_km', 'cost']
+LABELS.update(vehicle_type='Tipologia', service_date='Data trasferimento',
+              departure='Luogo ritiro', destination='Luogo consegna',
+              cost='Totale km × costo al km (€)', total_cost='Totale complessivo (€)')
+REPORT_FIELDS = SIMPLE_FIELDS + ['extra_cost', 'total_cost', 'service_type',
+                                 'service_time', 'client', 'status', 'fuel_cost', 'notes']
 ALL_FIELDS = FIELDS + EXTRA_FIELDS
 
 
@@ -85,6 +90,41 @@ def calculate_cost(km, cost_per_km):
     return float((Decimal(str(km)) * Decimal(str(cost_per_km))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
 
+def overall_cost(base, extra):
+    if base is None or pd.isna(base):
+        return None
+    extra = 0 if extra is None or pd.isna(extra) else extra
+    return float((Decimal(str(base)) + Decimal(str(extra))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+
+def service_report(frame):
+    report = frame.copy()
+    report['cost'] = [calculate_cost(row['km'], row['cost_per_km'])
+        if pd.notna(row['km']) and pd.notna(row['cost_per_km']) else row['cost']
+        for row in report.to_dict('records')]
+    report['total_cost'] = [overall_cost(row['cost'], row['extra_cost']) for row in report.to_dict('records')]
+    result = report[REPORT_FIELDS].rename(columns=LABELS)
+    result[LABELS['service_date']] = pd.to_datetime(result[LABELS['service_date']])
+    return result
+
+
+def services_excel(report, table_to_excel):
+    from openpyxl import load_workbook
+    out = io.BytesIO()
+    workbook = load_workbook(io.BytesIO(table_to_excel(report, 'Delivery Collection')))
+    sheet = workbook.active
+    money_fields = ['cost_per_km', 'cost', 'extra_cost', 'total_cost', 'fuel_cost']
+    for field in money_fields:
+        index = list(report.columns).index(LABELS[field]) + 1
+        for row in range(2, sheet.max_row + 1):
+            sheet.cell(row, index).number_format = '#,##0.00 "€"'
+    date_index = list(report.columns).index(LABELS['service_date']) + 1
+    for row in range(2, sheet.max_row + 1):
+        sheet.cell(row, date_index).number_format = 'dd/mm/yyyy'
+    workbook.save(out)
+    return out.getvalue()
+
+
 def period_bounds(mode, year, month=1, end_year=None, end_month=None):
     if mode == 'Tutto lo storico':
         return None, None
@@ -128,12 +168,12 @@ def parse_services(file_bytes):
     recognized = False
     aliases = {
         'service_type': ['TUPI DI SERVIZIO', 'TIPI DI SERVIZIO', 'TIPO DI SERVIZIO', 'TIPO SERVIZIO'],
-        'service_date': ['DATA', 'DATA DEL SERVIZIO', 'DATA TRAFERIMENTO', 'DATA TRASFERIMENTO'],
+        'service_date': ['DATA', 'DATA DEL SERVIZIO', 'DATA TRAFERIMENTO', 'DATA TRASFERIMENTO', 'DATA TRASFERIMENTO'],
         'service_time': ['ORARIO', 'ORARIO DI RITIRO', 'ORA'],
         'driver': ['AUTISTA'], 'plate': ['TARGA', 'TARGA AUTO-VAN'], 'client': ['CLIENTE'],
         'departure': ['LUOGO DI PARTENZA', 'PARTENZA', 'LUOGO RITIRO'],
         'destination': ['INDIRIZZO DI CONSEGNA', 'LUOGO DI DESTINAZIONE', 'DESTINAZIONE / INDIRIZZO', 'LUOGO CONSEGNA'],
-        'cost': ['COSTO', 'COSTO (€)'], 'notes': ['NOTE'], 'status': ['STATO'],
+        'cost': ['COSTO', 'COSTO (€)', 'TOTALE KM × COSTO AL KM (€)'], 'notes': ['NOTE'], 'status': ['STATO'],
         'km': ['KM'], 'fuel_cost': ['CARBURANTE', 'CARBURANTE (€)'],
         'extra_cost': ['SPESE EXTRA', 'SPESE EXTRA (€)'],
         'requested_by': ['COMMISSIONATA DA:', 'COMMISSIONATA DA', 'COMMISSIONATO DA'],
@@ -242,17 +282,33 @@ def services_pdf(frame):
     styles = getSampleStyleSheet()
     styles['Title'].fontName = 'Helvetica-Bold'
     small = styles['BodyText'].clone('Services'); small.fontSize = 8; small.leading = 10; small.fontName = 'Helvetica'
-    frame = frame.copy()
-    frame['Data'] = pd.to_datetime(frame['Data']).dt.strftime('%d/%m/%Y')
+    full_report = frame.copy()
+    frame = frame[[LABELS[field] for field in SIMPLE_FIELDS + ['extra_cost', 'total_cost']]].copy()
+    frame[LABELS['service_date']] = pd.to_datetime(frame[LABELS['service_date']]).dt.strftime('%d/%m/%Y')
+    for field in ['cost_per_km', 'cost', 'extra_cost', 'total_cost']:
+        frame[LABELS[field]] = frame[LABELS[field]].map(lambda value: '' if pd.isna(value) else f'{value:.2f}')
     rows = [[Paragraph(escape(str(column)), small) for column in frame.columns]]
     rows += [[Paragraph(escape('' if pd.isna(value) else str(value)).replace('\n', '<br/>'), small)
               for value in row] for row in frame.itertuples(index=False, name=None)]
-    widths = [68, 62, 42, 65, 65, 70, 65, 116, 50, 75, 115]
+    widths = [48, 50, 62, 75, 75, 33, 60, 65, 50, 55, 70, 60, 80]
     table = Table(rows, colWidths=widths, repeatRows=1)
     table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor('#e5edf5')),
                               ('GRID', (0,0), (-1,-1), .3, colors.lightgrey),
                               ('VALIGN', (0,0), (-1,-1), 'TOP')]))
-    doc.build([Paragraph('Delivery / Collection', styles['Title']), Spacer(1,12), table])
+    total = full_report[LABELS['total_cost']].sum()
+    missing = full_report[LABELS['total_cost']].isna().sum()
+    story = [Paragraph('Delivery / Collection', styles['Title']),
+             Paragraph(f'{len(frame)} servizi · Totale complessivo degli importi indicati: € {total:.2f} · {missing} senza totale', small),
+             Spacer(1,12), table]
+    story += [Spacer(1,12), Paragraph('Dettagli facoltativi', styles['Heading2'])]
+    for row in full_report.to_dict('records'):
+        details = [f'{LABELS[field]}: {text(row[LABELS[field]])}'
+                   for field in ['service_type', 'service_time', 'client', 'status', 'fuel_cost', 'notes']
+                   if text(row[LABELS[field]])]
+        if details:
+            label = f"{text(row[LABELS['plate']])} · {pd.Timestamp(row[LABELS['service_date']]).strftime('%d/%m/%Y')}"
+            story += [Paragraph(escape(label + ' — ' + '; '.join(details)).replace('\n', '<br/>'), small), Spacer(1,6)]
+    doc.build(story)
     return out.getvalue()
 
 
@@ -304,18 +360,15 @@ def services_page(st, db, table_to_excel, current_user):
     if search.strip():
         shown = shown[shown[['plate', 'driver', 'client']].fillna('').apply(
             lambda column: column.str.contains(search.strip(), case=False, regex=False)).any(axis=1)]
-    display = shown[SIMPLE_FIELDS].rename(columns=LABELS)
+    report = service_report(shown)
+    display = report[[LABELS[field] for field in SIMPLE_FIELDS + ['extra_cost', 'total_cost']]]
     st.dataframe(display, hide_index=True, use_container_width=True)
-    st.caption(f'{len(shown)} servizi · Costi indicati: € {shown.cost.sum():.2f} · {shown.cost.isna().sum()} senza costo')
+    st.caption(f"{len(shown)} servizi · Totale complessivo: € {report[LABELS['total_cost']].sum():.2f} · {report[LABELS['total_cost']].isna().sum()} senza totale")
     if not shown.empty:
         a, b = st.columns(2)
-        a.download_button('Scarica Excel', table_to_excel(shown[ALL_FIELDS].rename(columns=LABELS), 'Delivery Collection'), 'delivery_collection.xlsx',
+        a.download_button('Scarica Excel', services_excel(report, table_to_excel), 'delivery_collection.xlsx',
                           mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        pdf_display = shown[FIELDS].rename(columns=LABELS)
-        pdf_display['Note'] = [ '\n'.join(filter(None, [text(row['notes'])] +
-            [f'{LABELS[field]}: {text(row[field])}' for field in EXTRA_FIELDS if text(row[field])]))
-            for row in shown.to_dict('records')]
-        b.download_button('Scarica PDF', services_pdf(pdf_display), 'delivery_collection.pdf', mime='application/pdf')
+        b.download_button('Scarica PDF', services_pdf(report), 'delivery_collection.pdf', mime='application/pdf')
     choices = {r['id']: r for r in shown.to_dict('records')}
     selected = st.selectbox('Nuovo servizio o modifica uno esistente', [''] + list(choices),
         format_func=lambda key: '➕ Nuovo servizio' if not key else
@@ -359,7 +412,7 @@ def services_page(st, db, table_to_excel, current_user):
                 value = record.get(field)
                 optional_costs[field] = column.number_input(LABELS[field], min_value=0.0,
                     value=None if value is None or pd.isna(value) else float(value), step=1.0)
-            st.caption('Carburante e spese extra sono indicati separatamente dal totale km × costo al km.')
+            st.caption('Totale complessivo = km × costo al km + spese extra. Carburante resta separato.')
             notes = st.text_area('Note', value=text(record.get('notes')))
         submitted = st.form_submit_button('Salva servizio', type='primary')
     if submitted:
@@ -379,7 +432,8 @@ def services_page(st, db, table_to_excel, current_user):
             st.error(str(exc))
         else:
             st.session_state['services_nonce'] = nonce + 1
-            st.session_state['services_flash'] = f'Servizio salvato. Totale: € {cost:.2f}.'
+            total = overall_cost(cost, optional_costs['extra_cost'])
+            st.session_state['services_flash'] = f'Servizio salvato. Costo km: € {cost:.2f}. Totale con extra: € {total:.2f}.'
             st.rerun()
     with st.expander('Importa storico da Excel'):
         st.caption('Legge tutti i fogli. Le righe storiche senza tipo diventano Trasferimento; lo stato resta Da verificare. Reimportare lo stesso file non duplica i servizi.')
