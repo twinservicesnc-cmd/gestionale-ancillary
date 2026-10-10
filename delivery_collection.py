@@ -28,8 +28,8 @@ SIMPLE_FIELDS = ['vehicle_type', 'plate', 'service_date', 'departure', 'destinat
 LABELS.update(vehicle_type='Tipologia', service_date='Data trasferimento',
               departure='Luogo ritiro', destination='Luogo consegna',
               cost='Totale km × costo al km (€)', total_cost='Totale complessivo (€)')
-REPORT_FIELDS = SIMPLE_FIELDS + ['extra_cost', 'total_cost', 'service_type',
-                                 'service_time', 'client', 'status', 'fuel_cost', 'notes']
+SUMMARY_FIELDS = SIMPLE_FIELDS + ['extra_cost', 'fuel_cost', 'total_cost']
+REPORT_FIELDS = SUMMARY_FIELDS + ['service_type', 'service_time', 'client', 'status', 'notes']
 ALL_FIELDS = FIELDS + EXTRA_FIELDS
 
 
@@ -284,14 +284,14 @@ def services_pdf(frame):
     styles['Title'].fontName = 'Helvetica-Bold'
     small = styles['BodyText'].clone('Services'); small.fontSize = 8; small.leading = 10; small.fontName = 'Helvetica'
     full_report = frame.copy()
-    frame = frame[[LABELS[field] for field in SIMPLE_FIELDS + ['extra_cost', 'total_cost']]].copy()
+    frame = frame[[LABELS[field] for field in SUMMARY_FIELDS]].copy()
     frame[LABELS['service_date']] = pd.to_datetime(frame[LABELS['service_date']]).dt.strftime('%d/%m/%Y')
-    for field in ['cost_per_km', 'cost', 'extra_cost', 'total_cost']:
+    for field in ['cost_per_km', 'cost', 'extra_cost', 'fuel_cost', 'total_cost']:
         frame[LABELS[field]] = frame[LABELS[field]].map(lambda value: '' if pd.isna(value) else f'{value:.2f}')
     rows = [[Paragraph(escape(str(column)), small) for column in frame.columns]]
     rows += [[Paragraph(escape('' if pd.isna(value) else str(value)).replace('\n', '<br/>'), small)
               for value in row] for row in frame.itertuples(index=False, name=None)]
-    widths = [48, 50, 62, 75, 75, 33, 60, 65, 50, 55, 70, 60, 80]
+    widths = [43, 48, 60, 65, 65, 32, 55, 58, 48, 52, 67, 60, 60, 70]
     table = Table(rows, colWidths=widths, repeatRows=1)
     table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor('#e5edf5')),
                               ('GRID', (0,0), (-1,-1), .3, colors.lightgrey),
@@ -362,7 +362,7 @@ def services_page(st, db, table_to_excel, current_user):
         shown = shown[shown[['plate', 'driver', 'client']].fillna('').apply(
             lambda column: column.str.contains(search.strip(), case=False, regex=False)).any(axis=1)]
     report = service_report(shown)
-    display = report[[LABELS[field] for field in SIMPLE_FIELDS + ['extra_cost', 'total_cost']]]
+    display = report[[LABELS[field] for field in SUMMARY_FIELDS]]
     st.dataframe(display, hide_index=True, use_container_width=True)
     st.caption(f"{len(shown)} servizi · Totale complessivo: € {report[LABELS['total_cost']].sum():.2f} · {report[LABELS['total_cost']].isna().sum()} senza totale")
     if not shown.empty:
