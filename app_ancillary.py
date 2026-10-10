@@ -4520,6 +4520,98 @@ def import_vehicle_recovery_excel(file_bytes, event_id=""):
     return imported, skipped
 
 
+def _excel_column_guess(columns, aliases):
+    normalized = {re.sub(r"[^a-z0-9]", "", str(column).lower()): column for column in columns}
+    for alias in aliases:
+        key = re.sub(r"[^a-z0-9]", "", alias.lower())
+        if key in normalized:
+            return normalized[key]
+    return "— Non importare —"
+
+
+def import_vehicle_excel_general(frame, mapping, mode):
+    """Importa anagrafiche vetture da un foglio Excel già validato e mappato."""
+    vehicle_tables()
+    created = updated = skipped = 0
+    now = datetime.now().isoformat(timespec="seconds")
+    configured = configured_operators()
+    default_operator = configured[0]["name"] if configured else (current_user().get("operator_name") or current_user().get("display_name") or "AMMINISTRATORE")
+
+    def value(row, field):
+        column = mapping.get(field)
+        return _safe_excel_text(row.get(column)) if column and column != "— Non importare —" else ""
+
+    with db() as connection:
+        for _, row in frame.iterrows():
+            plate = re.sub(r"[^A-Z0-9]", "", upper(value(row, "plate")))
+            if not plate:
+                skipped += 1
+                continue
+            existing = connection.execute(
+                "SELECT id,payload FROM vehicle_checks WHERE plate=? ORDER BY checked_at DESC,updated_at DESC LIMIT 1",
+                (plate,),
+            ).fetchone()
+            if existing and mode == "Crea solo targhe nuove":
+                skipped += 1
+                continue
+            checked_text = value(row, "checked_at")
+            parsed_date = pd.to_datetime(checked_text, errors="coerce", dayfirst=True)
+            checked_at = parsed_date.date().isoformat() if pd.notna(parsed_date) else date.today().isoformat()
+            if existing and mode == "Aggiorna la scheda più recente":
+                identifier = existing["id"]
+                payload = json.loads(existing["payload"])
+                action = "AGGIORNAMENTO DA EXCEL"
+            else:
+                identifier = str(uuid.uuid4())
+                payload = {
+                    "event_id": "", "event_title": "", "plate": plate, "brand": "", "model": "",
+                    "group": "", "park_number": "", "ra": "", "km": 0, "fuel": 100,
+                    "operator": default_operator, "checked_at": checked_at,
+                    "preparation_status": "Da completare", "preparation_operator": default_operator,
+                    "notes": "Importato da Excel.", "damage_status": "Da verificare", "damage_notes": "",
+                    "maintenance": "Da verificare", "repair_tasks": "", "maintenance_notes": "",
+                    "cleaning_inside": "Da verificare", "cleaning_outside": "Da verificare",
+                    "tires_ok": False,
+                    "checklist": [{"Voce": label, "Stato": "Non previsto", "Presente": False, "Non previsto": True} for label in VEHICLE_CHECKLIST],
+                    "tires": [{"Marca": "", "Modello": "", "Tipo": "", "Misura": "", "Stato / note": "Da verificare"}],
+                }
+                action = "IMPORTAZIONE DA EXCEL"
+            text_fields = {"brand": "brand", "model": "model", "group": "group", "park_number": "park_number", "ra": "ra", "operator": "operator", "notes": "notes"}
+            for field, payload_key in text_fields.items():
+                incoming = value(row, field)
+                if incoming:
+                    payload[payload_key] = upper(incoming) if field in {"ra", "operator"} else incoming
+            for field, default in (("km", payload.get("km", 0)), ("fuel", payload.get("fuel", 100))):
+                incoming = value(row, field).replace(",", ".")
+                if incoming:
+                    try:
+                        payload[field] = float(incoming)
+                    except ValueError:
+                        payload[field] = default
+            payload["plate"] = plate
+            payload["checked_at"] = checked_at
+            payload["operator"] = payload.get("operator") or default_operator
+            payload["preparation_operator"] = payload.get("preparation_operator") or payload["operator"]
+            encoded = json.dumps(payload, ensure_ascii=False)
+            if existing and mode == "Aggiorna la scheda più recente":
+                connection.execute(
+                    "UPDATE vehicle_checks SET checked_at=?,operator=?,payload=?,updated_at=? WHERE id=?",
+                    (checked_at, payload["operator"], encoded, now, identifier),
+                )
+                updated += 1
+            else:
+                connection.execute(
+                    "INSERT INTO vehicle_checks VALUES (?,?,?,?,?,?,?)",
+                    (identifier, plate, checked_at, payload["operator"], encoded, now, now),
+                )
+                created += 1
+            connection.execute(
+                "INSERT INTO vehicle_check_history VALUES (?,?,?,?,?,?)",
+                (str(uuid.uuid4()), identifier, action, current_user().get("username", ""), now, encoded),
+            )
+    return created, updated, skipped
+
+
 def _restore_uploaded_database(uploaded):
     handle, temporary_name = tempfile.mkstemp(prefix="ancillary_manual_restore_", suffix=".db")
     os.close(handle)
@@ -4586,6 +4678,57 @@ def import_backup():
         else:
             st.success(f"Check-in recuperati: {imported}. Righe escluse: {skipped}.")
             st.rerun()
+
+    st.subheader("Importazione generale vetture da Excel")
+    st.caption("Carica un Excel, controlla l’anteprima e associa le colonne. È obbligatoria soltanto la targa.")
+    general_vehicle_upload = st.file_uploader("File Excel vetture", type=["xlsx"], key="general_vehicle_excel")
+    if general_vehicle_upload is not None:
+        try:
+            general_frame = pd.read_excel(io.BytesIO(general_vehicle_upload.getvalue()), sheet_name=0, dtype=object)
+        except Exception as exc:
+            st.error(f"File Excel non leggibile: {exc}")
+        else:
+            general_frame = general_frame.dropna(how="all")
+            st.write(f"Righe rilevate: **{len(general_frame)}**")
+            st.dataframe(general_frame.head(20), hide_index=True, use_container_width=True)
+            options = ["— Non importare —"] + [str(column) for column in general_frame.columns]
+            definitions = [
+                ("plate", "Targa *", ["Targa", "Plate"]), ("brand", "Marca", ["Marca", "Brand"]),
+                ("model", "Modello", ["Modello", "Model"]), ("group", "Gruppo", ["Gruppo", "Group", "Categoria"]),
+                ("park_number", "Park N°", ["Park N°", "Park", "Posto"]), ("ra", "RA", ["RA", "Contratto"]),
+                ("checked_at", "Data controllo", ["Data controllo", "Data", "Check-in"]),
+                ("operator", "Operatore", ["Operatore", "Operator"]), ("km", "Km", ["Km", "Chilometri"]),
+                ("fuel", "Carburante / carica %", ["Carburante / carica %", "Carburante", "Fuel"]),
+                ("notes", "Note", ["Note", "Annotazioni"]),
+            ]
+            mapping = {}
+            columns_ui = st.columns(3)
+            for index, (field, label, aliases) in enumerate(definitions):
+                guessed = _excel_column_guess(general_frame.columns, aliases)
+                mapping[field] = columns_ui[index % 3].selectbox(
+                    label, options, index=options.index(guessed) if guessed in options else 0,
+                    key=f"general_vehicle_map_{field}",
+                )
+            mode = st.radio(
+                "Se la targa è già presente",
+                ["Crea solo targhe nuove", "Aggiorna la scheda più recente", "Crea sempre una nuova scheda"],
+                horizontal=True, key="general_vehicle_import_mode",
+            )
+            confirm_general = st.checkbox("Confermo l’importazione delle vetture mostrate in anteprima", key="confirm_general_vehicle_import")
+            plate_ready = mapping.get("plate") != "— Non importare —"
+            if not plate_ready:
+                st.warning("Associa la colonna Targa per abilitare l’importazione.")
+            if st.button(
+                "Importa vetture da Excel", disabled=not (plate_ready and confirm_general and not general_frame.empty),
+                type="primary", use_container_width=True,
+            ):
+                try:
+                    created, updated, skipped = import_vehicle_excel_general(general_frame, mapping, mode)
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    st.error(f"Importazione non riuscita: {exc}")
+                else:
+                    st.success(f"Importazione completata: {created} create, {updated} aggiornate, {skipped} escluse.")
+                    st.rerun()
     st.subheader("Importazione intelligente da Excel")
     st.caption("Il gestionale riconosce riepiloghi ancillary, report Contratti RA, Commissioni e Addebito Danni.")
     upload = st.file_uploader("Carica un file Excel", type=["xlsx"])
