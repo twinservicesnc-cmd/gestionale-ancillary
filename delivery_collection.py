@@ -1,5 +1,6 @@
 """Servizi Delivery / Collection e import dello storico trasferimenti."""
 import hashlib
+import calendar
 import io
 import json
 import math
@@ -82,6 +83,20 @@ def calculate_cost(km, cost_per_km):
     if any(not math.isfinite(value) or value < 0 for value in values):
         raise ValueError('Km e costo al km devono essere positivi o zero.')
     return float((Decimal(str(km)) * Decimal(str(cost_per_km))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+
+def period_bounds(mode, year, month=1, end_year=None, end_month=None):
+    if mode == 'Tutto lo storico':
+        return None, None
+    if mode == 'Un anno':
+        return date(year, 1, 1), date(year, 12, 31)
+    start = date(year, month, 1)
+    if mode == 'Un mese':
+        end_year, end_month = year, month
+    end = date(end_year, end_month, calendar.monthrange(end_year, end_month)[1])
+    if end < start:
+        raise ValueError('Il mese finale deve essere uguale o successivo al mese iniziale.')
+    return start, end
 
 
 def save_service(db, record, username='', identifier=None):
@@ -250,11 +265,40 @@ def services_page(st, db, table_to_excel, current_user):
         st.success(flash)
     with db() as conn:
         frame = pd.read_sql_query('SELECT * FROM delivery_collection ORDER BY service_date DESC, service_time DESC, created_at DESC', conn)
+    today = datetime.now(ZoneInfo('Europe/Rome')).date()
+    stored_years = pd.to_datetime(frame['service_date'], errors='coerce').dt.year.dropna().astype(int).tolist()
+    years = list(range(min(stored_years + [today.year]), max(stored_years + [today.year]) + 1))
+    months = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno',
+              'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre']
+    period = st.selectbox('Periodo dello storico', ['Tutto lo storico', 'Un mese', 'Più mesi', 'Un anno'])
+    start, end = None, None
+    if period == 'Un anno':
+        year = st.selectbox('Anno', years, index=years.index(today.year))
+        start, end = period_bounds(period, year)
+    elif period in ['Un mese', 'Più mesi']:
+        a, b = st.columns(2)
+        month = a.selectbox('Mese' if period == 'Un mese' else 'Dal mese', list(range(1, 13)),
+                            index=today.month - 1, format_func=lambda value: months[value - 1])
+        year = b.selectbox('Anno' if period == 'Un mese' else 'Anno iniziale', years, index=years.index(today.year))
+        end_year, end_month = year, month
+        if period == 'Più mesi':
+            a, b = st.columns(2)
+            end_month = a.selectbox('Al mese', list(range(1, 13)), index=today.month - 1,
+                                    format_func=lambda value: months[value - 1])
+            end_year = b.selectbox('Anno finale', years, index=years.index(today.year))
+        try:
+            start, end = period_bounds(period, year, month, end_year, end_month)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
     a, b = st.columns(2)
     kind = a.selectbox('Tipo', ['Tutti'] + SERVICE_TYPES)
     status = b.selectbox('Stato', ['Tutti'] + STATUSES)
     search = st.text_input('Cerca targa, autista o cliente')
     shown = frame.copy()
+    if start is not None:
+        shown = shown[shown.service_date.between(start.isoformat(), end.isoformat())]
+        st.caption(f'Periodo: {start.strftime("%d/%m/%Y")} – {end.strftime("%d/%m/%Y")}. Excel e PDF rispettano il periodo e gli altri filtri.')
     if kind != 'Tutti': shown = shown[shown.service_type.eq(kind)]
     if status != 'Tutti': shown = shown[shown.status.eq(status)]
     if search.strip():
