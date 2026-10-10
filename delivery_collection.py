@@ -90,11 +90,12 @@ def calculate_cost(km, cost_per_km):
     return float((Decimal(str(km)) * Decimal(str(cost_per_km))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
 
-def overall_cost(base, extra):
+def overall_cost(base, extra, fuel=None):
     if base is None or pd.isna(base):
         return None
     extra = 0 if extra is None or pd.isna(extra) else extra
-    return float((Decimal(str(base)) + Decimal(str(extra))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+    fuel = 0 if fuel is None or pd.isna(fuel) else fuel
+    return float((Decimal(str(base)) + Decimal(str(extra)) + Decimal(str(fuel))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
 
 def service_report(frame):
@@ -102,7 +103,7 @@ def service_report(frame):
     report['cost'] = [calculate_cost(row['km'], row['cost_per_km'])
         if pd.notna(row['km']) and pd.notna(row['cost_per_km']) else row['cost']
         for row in report.to_dict('records')]
-    report['total_cost'] = [overall_cost(row['cost'], row['extra_cost']) for row in report.to_dict('records')]
+    report['total_cost'] = [overall_cost(row['cost'], row['extra_cost'], row['fuel_cost']) for row in report.to_dict('records')]
     result = report[REPORT_FIELDS].rename(columns=LABELS)
     result[LABELS['service_date']] = pd.to_datetime(result[LABELS['service_date']])
     return result
@@ -412,7 +413,7 @@ def services_page(st, db, table_to_excel, current_user):
                 value = record.get(field)
                 optional_costs[field] = column.number_input(LABELS[field], min_value=0.0,
                     value=None if value is None or pd.isna(value) else float(value), step=1.0)
-            st.caption('Totale complessivo = km × costo al km + spese extra. Carburante resta separato.')
+            st.caption('Totale complessivo = km × costo al km + spese extra + carburante.')
             notes = st.text_area('Note', value=text(record.get('notes')))
         submitted = st.form_submit_button('Salva servizio', type='primary')
     if submitted:
@@ -432,8 +433,8 @@ def services_page(st, db, table_to_excel, current_user):
             st.error(str(exc))
         else:
             st.session_state['services_nonce'] = nonce + 1
-            total = overall_cost(cost, optional_costs['extra_cost'])
-            st.session_state['services_flash'] = f'Servizio salvato. Costo km: € {cost:.2f}. Totale con extra: € {total:.2f}.'
+            total = overall_cost(cost, optional_costs['extra_cost'], optional_costs['fuel_cost'])
+            st.session_state['services_flash'] = f'Servizio salvato. Costo km: € {cost:.2f}. Totale con extra e carburante: € {total:.2f}.'
             st.rerun()
     with st.expander('Importa storico da Excel'):
         st.caption('Legge tutti i fogli. Le righe storiche senza tipo diventano Trasferimento; lo stato resta Da verificare. Reimportare lo stesso file non duplica i servizi.')
