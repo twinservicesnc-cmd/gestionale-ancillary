@@ -6,6 +6,7 @@ import math
 import re
 import uuid
 from datetime import date, datetime, time
+from decimal import Decimal, ROUND_HALF_UP
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -18,8 +19,11 @@ FIELDS = ['service_type', 'service_date', 'service_time', 'driver', 'plate',
 LABELS = dict(zip(FIELDS, ['Tipo servizio', 'Data', 'Ora', 'Autista', 'Targa',
                          'Cliente', 'Partenza', 'Destinazione / indirizzo',
                          'Costo (€)', 'Stato', 'Note']))
-EXTRA_FIELDS = ['km', 'fuel_cost', 'extra_cost', 'requested_by', 'vehicle_type']
+EXTRA_FIELDS = ['km', 'fuel_cost', 'extra_cost', 'requested_by', 'vehicle_type', 'cost_per_km', 'reference']
 LABELS.update(dict(zip(EXTRA_FIELDS, ['Km', 'Carburante (€)', 'Spese extra (€)', 'Commissionato da', 'Tipo veicolo'])))
+LABELS.update(cost_per_km='Costo al km (€)', reference='Riferimento')
+SIMPLE_FIELDS = ['vehicle_type', 'plate', 'service_date', 'departure', 'destination',
+                 'km', 'reference', 'requested_by', 'driver', 'cost_per_km', 'cost']
 ALL_FIELDS = FIELDS + EXTRA_FIELDS
 
 
@@ -40,7 +44,7 @@ def init_services(db):
         existing = {row[1] for row in conn.execute('PRAGMA table_info(delivery_collection)')}
         for field in EXTRA_FIELDS:
             if field not in existing:
-                kind = 'REAL' if field in ['km', 'fuel_cost', 'extra_cost'] else 'TEXT'
+                kind = 'REAL' if field in ['km', 'fuel_cost', 'extra_cost', 'cost_per_km'] else 'TEXT'
                 conn.execute(f'ALTER TABLE delivery_collection ADD COLUMN {field} {kind}')
 
 
@@ -60,13 +64,24 @@ def validate_service(record):
         raise ValueError('Il costo deve essere un numero positivo o zero.')
     for field in EXTRA_FIELDS:
         value = record.get(field)
-        if field in ['km', 'fuel_cost', 'extra_cost']:
+        if field in ['km', 'fuel_cost', 'extra_cost', 'cost_per_km']:
             result[field] = None if not text(value) else float(value)
             if result[field] is not None and (not math.isfinite(result[field]) or result[field] < 0):
                 raise ValueError(f'{LABELS[field]}: inserisci un numero positivo o zero.')
         else:
             result[field] = text(value)
+    if result['cost_per_km'] is not None:
+        result['cost'] = calculate_cost(result['km'], result['cost_per_km'])
     return result
+
+
+def calculate_cost(km, cost_per_km):
+    if km is None or cost_per_km is None:
+        raise ValueError('Inserisci km e costo al km.')
+    values = [float(km), float(cost_per_km)]
+    if any(not math.isfinite(value) or value < 0 for value in values):
+        raise ValueError('Km e costo al km devono essere positivi o zero.')
+    return float((Decimal(str(km)) * Decimal(str(cost_per_km))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
 
 def save_service(db, record, username='', identifier=None):
@@ -108,6 +123,8 @@ def parse_services(file_bytes):
         'extra_cost': ['SPESE EXTRA', 'SPESE EXTRA (€)'],
         'requested_by': ['COMMISSIONATA DA:', 'COMMISSIONATA DA', 'COMMISSIONATO DA'],
         'vehicle_type': ['TIPOLOGIA', 'TIPO VEICOLO'],
+        'cost_per_km': ['COSTO AL KM', 'COSTO A KM', 'COSTO AL KM (€)'],
+        'reference': ['RIFERIMENTO'],
     }
     for sheet in book.sheet_names:
         frame = pd.read_excel(book, sheet_name=sheet, dtype=object)
@@ -171,9 +188,13 @@ def parse_services(file_bytes):
                     client=text(field('client')), departure=text(field('departure')),
                     destination=text(field('destination')), cost=None if not text(raw_cost) else raw_cost,
                     status=text(field('status')) or 'Da verificare', notes=notes,
-                    **{key: amount(field(key)) if key in ['km', 'fuel_cost', 'extra_cost'] else text(field(key)) for key in EXTRA_FIELDS}))
+                    **{key: amount(field(key)) if key in ['km', 'fuel_cost', 'extra_cost', 'cost_per_km'] else
+                       (text(field(key)) or (unlabeled[0] if unlabeled else '')) if key == 'reference' else text(field(key)) for key in EXTRA_FIELDS}))
                 stamp = text(row.get(names.get('INFORMAZIONI CRONOLOGICHE')))
-                key = hashlib.sha256(json.dumps([payload, stamp], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                fingerprint = {key: value for key, value in payload.items() if key not in ['reference', 'cost_per_km']}
+                if payload['cost_per_km'] is not None:
+                    fingerprint['cost_per_km'] = payload['cost_per_km']
+                key = hashlib.sha256(json.dumps([fingerprint, stamp], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
                 records.append(dict(payload, source_key=key))
             except (ValueError, TypeError, OverflowError) as exc:
                 errors.append(f'{sheet}, riga {index + 2}: {exc}')
@@ -239,14 +260,14 @@ def services_page(st, db, table_to_excel, current_user):
     if search.strip():
         shown = shown[shown[['plate', 'driver', 'client']].fillna('').apply(
             lambda column: column.str.contains(search.strip(), case=False, regex=False)).any(axis=1)]
-    display = shown[FIELDS].rename(columns=LABELS)
+    display = shown[SIMPLE_FIELDS].rename(columns=LABELS)
     st.dataframe(display, hide_index=True, use_container_width=True)
     st.caption(f'{len(shown)} servizi · Costi indicati: € {shown.cost.sum():.2f} · {shown.cost.isna().sum()} senza costo')
     if not shown.empty:
         a, b = st.columns(2)
         a.download_button('Scarica Excel', table_to_excel(shown[ALL_FIELDS].rename(columns=LABELS), 'Delivery Collection'), 'delivery_collection.xlsx',
                           mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        pdf_display = display.copy()
+        pdf_display = shown[FIELDS].rename(columns=LABELS)
         pdf_display['Note'] = [ '\n'.join(filter(None, [text(row['notes'])] +
             [f'{LABELS[field]}: {text(row[field])}' for field in EXTRA_FIELDS if text(row[field])]))
             for row in shown.to_dict('records')]
@@ -258,42 +279,63 @@ def services_page(st, db, table_to_excel, current_user):
     record = choices.get(selected, {})
     nonce = st.session_state.get('services_nonce', 0)
     with st.form(f'service_{selected}_{nonce}'):
-        a, b, c = st.columns(3)
-        service_type = a.selectbox('Servizio', SERVICE_TYPES, index=SERVICE_TYPES.index(record.get('service_type', 'Delivery')))
-        service_date = b.date_input('Data *', value=date.fromisoformat(record['service_date']) if record else datetime.now(ZoneInfo('Europe/Rome')).date())
-        service_time = c.text_input('Ora (HH:MM)', value=record.get('service_time', ''), placeholder='09:30')
+        vehicle_types = ['AUTO', 'VAN']
+        stored_type = text(record.get('vehicle_type')).upper()
+        vehicle_type = st.radio('Tipologia *', vehicle_types, horizontal=True,
+                               index=vehicle_types.index(stored_type) if stored_type in vehicle_types else None)
         a, b = st.columns(2)
-        driver = a.text_input('Autista', value=record.get('driver', ''))
-        plate = b.text_input('Targa *', value=record.get('plate', ''))
-        client = st.text_input('Cliente', value=record.get('client', ''))
+        plate = a.text_input('Targa *', value=record.get('plate', ''))
+        service_date = b.date_input('Data trasferimento *', value=date.fromisoformat(record['service_date']) if record else datetime.now(ZoneInfo('Europe/Rome')).date())
         a, b = st.columns(2)
-        departure = a.text_input('Partenza', value=record.get('departure', ''))
-        destination = b.text_input('Destinazione / indirizzo', value=record.get('destination', ''))
+        departure = a.text_input('Luogo ritiro *', value=record.get('departure', ''))
+        destination = b.text_input('Luogo consegna *', value=record.get('destination', ''))
+        km_value = record.get('km')
+        km = st.number_input('Km *', min_value=0.0, value=None if km_value is None or pd.isna(km_value) else float(km_value), step=1.0)
+        reference = st.text_input('Riferimento', value=text(record.get('reference')),
+                                  help='Corrisponde al campo senza titolo del modulo originale.')
+        requested_by = st.text_input('Commissionato da *', value=text(record.get('requested_by')))
         a, b = st.columns(2)
-        cost = a.number_input('Costo (€) — facoltativo', min_value=0.0,
-            value=None if record.get('cost') is None or pd.isna(record.get('cost')) else float(record['cost']), step=1.0)
-        new_status = b.selectbox('Stato servizio', STATUSES, index=STATUSES.index(record.get('status', 'Da fare')))
-        notes = st.text_area('Note', value=record.get('notes', ''))
-        extras = {}
-        with st.expander('Dettagli facoltativi: km, spese e committente'):
-            for field in EXTRA_FIELDS:
-                if field in ['km', 'fuel_cost', 'extra_cost']:
-                    value = record.get(field)
-                    extras[field] = st.number_input(LABELS[field], min_value=0.0,
-                        value=None if value is None or pd.isna(value) else float(value), step=1.0)
-                else:
-                    extras[field] = st.text_input(LABELS[field], value=text(record.get(field)))
+        driver = a.text_input('Autista *', value=record.get('driver', ''))
+        rate_value = record.get('cost_per_km')
+        rate = b.number_input('Costo al km (€) *', min_value=0.0,
+            value=None if rate_value is None or pd.isna(rate_value) else float(rate_value), step=0.01, format='%.2f')
+        st.caption('Totale automatico = km × costo al km. Calcolato al salvataggio.')
+        with st.expander('Dettagli facoltativi'):
+            a, b = st.columns(2)
+            service_type = a.selectbox('Tipo di servizio', SERVICE_TYPES,
+                index=SERVICE_TYPES.index(record.get('service_type', 'Trasferimento')))
+            service_time = b.text_input('Ora (HH:MM)', value=text(record.get('service_time')), placeholder='09:30')
+            a, b = st.columns(2)
+            client = a.text_input('Cliente', value=text(record.get('client')))
+            status = b.selectbox('Stato servizio', STATUSES,
+                index=STATUSES.index(record.get('status', 'Da fare')))
+            a, b = st.columns(2)
+            optional_costs = {}
+            for field, column in [('fuel_cost', a), ('extra_cost', b)]:
+                value = record.get(field)
+                optional_costs[field] = column.number_input(LABELS[field], min_value=0.0,
+                    value=None if value is None or pd.isna(value) else float(value), step=1.0)
+            st.caption('Carburante e spese extra sono indicati separatamente dal totale km × costo al km.')
+            notes = st.text_area('Note', value=text(record.get('notes')))
         submitted = st.form_submit_button('Salva servizio', type='primary')
     if submitted:
         try:
-            save_service(db, dict(service_type=service_type, service_date=service_date.isoformat(),
-                service_time=service_time, driver=driver, plate=plate, client=client,
-                departure=departure, destination=destination, cost=cost, status=new_status, notes=notes, **extras), username, selected or None)
+            if not all([vehicle_type, plate.strip(), departure.strip(), destination.strip(), requested_by.strip(), driver.strip()]):
+                raise ValueError('Compila i campi obbligatori indicati con *.')
+            cost = calculate_cost(km, rate)
+            # Preserve legacy data omitted from the simplified form.
+            payload = {field: record.get(field) for field in ALL_FIELDS}
+            payload.update(service_type=service_type, service_time=service_time, client=client,
+                status=status, notes=notes, **optional_costs, service_date=service_date.isoformat(),
+                driver=driver, plate=plate, departure=departure, destination=destination,
+                km=km, reference=reference, requested_by=requested_by,
+                vehicle_type=vehicle_type, cost_per_km=rate, cost=cost)
+            save_service(db, payload, username, selected or None)
         except (ValueError, TypeError) as exc:
             st.error(str(exc))
         else:
             st.session_state['services_nonce'] = nonce + 1
-            st.session_state['services_flash'] = 'Servizio salvato.'
+            st.session_state['services_flash'] = f'Servizio salvato. Totale: € {cost:.2f}.'
             st.rerun()
     with st.expander('Importa storico da Excel'):
         st.caption('Legge tutti i fogli. Le righe storiche senza tipo diventano Trasferimento; lo stato resta Da verificare. Reimportare lo stesso file non duplica i servizi.')
