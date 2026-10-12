@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from PIL import Image
+from vehicle_recovery import recovery_panel
 from delivery_collection import services_page
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Image as PdfImage, KeepTogether
@@ -2350,7 +2351,7 @@ def vehicle_sheet_pdf(payload, photos, works_only=False):
                                          ('Pulizia esterna',payload.get('cleaning_outside','Da verificare')),
                                          ('Approntamento',payload.get('preparation_status','Da verificare')),
                                          ('Carburante / carica',f"{payload.get('fuel','')}%")])
-        section('Documenti e dotazioni',[(row.get('Voce',''), 'Presente' if row.get('Presente') else 'Non previsto' if row.get('Non previsto') else 'Mancante / da verificare') for row in payload.get('checklist', [])] or [('Dotazioni','Non compilate')])
+        section('Documenti e dotazioni',[(row.get('Voce',''), vehicle_item_status(row)) for row in payload.get('checklist', [])] or [('Dotazioni','Non compilate')])
         section('Pneumatici',[(key,value) for row in payload.get('tires',[]) for key,value in row.items()] or [('Pneumatici','Non compilati')])
         section('Note vettura',[('Note',payload.get('notes',''))])
     selected_photos = [photo for photo in photos if not works_only or photo['file_name'].startswith('DANNO_')]
@@ -2394,7 +2395,7 @@ def vehicle_print_buttons(payload, identifier, key_prefix):
 
 
 def vehicle_item_status(row):
-    if row.get('Stato') in ['Presente', 'Non presente', 'Non previsto']:
+    if row.get('Stato') in ['Presente', 'Non presente', 'Non previsto', 'Da verificare']:
         return row['Stato']
     return 'Presente' if row.get('Presente') else 'Non previsto' if row.get('Non previsto') else 'Non presente'
 
@@ -2668,8 +2669,9 @@ def vehicle_check_form(current=None):
         group = a.text_input('Gruppo vettura', value=data.get('group', ''))
         ra = b.text_input('RA (facoltativo)', value=data.get('ra', ''))
         a, b = st.columns(2)
-        km = a.number_input('Chilometri', min_value=0, step=1, value=int(data.get('km', 0)))
-        fuel = b.slider('Carburante / carica (%)', 0, 100, int(data.get('fuel', 100)))
+        km = a.number_input('Chilometri', min_value=0, step=1, value=None if data.get('km', 0) is None else int(data.get('km', 0)))
+        fuel = b.number_input('Carburante / carica (%)', min_value=0, max_value=100, step=1,
+                              value=None if data.get('fuel', 100) is None else int(data.get('fuel', 100)))
         checked_date = st.date_input('Data controllo', value=date.fromisoformat(data.get('checked_at', date.today().isoformat())[:10]))
         operator = st.selectbox('Operatore *', operators, index=operators.index(operator_value), disabled=bool(linked))
         st.subheader('Documenti e dotazioni')
@@ -2758,6 +2760,8 @@ def vehicle_check_form(current=None):
 def vehicle_page(archive=False):
     vehicle_tables()
     st.header('Archivio vetture' if archive else 'Inserimento rapido vettura')
+    if archive:
+        recovery_panel(st, db, save_vehicle_check, VEHICLE_CHECKLIST, current_operator, load_special_events)
     message = st.session_state.pop('vehicle_saved_message', None)
     if message:
         st.success(message)
@@ -5201,4 +5205,5 @@ elif page == "Utenti e autorizzazioni":
     user_settings()
 else:
     import_backup()
+
 
