@@ -20,7 +20,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from PIL import Image
-from vehicle_recovery import recovery_panel
+from vehicle_recovery import recovery_panel, event_assignment_panel
 from delivery_collection import services_page
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Image as PdfImage, KeepTogether
@@ -4178,6 +4178,10 @@ def event_vehicles_page(frame):
         format_func=lambda item_id: event_label(records[item_id]),
         key="event_vehicle_event",
     )
+    assignment_message = st.session_state.pop('event_archive_message', None)
+    if assignment_message:
+        st.success(assignment_message)
+    event_assignment_panel(st, db, event_id, current_user)
     with db() as conn:
         stored = [
             dict(row) for row in conn.execute(
