@@ -8,7 +8,8 @@ import math
 import re
 import urllib.error
 import urllib.request
-from datetime import date
+import uuid
+from datetime import date, datetime
 
 import pandas as pd
 from PIL import Image
@@ -405,4 +406,84 @@ def recovery_panel(st, db, save_vehicle_check, labels, current_operator, load_ev
                 st.error(f'Recuperate {completed} schede prima dell’errore: {exc}. Puoi riprovare senza duplicare le schede già salvate.')
             else:
                 st.session_state['vehicle_saved_message']=f'{completed} schede recuperate. Dati registrati nello storico.'
+                st.rerun()
+
+
+def archive_event_options(db, recovered_only=False):
+    with db() as conn:
+        rows=conn.execute('SELECT id,plate,payload FROM vehicle_checks ORDER BY checked_at DESC,updated_at DESC').fetchall()
+    result,seen=[],set()
+    for row in rows:
+        value=plate(row[1])
+        if value in seen:
+            continue
+        seen.add(value)
+        payload=json.loads(row[2])
+        if recovered_only and not any(marker in clean(payload.get('notes')) for marker in ['Recupero dati da file','Importazione da schede fotografate']):
+            continue
+        result.append({'id':row[0],'plate':value,'brand':clean(payload.get('brand')),
+                       'model':clean(payload.get('model')),'event':clean(payload.get('event_title'))})
+    return sorted(result,key=lambda row:row['plate'])
+
+
+def assign_checks_to_event(db, event_id, identifiers, username=''):
+    identifiers=list(dict.fromkeys(identifiers))
+    now=datetime.now().isoformat(timespec='seconds')
+    changed=unchanged=0
+    with db() as conn:
+        event=conn.execute('SELECT title FROM special_events WHERE id=?',(event_id,)).fetchone()
+        if event is None:
+            raise ValueError('Evento non trovato.')
+        for identifier in identifiers:
+            row=conn.execute('SELECT plate,payload FROM vehicle_checks WHERE id=?',(identifier,)).fetchone()
+            if row is None:
+                raise ValueError('Una scheda non esiste più. Riapri la selezione.')
+            value=plate(row[0]);payload=json.loads(row[1]);previous=row[1]
+            found=conn.execute("SELECT id FROM event_vehicles WHERE event_id=? AND replace(replace(upper(plate),' ',''),'-','')=?",(event_id,value)).fetchone()
+            vehicle_id=found[0] if found else str(uuid.uuid4())
+            if not found:
+                conn.execute('''INSERT INTO event_vehicles
+                    (id,event_id,vehicle_group,plate,brand,model,assigned_to,ra,pickup_date,notes,updated_at,park_number)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (vehicle_id,event_id,clean(payload.get('group')),value,clean(payload.get('brand')),
+                     clean(payload.get('model')),'',clean(payload.get('ra')),'','Associata dall’archivio vetture',now,clean(payload.get('park_number'))))
+            payload.update(event_id=event_id,event_title=event[0],event_vehicle_id=vehicle_id)
+            encoded=json.dumps(payload,ensure_ascii=False)
+            if payload == json.loads(previous):
+                if found:
+                    unchanged+=1
+                else:
+                    changed+=1
+                continue
+            conn.execute('UPDATE vehicle_checks SET payload=?,updated_at=? WHERE id=?',(encoded,now,identifier))
+            conn.execute('INSERT INTO vehicle_check_history VALUES(?,?,?,?,?,?)',
+                         (str(uuid.uuid4()),identifier,'PRIMA DELL’ASSOCIAZIONE EVENTO',username,now,previous))
+            conn.execute('INSERT INTO vehicle_check_history VALUES(?,?,?,?,?,?)',
+                         (str(uuid.uuid4()),identifier,'ASSOCIAZIONE EVENTO',username,now,encoded))
+            changed+=1
+    return changed,unchanged
+
+
+def event_assignment_panel(st,db,event_id,current_user):
+    with st.expander('➕ Aggiungi vetture dall’archivio'):
+        recovered=st.selectbox('Vetture da selezionare',['Solo vetture recuperate','Tutte le vetture'],key='event_archive_scope')
+        options=archive_event_options(db,recovered=='Solo vetture recuperate')
+        if not options:
+            st.info('Nessuna vettura in questa selezione. Scegli Tutte le vetture per vedere l’archivio completo.')
+            return
+        by_id={row['id']:row for row in options}
+        all_selected=st.checkbox('Seleziona tutte le targhe mostrate',key='event_archive_all_'+event_id)
+        selected=list(by_id) if all_selected else st.multiselect('Targhe da associare',list(by_id),
+            format_func=lambda key: by_id[key]['plate'],key='event_archive_plates_'+event_id)
+        preview=[by_id[key] for key in selected]
+        if preview:
+            st.dataframe(pd.DataFrame(preview).drop(columns='id').rename(columns={'plate':'Targa','brand':'Marca','model':'Modello','event':'Evento attuale'}),hide_index=True,use_container_width=True)
+        st.caption('Associa le schede e aggiunge le targhe all’elenco dell’evento senza duplicati. Danni, accessori, fotografie e dati già inseriti vengono conservati. Se una scheda è collegata a un altro evento, il suo collegamento viene aggiornato all’evento selezionato.')
+        if st.button('Associa all’evento',disabled=not selected,key='event_archive_assign_'+event_id):
+            try:
+                changed,unchanged=assign_checks_to_event(db,event_id,selected,current_user().get('username',''))
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.session_state['event_archive_message']=f'{changed} vetture associate; {unchanged} già collegate.'
                 st.rerun()
