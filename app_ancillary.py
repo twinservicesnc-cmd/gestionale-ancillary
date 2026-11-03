@@ -2922,7 +2922,12 @@ def van_fleet_page():
         for row in rows:
             size = van_tyre_key(row["Misura pneumatici"])
             for brand in brands:
-                row[f"{brand} (auto)"] = rules.get((brand, size), "Da verificare") if row["Misura pneumatici"] else "—"
+                label = next((label for label in columns.values() if label.strip().upper() == brand), None)
+                result = rules.get((brand, size), "Da verificare") if row["Misura pneumatici"] else ""
+                if label is None:
+                    row[f"{brand} (auto)"] = result
+                elif not row[label]:
+                    row[label] = result
         signature = hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:16]
         with st.form("van_tyres_form"):
             edited = st.data_editor(pd.DataFrame(rows), key=f"van_tyres_{signature}", hide_index=True,
