@@ -2891,12 +2891,27 @@ def van_fleet_page():
         if not vehicles:
             st.info("Importa prima le targhe dalla scheda VAN.")
             return
-        brands = ["MULTIGRIP", "PRASCO", "ISSE"]
+        brands = ["MULTIGRIP", "PRASCO", "ISSE", "SPARCO", "GOODYEAR"]
         with db() as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS van_sock_rules (brand TEXT, size TEXT, result TEXT NOT NULL, PRIMARY KEY(brand, size))")
             conn.executemany("INSERT OR IGNORE INTO van_sock_rules VALUES ('MULTIGRIP', ?, ?)",
                              [("205/60/16", "205/60/16 · Taglia 6"), ("215/65/16", "215/65/16 · Taglia 7"),
                               ("225/65/17", "225/65/17 · Taglia 8")])
+            # Righe leggibili delle schede fotografate; nessuna equivalenza presunta.
+            photo_sizes = {
+                "MULTIGRIP": {"6": "165/75/16 175/70/16 195/65/16 225/55/16 215/60/16 220/60/16",
+                              "7": "205/65/16 225/60/16 245/55/16 175/80/16 195/70/16 235/60/16 225/60/17 235/55/17",
+                              "8": "205/80/16 235/70/16 255/65/16 275/60/16 215/70/17 235/60/17 235/65/17"},
+                "SPARCO": {"L": "205/60/16 205/65/16 215/60/16 225/55/16 225/60/16 205/60/17 215/55/17",
+                           "XL": "205/75/16 205/80/16 215/65/16 215/70/16 225/65/16 225/70/16 225/75/16 215/65/17 215/70/17 225/65/17"},
+                "GOODYEAR": {"L": "205/60/16 205/65/16 215/60/16 225/55/16 225/60/16 205/60/17 215/55/17",
+                             "XL": "205/75/16 205/80/16 215/65/16 215/70/16 225/65/16 225/70/16 225/75/16 215/65/17 215/70/17 225/65/17"},
+                "PRASCO": {"L": "205/60/16 205/65/16 215/55/16 215/60/16 225/55/16 225/60/16"},
+            }
+            conn.executemany("INSERT OR IGNORE INTO van_sock_rules VALUES (?, ?, ?)",
+                             [(brand, size, f"{size} · Taglia {taglia}")
+                              for brand, sizes in photo_sizes.items()
+                              for taglia, entries in sizes.items() for size in entries.split()])
             rules = {(b, k): v for b, k, v in conn.execute("SELECT brand, size, result FROM van_sock_rules")}
         with st.expander("Catalogo calze per misura"):
             with st.form("van_sock_rule"):
