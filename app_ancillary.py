@@ -2804,6 +2804,11 @@ def van_import(conn, vehicles):
                      (plate, json.dumps(payload, ensure_ascii=False)))
 
 
+def van_tyre_key(value):
+    match = re.fullmatch(r"(\d{3})/(\d{2})(?:R|/)(\d{2})(C?)", re.sub(r"\s+", "", str(value)).upper())
+    return "/".join(match.groups()[:3]) + match[4] if match else ""
+
+
 def van_fleet_page():
     with db() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS van_fleet (plate TEXT PRIMARY KEY, payload TEXT NOT NULL)")
@@ -2886,6 +2891,26 @@ def van_fleet_page():
         if not vehicles:
             st.info("Importa prima le targhe dalla scheda VAN.")
             return
+        brands = ["MULTIGRIP", "PRASCO", "ISSE"]
+        with db() as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS van_sock_rules (brand TEXT, size TEXT, result TEXT NOT NULL, PRIMARY KEY(brand, size))")
+            conn.executemany("INSERT OR IGNORE INTO van_sock_rules VALUES ('MULTIGRIP', ?, ?)",
+                             [("205/60/16", "205/60/16 · Taglia 6"), ("215/65/16", "215/65/16 · Taglia 7"),
+                              ("225/65/17", "225/65/17 · Taglia 8")])
+            rules = {(b, k): v for b, k, v in conn.execute("SELECT brand, size, result FROM van_sock_rules")}
+        with st.expander("Catalogo calze per misura"):
+            with st.form("van_sock_rule"):
+                brand = st.selectbox("Marca calza", brands)
+                size = van_tyre_key(st.text_input("Misura (es. 205/60 R16)"))
+                result = st.text_input("Taglia o codice; scrivi NO solo se verificato").strip()
+                if st.form_submit_button("Salva regola"):
+                    if not size or not result:
+                        st.error("Inserisci una misura valida e un esito.")
+                    else:
+                        with db() as conn:
+                            conn.execute("INSERT INTO van_sock_rules VALUES (?, ?, ?) ON CONFLICT(brand, size) DO UPDATE SET result=excluded.result",
+                                         (brand, size, result))
+                        st.rerun()
         names = {"tyre": "Misura pneumatici", **columns}
         query = st.text_input("Cerca targa o modello").strip().casefold()
         rows = [{"Targa": p, "Gruppo": v.get("group", ""), "Marca VAN": v.get("brand", ""),
@@ -2894,10 +2919,14 @@ def van_fleet_page():
         if not rows:
             st.info("Nessuna targa corrispondente.")
             return
+        for row in rows:
+            size = van_tyre_key(row["Misura pneumatici"])
+            for brand in brands:
+                row[f"{brand} (auto)"] = rules.get((brand, size), "Da verificare") if row["Misura pneumatici"] else "—"
         signature = hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:16]
         with st.form("van_tyres_form"):
             edited = st.data_editor(pd.DataFrame(rows), key=f"van_tyres_{signature}", hide_index=True,
-                                    disabled=["Targa", "Gruppo", "Marca VAN", "Modello"])
+                                    disabled=["Targa", "Gruppo", "Marca VAN", "Modello", *[f"{b} (auto)" for b in brands]])
             if st.form_submit_button("Salva gomme e calze"):
                 changes = {row["Targa"]: {k: str(row[label] or "").strip() if pd.notna(row[label]) else ""
                                           for k, label in names.items() if row[label] != old[label]}
