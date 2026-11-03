@@ -2757,6 +2757,166 @@ def vehicle_check_form(current=None):
             st.rerun()
 
 
+def van_excel_rows(data, filename):
+    engine = "xlrd" if filename.lower().endswith(".xls") else "openpyxl"
+    with pd.ExcelFile(io.BytesIO(data), engine=engine) as book:
+        sheets = {name.strip().casefold(): name for name in book.sheet_names}
+        def rows(name):
+            raw = book.parse(sheets[name], header=None, dtype=str).fillna("")
+            for i, row in enumerate(raw.itertuples(index=False, name=None)):
+                keys = [str(v).strip().casefold() for v in row]
+                if "targa" in keys:
+                    return [dict(zip(keys, values)) for values in raw.iloc[i+1:].itertuples(index=False, name=None)]
+            raise ValueError(f"Colonna TARGA assente nel foglio {name}.")
+        vehicles = {}
+        for row in rows("veicoli"):
+            plate = re.sub(r"\s+", "", row["targa"]).upper()
+            group = row.get("grp. naz.", "").strip().upper()
+            if not group.startswith("Z") or not re.fullmatch(r"[A-Z0-9]{5,12}", plate):
+                continue
+            if plate in vehicles:
+                raise ValueError(f"Targa duplicata: {plate}")
+            vehicles[plate] = {key: row.get(src, "").strip() for key, src in {
+                "group": "grp. naz.", "brand": "maker", "model": "model",
+                "version": "version", "station": "staz.", "prefix": "prefix number"}.items()}
+        if "calze" in sheets:
+            seen = set()
+            for row in rows("calze"):
+                plate = re.sub(r"\s+", "", row["targa"]).upper()
+                if plate not in vehicles:
+                    continue
+                if plate in seen:
+                    raise ValueError(f"Targa duplicata nel foglio calze: {plate}")
+                seen.add(plate)
+                vehicles[plate].update({key: row.get(src, "").strip() for key, src in {
+                    "tyre": "misure", "a": "a", "b": "b", "c": "c"}.items()})
+        return vehicles
+
+
+def van_import(conn, vehicles):
+    for plate, values in vehicles.items():
+        row = conn.execute("SELECT payload FROM van_fleet WHERE plate=?", (plate,)).fetchone()
+        payload = json.loads(row[0]) if row else {}
+        for key, value in values.items():
+            if value and (key not in {"tyre", "a", "b", "c"} or not payload.get(key)):
+                payload[key] = value
+        conn.execute("INSERT INTO van_fleet VALUES (?, ?) ON CONFLICT(plate) DO UPDATE SET payload=excluded.payload",
+                     (plate, json.dumps(payload, ensure_ascii=False)))
+
+
+def van_fleet_page():
+    with db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS van_fleet (plate TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS van_columns (id TEXT PRIMARY KEY, label TEXT NOT NULL)")
+        conn.executemany("INSERT OR IGNORE INTO van_columns VALUES (?, ?)",
+                         [("a", "Calza A"), ("b", "Calza B"), ("c", "Calza C")])
+        columns = dict(conn.execute("SELECT id, label FROM van_columns ORDER BY rowid"))
+        vehicles = {p: json.loads(v) for p, v in conn.execute("SELECT plate, payload FROM van_fleet ORDER BY plate")}
+    st.header("Parco VAN")
+    tab_vans, tab_tyres = st.tabs(["VAN", "Gomme e calze"])
+    with tab_vans:
+        uploaded = st.file_uploader("Importa parco VAN", type=["xls", "xlsx"])
+        if uploaded:
+            try:
+                incoming = van_excel_rows(uploaded.getvalue(), uploaded.name)
+            except Exception as exc:
+                st.error(f"Impossibile leggere il file: {exc}")
+            else:
+                st.write(f"{len(incoming)} VAN trovati · {len(incoming.keys() - vehicles.keys())} nuovi")
+                if incoming:
+                    st.dataframe(pd.DataFrame([{"Targa": p, "Gruppo": v["group"], "Marca": v["brand"],
+                                                "Modello": v["model"]} for p, v in incoming.items()]), hide_index=True)
+                    if st.button("Importa VAN", key="van_import_confirm"):
+                        with db() as conn:
+                            van_import(conn, incoming)
+                        st.session_state["van_notice"] = f"Elaborate {len(incoming)} targhe."
+                        st.rerun()
+        if notice := st.session_state.pop("van_notice", None):
+            st.success(notice)
+        st.dataframe(pd.DataFrame([{"Targa": p, "Gruppo": v.get("group"), "Marca": v.get("brand"),
+                                    "Modello": v.get("model"), "Versione": v.get("version"),
+                                    "Stazione": v.get("station"), "Numero": v.get("prefix")}
+                                   for p, v in vehicles.items()]), hide_index=True)
+        with st.expander("Aggiungi VAN manualmente"):
+            with st.form("van_manual_form", clear_on_submit=True):
+                plate = re.sub(r"\s+", "", st.text_input("Targa")).upper()
+                group = st.text_input("Gruppo VAN").strip().upper()
+                values = {"group": group, "brand": st.text_input("Marca").strip(),
+                          "model": st.text_input("Modello").strip(), "version": st.text_input("Versione").strip()}
+                if st.form_submit_button("Aggiungi VAN"):
+                    if not re.fullmatch(r"[A-Z0-9]{5,12}", plate) or not group.startswith("Z"):
+                        st.error("Inserisci una targa valida e un gruppo VAN (es. Z2).")
+                    else:
+                        with db() as conn:
+                            added = conn.execute("INSERT OR IGNORE INTO van_fleet VALUES (?, ?)",
+                                                 (plate, json.dumps(values, ensure_ascii=False))).rowcount
+                        if added:
+                            st.session_state["van_notice"] = f"VAN {plate} aggiunto."
+                            st.rerun()
+                        st.error("Questa targa è già nel Parco VAN.")
+        if vehicles:
+            with st.expander("Elimina VAN dal parco"):
+                target = st.selectbox("Targa da eliminare", ["", *vehicles])
+                if target:
+                    st.caption("Saranno rimossi anche i dati di gomme e calze di questa targa dal Parco VAN.")
+                    if st.checkbox(f"Confermo l’eliminazione di {target}", key=f"van_delete_confirm_{target}"):
+                        if st.button("Elimina VAN", key=f"van_delete_{target}"):
+                            with db() as conn:
+                                conn.execute("DELETE FROM van_fleet WHERE plate=?", (target,))
+                            st.session_state["van_notice"] = f"VAN {target} eliminato dal parco."
+                            st.rerun()
+    with tab_tyres:
+        with st.expander("Aggiungi o rinomina colonne"):
+            with st.form("van_column_form"):
+                key = st.selectbox("Colonna", ["", *columns], format_func=lambda k: columns.get(k, "Nuova colonna"))
+                label = st.text_input("Nome colonna", max_chars=80)
+                if st.form_submit_button("Salva colonna"):
+                    label = label.strip()
+                    reserved = {"targa", "gruppo", "marca van", "modello", "misura pneumatici"}
+                    with db() as conn:
+                        current = dict(conn.execute("SELECT id, label FROM van_columns"))
+                        if not label or label.casefold() in reserved | {v.casefold() for k, v in current.items() if k != key}:
+                            st.error("Scegli un nome diverso, non vuoto.")
+                        elif key:
+                            conn.execute("UPDATE van_columns SET label=? WHERE id=?", (label, key))
+                        else:
+                            conn.execute("INSERT INTO van_columns VALUES (?, ?)", (uuid.uuid4().hex, label))
+                    if label and label.casefold() not in reserved | {v.casefold() for k, v in current.items() if k != key}:
+                        st.rerun()
+        if not vehicles:
+            st.info("Importa prima le targhe dalla scheda VAN.")
+            return
+        names = {"tyre": "Misura pneumatici", **columns}
+        query = st.text_input("Cerca targa o modello").strip().casefold()
+        rows = [{"Targa": p, "Gruppo": v.get("group", ""), "Marca VAN": v.get("brand", ""),
+                 "Modello": v.get("model", ""), **{label: v.get(k, "") for k, label in names.items()}}
+                for p, v in vehicles.items() if not query or query in (p + " " + v.get("model", "")).casefold()]
+        if not rows:
+            st.info("Nessuna targa corrispondente.")
+            return
+        signature = hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:16]
+        with st.form("van_tyres_form"):
+            edited = st.data_editor(pd.DataFrame(rows), key=f"van_tyres_{signature}", hide_index=True,
+                                    disabled=["Targa", "Gruppo", "Marca VAN", "Modello"])
+            if st.form_submit_button("Salva gomme e calze"):
+                changes = {row["Targa"]: {k: str(row[label] or "").strip() if pd.notna(row[label]) else ""
+                                          for k, label in names.items() if row[label] != old[label]}
+                           for row, old in zip(edited.to_dict("records"), rows)}
+                with db() as conn:
+                    for plate, values in changes.items():
+                        if values:
+                            current = conn.execute("SELECT payload FROM van_fleet WHERE plate=?", (plate,)).fetchone()
+                            if current:
+                                payload = json.loads(current[0])
+                                payload.update(values)
+                                conn.execute("UPDATE van_fleet SET payload=? WHERE plate=?",
+                                             (json.dumps(payload, ensure_ascii=False), plate))
+                st.session_state["van_tyres_saved"] = True
+                st.rerun()
+        if st.session_state.pop("van_tyres_saved", False):
+            st.success("Gomme e calze salvate.")
+
+
 def vehicle_page(archive=False):
     vehicle_tables()
     st.header('Archivio vetture' if archive else 'Inserimento rapido vettura')
@@ -5058,6 +5218,7 @@ all_special_events = load_special_events()
 navigation = {
     "VETTURE": [("📱 Inserimento rapido vettura", "Inserimento rapido vettura"),
                 ("🚗 Archivio vetture", "Archivio vetture"),
+                ("🚐 Parco VAN", "Parco VAN"),
                 ("📁 Foto e documenti per targa", "Foto e documenti per targa")],
     "ANCILLARY": [
         ("📊 Dashboard ancillary", "Dashboard ancillary"),
@@ -5189,6 +5350,8 @@ elif page == "Inserimento rapido vettura":
     vehicle_page()
 elif page == "Foto e documenti per targa":
     vehicle_documents_page()
+elif page == "Parco VAN":
+    van_fleet_page()
 elif page == "Archivio vetture":
     vehicle_page(archive=True)
 elif page == "Archivio ancillary":
@@ -5209,5 +5372,4 @@ elif page == "Utenti e autorizzazioni":
     user_settings()
 else:
     import_backup()
-
 
