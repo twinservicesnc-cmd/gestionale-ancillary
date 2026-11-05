@@ -2900,8 +2900,9 @@ def van_front_photo_bytes(raw):
     if len(raw) > 15 * 1024 * 1024:
         raise ValueError("Ogni foto deve essere inferiore a 15 MB.")
     with Image.open(io.BytesIO(raw)) as source:
-        if source.format not in {"JPEG", "PNG", "WEBP"}:
-            raise ValueError("Usa foto JPG, PNG o WEBP.")
+        if source.format not in {"JPEG", "MPO", "PNG", "WEBP"}:
+            raise ValueError(f"Formato reale rilevato: {source.format or 'sconosciuto'}. Salva la foto come JPEG, PNG o WEBP.")
+        source.seek(0)
         image = ImageOps.exif_transpose(source).convert("RGB")
         image.thumbnail((1600, 1600))
         output = io.BytesIO()
