@@ -2932,6 +2932,34 @@ def van_save_front(conn, plate, measure, photos, tyre_type=None):
     return added
 
 
+def van_ai_error_message(exc):
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        code = ""
+        try:
+            code = json.loads(exc.read().decode()).get("error", {}).get("code", "")
+        except Exception:
+            pass
+        if exc.code == 401:
+            return "Chiave API rifiutata (HTTP 401). Verifica che sia attiva e copiata correttamente nei Secrets."
+        if exc.code == 429:
+            if code == "insufficient_quota":
+                return "Credito o quota API insufficienti (HTTP 429). Controlla Billing della piattaforma OpenAI: ChatGPT e API hanno fatturazione separata."
+            return "Limite richieste API raggiunto (HTTP 429). Attendi e riprova; verifica anche la quota API."
+        if exc.code in (403, 404):
+            return f"Modello non accessibile o permessi insufficienti (HTTP {exc.code}). Verifica modello e permessi della chiave."
+        if exc.code == 400:
+            return "Richiesta API rifiutata (HTTP 400): verifica modello e formato della foto."
+        return f"Servizio API non disponibile (HTTP {exc.code}). Riprova più tardi."
+    if isinstance(exc, (TimeoutError, urllib.error.URLError)):
+        return "Connessione al servizio API non riuscita o tempo scaduto. Riprova."
+    if isinstance(exc, (json.JSONDecodeError, KeyError)):
+        return "Risposta API non leggibile o incompleta. Riprova con una foto più ravvicinata."
+    if isinstance(exc, ValueError):
+        return "Foto o risposta non valida. Usa una foto nitida del fianco con la misura leggibile."
+    return f"Lettura non riuscita ({type(exc).__name__}). Nessun dato è stato salvato."
+
+
 def van_detect_tyre_type(raw, config):
     import urllib.request
     body = {
@@ -3000,8 +3028,8 @@ def van_front_panel(vehicles, brands, rules):
                         with st.spinner("Lettura misura e tipo…"):
                             detected = van_detect_tyre_type(photos[0], config)
                         st.session_state["front_pending"] = (plate, photos, detected)
-                    except Exception:
-                        st.error("Lettura non riuscita. Controlla foto e configurazione API.")
+                    except Exception as exc:
+                        st.error(van_ai_error_message(exc))
             if st.form_submit_button("Salva misura e foto anteriori"):
                 try:
                     files = ([camera] if camera else []) + list(uploads or [])
@@ -3058,8 +3086,8 @@ def van_front_panel(vehicles, brands, rules):
                             with st.spinner("Lettura del pneumatico…"):
                                 detected = van_detect_tyre_type(bytes(photo[0]), config)
                             st.session_state[f"type_result_{photo_id}"] = detected
-                        except Exception:
-                            st.error("Lettura non riuscita. Verifica connessione e configurazione API.")
+                        except Exception as exc:
+                            st.error(van_ai_error_message(exc))
                     detected = st.session_state.get(f"type_result_{photo_id}")
                     if detected:
                         st.info(f'{detected["tipo"]}: {detected["evidenza"]}')
