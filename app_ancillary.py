@@ -2809,6 +2809,15 @@ def van_tyre_key(value):
     return "/".join(match.groups()[:3]) + match[4] if match else ""
 
 
+def van_sock_match(rules, brand, size):
+    # Idoneità ai commerciali confermata dalla società per queste marche.
+    if (brand, size) in rules:
+        return rules[(brand, size)]
+    if brand in {"MULTIGRIP", "PRASCO", "ISSE", "SPARCO", "GOODYEAR"} and size.endswith("C"):
+        return rules.get((brand, size[:-1]), "Da verificare")
+    return "Da verificare"
+
+
 def van_read_sock_photo(raw, config):
     import urllib.request
     with Image.open(io.BytesIO(raw)) as image:
@@ -3064,7 +3073,7 @@ def van_front_panel(vehicles, brands, rules):
         size = van_tyre_key(vehicles[plate].get("tyre", ""))
         if size:
             st.write("Calze per la misura anteriore salvata")
-            st.dataframe(pd.DataFrame([{"Marca": brand, "Taglia da catalogo": rules.get((brand, size), "Da verificare")}
+            st.dataframe(pd.DataFrame([{"Marca": brand, "Taglia da catalogo": van_sock_match(rules, brand, size)}
                                        for brand in brands]), hide_index=True)
         with db() as conn:
             stored = conn.execute("SELECT id, size, created_at FROM van_front_photos WHERE plate=? ORDER BY created_at DESC",
@@ -3241,7 +3250,7 @@ def van_fleet_page():
             size = van_tyre_key(row["Misura pneumatici"])
             for brand in brands:
                 label = next((label for label in columns.values() if label.strip().upper() == brand), None)
-                result = rules.get((brand, size), "Da verificare") if row["Misura pneumatici"] else ""
+                result = van_sock_match(rules, brand, size) if row["Misura pneumatici"] else ""
                 if result and result.strip().casefold() not in {"no", "da verificare"}:
                     result = f"🟢 {result}"
                 if label is None:
